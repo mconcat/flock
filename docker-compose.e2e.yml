@@ -1,0 +1,85 @@
+# Flock — Real Multi-Node E2E Test with LLM Pipeline
+#
+# Runs TWO openclaw gateways (source-node + target-node) with real Flock agents,
+# then a test-runner validates the complete production pipeline including
+# cross-node migration over HTTP.
+#
+# NO mock servers — real multi-node communication via Docker networking.
+# Requires auth-profiles.json with valid LLM credentials.
+#
+# Run:
+#   docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit
+#
+# Verbose:
+#   E2E_VERBOSE=1 docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit
+#
+# Clean up:
+#   docker compose -f docker-compose.e2e.yml down -v
+
+services:
+  source-node:
+    build:
+      context: .
+      dockerfile: e2e/Dockerfile
+    environment:
+      - NODE_ENV=test
+      - E2E_VERBOSE=${E2E_VERBOSE:-}
+      - OPENCLAW_STATE_DIR=/root/.openclaw
+      - OPENCLAW_CONFIG_PATH=/root/.openclaw/openclaw.json
+    volumes:
+      - ${HOME}/.clawdbot/agents/main/agent/auth-profiles.json:/tmp/host-auth-profiles.json:ro
+    tmpfs:
+      - /tmp:exec,size=512m
+    command: ["openclaw", "gateway", "run", "--dev", "--verbose"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "const h=require('http');h.get('http://127.0.0.1:3779/health',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>process.exit(r.statusCode===200?0:1))}).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    ports:
+      - "3779:3779"
+
+  target-node:
+    build:
+      context: .
+      dockerfile: e2e/Dockerfile
+    environment:
+      - NODE_ENV=test
+      - E2E_VERBOSE=${E2E_VERBOSE:-}
+      - OPENCLAW_STATE_DIR=/root/.openclaw
+      - OPENCLAW_CONFIG_PATH=/root/.openclaw/openclaw-target.json
+    volumes:
+      - ${HOME}/.clawdbot/agents/main/agent/auth-profiles.json:/tmp/host-auth-profiles.json:ro
+    tmpfs:
+      - /tmp:exec,size=512m
+    command: ["openclaw", "gateway", "run", "--dev", "--verbose"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "const h=require('http');h.get('http://127.0.0.1:3780/health',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>process.exit(r.statusCode===200?0:1))}).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    ports:
+      - "3780:3780"
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: e2e/Dockerfile
+    environment:
+      - NODE_ENV=test
+      - E2E_VERBOSE=${E2E_VERBOSE:-}
+      - SOURCE_URL=http://source-node:3779
+      - TARGET_URL=http://target-node:3780
+      - GATEWAY_TOKEN=test-token-e2e
+    tmpfs:
+      - /tmp:exec,size=512m
+    depends_on:
+      source-node:
+        condition: service_healthy
+      target-node:
+        condition: service_healthy
+    command: ["node", "/workspace/test-harness.mjs"]
+
+volumes: {}

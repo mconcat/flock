@@ -1,0 +1,51 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/workspace",
+      "sandbox": {
+        "mode": "off"
+      }
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true
+      }
+    ]
+  },
+  "gateway": {
+    "port": 3780,
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "test-token-e2e"
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "flock": {
+        "enabled": true,
+        "config": {
+          "nodeId": "target-node",
+          "remoteNodes": [
+            { "nodeId": "source-node", "a2aEndpoint": "http://source-node:3779/flock" }
+          ],
+          "dataDir": "/tmp/flock-data",
+          "gatewayAgents": [],
+          "gateway": {
+            "port": 3780,
+            "token": "test-token-e2e"
+          }
+        }
+      }
+    }
+  }
+}

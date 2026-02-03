@@ -1,0 +1,47 @@
+{
+  "name": "@flock-org/flock",
+  "version": "0.2.0",
+  "description": "Agent swarm orchestration plugin for openclaw — homes, leases, A2A communication, and governance",
+  "type": "module",
+  "main": "dist/index.js",
+  "openclaw": {
+    "extensions": [
+      "dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc && cp -r src/prompts/templates dist/prompts/",
+    "lint": "eslint src/",
+    "test": "vitest run --project unit && npm run test:integration && npm run test:e2e",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "docker compose -f docker-compose.test.yml run --rm --build integration; docker compose -f docker-compose.test.yml down -v",
+    "test:e2e": "docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit; docker compose -f docker-compose.e2e.yml down -v",
+    "test:e2e:crossnode": "docker compose -f docker-compose.crossnode.yml up --build --abort-on-container-exit; docker compose -f docker-compose.crossnode.yml down -v",
+    "test:watch": "vitest --project unit"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "agent",
+    "swarm",
+    "orchestration",
+    "multi-agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.30"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "^0.3.9",
+    "better-sqlite3": "^12.6.2"
+  }
+}

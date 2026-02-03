@@ -1,0 +1,47 @@
+# Flock Live — Standalone Agent Swarm
+#
+# Runs an isolated OpenClaw gateway + Flock plugin with real LLM-backed agents.
+# Completely separate from the host's Clawdbot instance.
+#
+# Start:
+#   docker compose -f docker-compose.live.yml up -d --build
+#
+# Logs:
+#   docker compose -f docker-compose.live.yml logs -f
+#
+# Stop:
+#   docker compose -f docker-compose.live.yml down
+#
+# Shell into container:
+#   docker compose -f docker-compose.live.yml exec flock bash
+#
+# Interact with agents:
+#   ./live/cli.sh atlas "Hello Atlas, what can you do?"
+#   ./live/cli.sh forge "Write a hello world in TypeScript"
+
+services:
+  flock:
+    build:
+      context: .
+      dockerfile: live/Dockerfile
+    container_name: flock-live
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - OPENCLAW_STATE_DIR=/root/.openclaw
+      - OPENCLAW_CONFIG_PATH=/root/.openclaw/openclaw.json
+      - FLOCK_GATEWAY_TOKEN=${FLOCK_GATEWAY_TOKEN:?Set FLOCK_GATEWAY_TOKEN in .env or environment}
+    volumes:
+      # Host auth credentials (read-only) — needed for LLM API access
+      - ${HOME}/.clawdbot/agents/main/agent/auth-profiles.json:/tmp/host-auth-profiles.json:ro
+      # Persistent data (survives container restarts)
+      - flock-db:/data/flock-db
+      - flock-homes:/data/flock-homes
+    ports:
+      - "4000:4000"
+
+volumes:
+  flock-db:
+    name: flock-live-db
+  flock-homes:
+    name: flock-live-homes

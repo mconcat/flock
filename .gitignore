@@ -1,0 +1,31 @@
+node_modules/
+dist/
+.flock/
+
+# Database
+*.db
+*.sqlite
+
+# Environment / secrets
+.env
+.env.*
+e2e/.env
+e2e/.env.*
+*.secret
+**/secrets/
+auth-profiles.json
+**/auth-profiles.json
+
+# Build artifacts
+*.tsbuildinfo
+
+# Docs
+docs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
