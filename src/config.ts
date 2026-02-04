@@ -58,6 +58,13 @@ export interface FlockConfig {
   };
   /** Base directory for shared workspace vaults. */
   vaultsBasePath: string;
+  /**
+   * Channel-to-agent routing map. Maps Discord channel IDs to arrays of
+   * agent IDs that should receive broadcasts from that channel.
+   * When orchestrator calls flock_broadcast from a Discord channel session,
+   * targets are automatically filtered to only include agents in this mapping.
+   */
+  channelRouting: Record<string, string[]>;
 }
 
 /** Safely coerce an unknown value to a string-keyed record. */
@@ -171,5 +178,23 @@ export function resolveFlockConfig(raw?: Record<string, unknown> | null): FlockC
       token: typeof gatewayRaw.token === "string" ? gatewayRaw.token : "",
     },
     vaultsBasePath: typeof r.vaultsBasePath === "string" ? r.vaultsBasePath : `${dataDir}/vaults`,
+    channelRouting: parseChannelRouting(r.channelRouting),
   };
+}
+
+/** Parse channelRouting from config, returning Record<channelId, agentIds[]>. */
+function parseChannelRouting(raw: unknown): Record<string, string[]> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return {};
+  }
+  const result: Record<string, string[]> = {};
+  for (const [channelId, agents] of Object.entries(raw as Record<string, unknown>)) {
+    if (Array.isArray(agents)) {
+      const validAgents = agents.filter((a): a is string => typeof a === "string" && a.trim().length > 0);
+      if (validAgents.length > 0) {
+        result[channelId] = validAgents;
+      }
+    }
+  }
+  return result;
 }

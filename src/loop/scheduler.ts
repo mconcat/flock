@@ -26,7 +26,7 @@ const TICK_INTERVAL_MS = 60_000;
 const TICK_JITTER_MS = 10_000;
 
 /** Maximum concurrent tick sends to prevent overload. */
-const MAX_CONCURRENT_TICKS = 4;
+const MAX_CONCURRENT_TICKS = 2;
 
 /* Agents continue work by making tool calls within a single turn
    (OpenClaw handles multi-turn tool loop internally). No re-tick needed. */

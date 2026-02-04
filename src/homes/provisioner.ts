@@ -379,17 +379,47 @@ function buildUserMd(
       const sysadmins = others.filter((a) => a.role === "sysadmin" || a.role === "orchestrator");
 
       if (workers.length > 0) {
-        lines.push("## Worker Agents on This Node");
-        lines.push("");
-        lines.push("These are the worker agents available for project work.");
-        lines.push("When the human operator requests a project, broadcast it to them.");
-        lines.push("They will self-organize as a team.");
-        lines.push("");
+        // Group workers by project prefix (e.g., cybros-, creep-, game-)
+        const projectGroups = new Map<string, AgentInfo[]>();
         for (const w of workers) {
-          const arch = w.archetype ? ` (${w.archetype})` : "";
-          lines.push(`- **${w.id}**${arch}`);
+          const prefix = w.id.split("-")[0]; // e.g., "cybros" from "cybros-pm"
+          if (!projectGroups.has(prefix)) {
+            projectGroups.set(prefix, []);
+          }
+          projectGroups.get(prefix)!.push(w);
         }
+
+        lines.push("## Project Teams");
         lines.push("");
+        lines.push("Workers are organized by project. Each Discord channel corresponds to a project team.");
+        lines.push("");
+
+        for (const [prefix, team] of projectGroups) {
+          lines.push(`### ${prefix} team`);
+          for (const w of team) {
+            const arch = w.archetype ? ` (${w.archetype})` : "";
+            lines.push(`- **${w.id}**${arch}`);
+          }
+          lines.push("");
+        }
+
+        // Add instructions for orchestrator about channel-based routing
+        if (role === "orchestrator") {
+          lines.push("## How to Handle Requests from Discord");
+          lines.push("");
+          lines.push("**IMPORTANT: When you receive a request from a Discord channel, you MUST use `flock_broadcast` to relay it to the workers.**");
+          lines.push("");
+          lines.push("1. **Do NOT respond directly to project requests.** Your job is to relay, not to do the work.");
+          lines.push("2. **Call `flock_broadcast`** with the request message. You don't need to specify the `to` parameter.");
+          lines.push("   - The system automatically routes to the correct project team based on which Discord channel the message came from.");
+          lines.push("3. **Example:**");
+          lines.push("   - User sends \"코드베이스 분석해줘\" in a project channel");
+          lines.push("   - You call: `flock_broadcast(message=\"사용자 요청: 코드베이스 분석해줘\")`");
+          lines.push("   - System automatically routes to the correct team");
+          lines.push("");
+          lines.push("**You are a messenger, not a worker. Always broadcast to the team.**");
+          lines.push("");
+        }
       }
 
       if (sysadmins.length > 0) {

@@ -234,6 +234,7 @@ export function register(api: PluginApi) {
     migrationOrchestrator,
     logger,
     vaultsBasePath: config.vaultsBasePath,
+    channelRouting: config.channelRouting,
   };
   registerFlockTools(api, toolDeps);
 
@@ -453,6 +454,21 @@ export function register(api: PluginApi) {
       db.agentLoop.init(agent.id, "AWAKE");
     }
     logger.info(`[flock] initialized loop state for ${config.gatewayAgents.length} agent(s)`);
+
+    // Auto-provision homes for gateway agents
+    for (const agent of config.gatewayAgents) {
+      const homeId = `${agent.id}@${config.nodeId}`;
+      if (!homes.get(homeId)) {
+        const home = homes.create(agent.id, config.nodeId);
+        homes.transition(home.homeId, "PROVISIONING", "auto-provision", "system");
+        homes.transition(home.homeId, "IDLE", "auto-provision complete", "system");
+        homes.transition(home.homeId, "LEASED", "auto-lease for gateway agent", "system");
+        // Set a long lease (24 hours)
+        homes.setLeaseExpiry(home.homeId, Date.now() + 24 * 60 * 60 * 1000);
+        logger.info(`[flock:homes] auto-provisioned home for gateway agent: ${homeId}`);
+      }
+    }
+    logger.info(`[flock] auto-provisioned homes for ${config.gatewayAgents.length} gateway agent(s)`);
   }
 
   // Wire agent loop store and scheduler into tool deps

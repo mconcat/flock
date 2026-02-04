@@ -170,6 +170,20 @@
       "homesDir": {
         "type": "string",
         "description": "Root directory for agent homes. Defaults to /data/flock-homes"
+      },
+      "channelRouting": {
+        "type": "object",
+        "description": "Channel-to-agent routing map. Maps Discord channel IDs to arrays of agent IDs for automatic broadcast filtering.",
+        "additionalProperties": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "vaultsBasePath": {
+        "type": "string",
+        "description": "Base directory for shared workspace vaults. Defaults to {dataDir}/vaults"
       }
     }
   }
