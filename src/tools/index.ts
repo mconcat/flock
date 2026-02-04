@@ -65,6 +65,12 @@ export interface ToolDeps {
   agentLoop?: AgentLoopStore;
   /** Work loop scheduler for thread tracking. */
   workLoopScheduler?: WorkLoopScheduler;
+  /**
+   * Channel-to-agent routing map. When orchestrator calls flock_broadcast
+   * from a Discord channel session, targets are automatically set to the
+   * agents mapped to that channel ID.
+   */
+  channelRouting?: Record<string, string[]>;
 }
 
 /**
@@ -72,7 +78,7 @@ export interface ToolDeps {
  * is injected into every tool call's params as `agentId`. This way tools don't
  * need to rely on the LLM passing agentId — it comes from the session identity.
  */
-function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined): ToolDefinition {
+function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined, sessionKey?: string): ToolDefinition {
   const resolvedId = agentId ?? "unknown";
   return {
     ...tool,
@@ -81,6 +87,10 @@ function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined):
       // to avoid collisions with user-facing params like agentId (used as filter in flock_history).
       // Tools should read _callerAgentId first, then fall back to params.agentId.
       params._callerAgentId = resolvedId;
+      // Inject _sessionKey for channel-based routing in flock_broadcast
+      if (sessionKey) {
+        params._sessionKey = sessionKey;
+      }
       return tool.execute(toolCallId, params);
     },
   };
@@ -127,7 +137,7 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
   for (const tool of toolFactories) {
     api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
       console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
-      return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
+      return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx), ctx.sessionKey);
     });
   }
 
@@ -145,7 +155,7 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     for (const tool of workspaceTools) {
       api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
         console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
-        return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
+        return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx), ctx.sessionKey);
       });
     }
   }
@@ -1346,14 +1356,15 @@ function notifyAgent(
   threadId: string,
   taskId: string,
   currentMaxSeq: number,
+  additionalDelayMs: number = 0,
 ): void {
-  // Skip notification for SLEEP agents — they only wake on explicit triggers.
-  // Thread notifications are not explicit triggers; direct messages and flock_wake are.
+  // Wake sleeping agents for broadcast/thread notifications.
+  // Broadcasts are explicit communication requests that should wake agents.
   if (deps.agentLoop) {
     const loopState = deps.agentLoop.get(target);
     if (loopState?.state === "SLEEP") {
-      deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for thread ${threadId} — agent is SLEEP`);
-      return;
+      deps.agentLoop.setState(target, "AWAKE");
+      deps.logger?.info?.(`[flock:notify] Waking "${target}" for thread ${threadId} notification`);
     }
   }
 
@@ -1370,10 +1381,11 @@ function notifyAgent(
   }
   setLastNotifiedSeq(threadId, target, currentMaxSeq);
 
-  // Random delay (1-5s) to prevent broadcast storm — like Ethernet collision avoidance.
-  // After delay, re-check if new messages arrived; if so, skip this notification
-  // (the newer message's notification will cover it with fresher context).
-  const delayMs = 1000 + Math.floor(Math.random() * 4000);
+  // Sequential delay to prevent lock contention, plus random jitter to avoid clustering.
+  // additionalDelayMs spaces out notifications from the same broadcast (0s, 3s, 6s, 9s...).
+  // Random jitter (0-1s) adds slight variation to prevent exact alignment.
+  const jitterMs = Math.floor(Math.random() * 1000);
+  const delayMs = additionalDelayMs + jitterMs;
   deps.logger?.debug?.(`[flock:notify] Delaying notification to "${target}" for ${delayMs}ms (thread ${threadId}, seq ${currentMaxSeq})`);
 
   setTimeout(() => {
@@ -1482,13 +1494,39 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
 
       const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
       const toRaw = params.to;
-      const targets: string[] = Array.isArray(toRaw)
+      let targets: string[] = Array.isArray(toRaw)
         ? toRaw.filter((t): t is string => typeof t === "string" && t.trim().length > 0).map(s => s.trim())
         : typeof toRaw === "string" ? toRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
       const message = typeof params.message === "string" ? params.message.trim() : "";
       const threadId = typeof params.threadId === "string" && params.threadId.trim()
         ? params.threadId.trim()
         : `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      // --- Channel-based routing ---
+      // If session is from a Discord channel and channelRouting is configured,
+      // auto-set or filter targets to only include agents mapped to that channel.
+      const sessionKey = typeof params._sessionKey === "string" ? params._sessionKey : "";
+      deps.logger?.info(`[flock:broadcast] EXECUTE called. sessionKey="${sessionKey}" targets=${JSON.stringify(targets)} hasChannelRouting=${!!deps.channelRouting}`);
+      const discordChannelMatch = sessionKey.match(/discord:channel:(\d+)/);
+      if (discordChannelMatch && deps.channelRouting) {
+        const channelId = discordChannelMatch[1];
+        const channelAgents = deps.channelRouting[channelId];
+        if (channelAgents && channelAgents.length > 0) {
+          if (targets.length === 0) {
+            // No targets specified — auto-set to channel's agents
+            targets = [...channelAgents];
+            deps.logger?.info(`[flock:broadcast] Auto-routing to channel ${channelId} agents: ${targets.join(", ")}`);
+          } else {
+            // Targets specified — filter to only include agents in channel routing
+            const filtered = targets.filter(t => channelAgents.includes(t));
+            if (filtered.length > 0) {
+              deps.logger?.info(`[flock:broadcast] Filtered targets for channel ${channelId}: ${filtered.join(", ")} (from ${targets.join(", ")})`);
+              targets = filtered;
+            }
+            // If filtered is empty, keep original targets (allow explicit override)
+          }
+        }
+      }
 
       if (targets.length === 0) {
         return toOCResult({ ok: false, error: "'to' must contain at least one agent ID." });
@@ -1571,8 +1609,10 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
         }
 
         // Fire-and-forget: notify agent without waiting
+        // Use sequential delays (index * 3s) to prevent lock contention
         const maxSeq = history.length > 0 ? Math.max(...history.map(m => m.seq)) : 0;
-        notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
+        const targetIndex = targets.indexOf(target);
+        notifyAgent(deps, target, notification, threadId, taskId, maxSeq, targetIndex * 3000);
       }
 
       return toOCResult({
@@ -1673,8 +1713,10 @@ function createThreadPostTool(deps: ToolDeps): ToolDefinition {
             const notification = buildThreadNotification(threadId, allAgents, history);
             for (const target of otherParticipants) {
               // notifyAgent internally checks dedup (lastNotifiedSeq)
+              // Use sequential delays (index * 3s) to prevent lock contention
               const taskId = `tp-${threadId}-${target}-${now}`;
-              notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
+              const targetIndex = otherParticipants.indexOf(target);
+              notifyAgent(deps, target, notification, threadId, taskId, maxSeq, targetIndex * 3000);
             }
           }
         }

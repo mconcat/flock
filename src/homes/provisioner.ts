@@ -379,17 +379,58 @@ function buildUserMd(
       const sysadmins = others.filter((a) => a.role === "sysadmin" || a.role === "orchestrator");
 
       if (workers.length > 0) {
-        lines.push("## Worker Agents on This Node");
-        lines.push("");
-        lines.push("These are the worker agents available for project work.");
-        lines.push("When the human operator requests a project, broadcast it to them.");
-        lines.push("They will self-organize as a team.");
-        lines.push("");
+        // Group workers by project prefix (e.g., cybros-, creep-, game-)
+        const projectGroups = new Map<string, AgentInfo[]>();
         for (const w of workers) {
-          const arch = w.archetype ? ` (${w.archetype})` : "";
-          lines.push(`- **${w.id}**${arch}`);
+          const prefix = w.id.split("-")[0]; // e.g., "cybros" from "cybros-pm"
+          if (!projectGroups.has(prefix)) {
+            projectGroups.set(prefix, []);
+          }
+          projectGroups.get(prefix)!.push(w);
         }
+
+        lines.push("## Project Teams");
         lines.push("");
+        lines.push("Workers are organized by project. Each Discord channel corresponds to a project team.");
+        lines.push("");
+
+        for (const [prefix, team] of projectGroups) {
+          lines.push(`### ${prefix} team`);
+          for (const w of team) {
+            const arch = w.archetype ? ` (${w.archetype})` : "";
+            lines.push(`- **${w.id}**${arch}`);
+          }
+          lines.push("");
+        }
+
+        // Add instructions for orchestrator about channel-based routing
+        if (role === "orchestrator") {
+          lines.push("## How to Handle Requests from Discord");
+          lines.push("");
+          lines.push("**IMPORTANT: When you receive a request from a Discord channel, follow this workflow:**");
+          lines.push("");
+          lines.push("### Step 1: Broadcast to Team");
+          lines.push("- Call `flock_broadcast(message=\"사용자 요청: [요청내용]\")`");
+          lines.push("- You don't need to specify the `to` parameter — the system automatically routes to the correct project team.");
+          lines.push("- Note the `threadId` returned from the broadcast.");
+          lines.push("");
+          lines.push("### Step 2: Wait for Team Responses");
+          lines.push("- **CRITICAL: You MUST wait before checking for responses.**");
+          lines.push("- Team notifications are sent sequentially with 3-second intervals.");
+          lines.push("- Wait at least **15-20 seconds** after broadcasting to give team members time to respond.");
+          lines.push("");
+          lines.push("### Step 3: Check Thread for Responses");
+          lines.push("- Call `flock_thread_read(threadId=\"[threadId from step 1]\")` to see team responses.");
+          lines.push("- If no responses yet, wait another 15 seconds and check again.");
+          lines.push("- Repeat up to 3 times (total ~60 seconds of waiting).");
+          lines.push("");
+          lines.push("### Step 4: Report to User");
+          lines.push("- Summarize the team's responses back to the user.");
+          lines.push("- If team didn't respond after 60 seconds, inform the user and suggest they try again later.");
+          lines.push("");
+          lines.push("**You are a coordinator. Broadcast, wait, collect responses, and report back.**");
+          lines.push("");
+        }
       }
 
       if (sysadmins.length > 0) {
