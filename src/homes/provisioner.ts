@@ -407,17 +407,28 @@ function buildUserMd(
         if (role === "orchestrator") {
           lines.push("## How to Handle Requests from Discord");
           lines.push("");
-          lines.push("**IMPORTANT: When you receive a request from a Discord channel, you MUST use `flock_broadcast` to relay it to the workers.**");
+          lines.push("**IMPORTANT: When you receive a request from a Discord channel, follow this workflow:**");
           lines.push("");
-          lines.push("1. **Do NOT respond directly to project requests.** Your job is to relay, not to do the work.");
-          lines.push("2. **Call `flock_broadcast`** with the request message. You don't need to specify the `to` parameter.");
-          lines.push("   - The system automatically routes to the correct project team based on which Discord channel the message came from.");
-          lines.push("3. **Example:**");
-          lines.push("   - User sends \"코드베이스 분석해줘\" in a project channel");
-          lines.push("   - You call: `flock_broadcast(message=\"사용자 요청: 코드베이스 분석해줘\")`");
-          lines.push("   - System automatically routes to the correct team");
+          lines.push("### Step 1: Broadcast to Team");
+          lines.push("- Call `flock_broadcast(message=\"사용자 요청: [요청내용]\")`");
+          lines.push("- You don't need to specify the `to` parameter — the system automatically routes to the correct project team.");
+          lines.push("- Note the `threadId` returned from the broadcast.");
           lines.push("");
-          lines.push("**You are a messenger, not a worker. Always broadcast to the team.**");
+          lines.push("### Step 2: Wait for Team Responses");
+          lines.push("- **CRITICAL: You MUST wait before checking for responses.**");
+          lines.push("- Team notifications are sent sequentially with 3-second intervals.");
+          lines.push("- Wait at least **15-20 seconds** after broadcasting to give team members time to respond.");
+          lines.push("");
+          lines.push("### Step 3: Check Thread for Responses");
+          lines.push("- Call `flock_thread_read(threadId=\"[threadId from step 1]\")` to see team responses.");
+          lines.push("- If no responses yet, wait another 15 seconds and check again.");
+          lines.push("- Repeat up to 3 times (total ~60 seconds of waiting).");
+          lines.push("");
+          lines.push("### Step 4: Report to User");
+          lines.push("- Summarize the team's responses back to the user.");
+          lines.push("- If team didn't respond after 60 seconds, inform the user and suggest they try again later.");
+          lines.push("");
+          lines.push("**You are a coordinator. Broadcast, wait, collect responses, and report back.**");
           lines.push("");
         }
       }

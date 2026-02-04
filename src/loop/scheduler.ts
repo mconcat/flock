@@ -18,6 +18,8 @@ import type { A2AClient } from "../transport/client.js";
 import type { AuditLog } from "../audit/log.js";
 import type { PluginLogger } from "../types.js";
 import { userMessage } from "../transport/a2a-helpers.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 /** Base tick interval in ms. */
 const TICK_INTERVAL_MS = 60_000;
@@ -26,7 +28,13 @@ const TICK_INTERVAL_MS = 60_000;
 const TICK_JITTER_MS = 10_000;
 
 /** Maximum concurrent tick sends to prevent overload. */
-const MAX_CONCURRENT_TICKS = 2;
+const MAX_CONCURRENT_TICKS = 1;
+
+/** Delay between sequential tick sends (ms) to prevent lock contention. */
+const TICK_DELAY_MS = 3_000;
+
+/** Lock file age threshold (ms) - locks older than this are considered stale. */
+const STALE_LOCK_THRESHOLD_MS = 60_000;
 
 /* Agents continue work by making tool calls within a single turn
    (OpenClaw handles multi-turn tool loop internally). No re-tick needed. */
@@ -37,12 +45,16 @@ export interface WorkLoopSchedulerDeps {
   threadMessages: ThreadMessageStore;
   audit: AuditLog;
   logger: PluginLogger;
+  /** Base directory for agent data (for stale lock cleanup). */
+  agentsDir?: string;
 }
 
 export class WorkLoopScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private deps: WorkLoopSchedulerDeps;
+  /** Guard to prevent overlapping tick cycles. */
+  private tickInProgress = false;
 
   /** Track which threads each agent last saw (agentId → threadId → lastSeenSeq). */
   private agentThreadSeqs = new Map<string, Map<string, number>>();
@@ -86,6 +98,24 @@ export class WorkLoopScheduler {
   private async tick(): Promise<void> {
     if (!this.running) return;
 
+    // Prevent overlapping tick cycles - if previous cycle is still running, skip
+    if (this.tickInProgress) {
+      this.deps.logger.debug?.(`[flock:loop] Skipping tick - previous cycle still in progress`);
+      return;
+    }
+
+    this.tickInProgress = true;
+    try {
+      await this.doTick();
+    } finally {
+      this.tickInProgress = false;
+    }
+  }
+
+  /**
+   * Actual tick implementation.
+   */
+  private async doTick(): Promise<void> {
     const now = Date.now();
     const awakeAgents = this.deps.agentLoop.listByState("AWAKE");
 
@@ -107,21 +137,63 @@ export class WorkLoopScheduler {
       `[flock:loop] Ticking ${dueAgents.length} agent(s): ${dueAgents.map(a => a.agentId).join(", ")}`,
     );
 
-    // Send ticks with concurrency limit
-    const queue = [...dueAgents];
-    const executing: Promise<void>[] = [];
+    // Clean stale locks before ticking to prevent cascading failures
+    this.cleanStaleLocks();
 
-    while (queue.length > 0 || executing.length > 0) {
-      while (queue.length > 0 && executing.length < MAX_CONCURRENT_TICKS) {
-        const agent = queue.shift()!;
-        const promise = this.sendTick(agent, now).then(() => {
-          executing.splice(executing.indexOf(promise), 1);
-        });
-        executing.push(promise);
+    // Send ticks sequentially with delays to prevent lock contention
+    for (const agent of dueAgents) {
+      await this.sendTick(agent, now);
+      // Add delay between ticks to let locks settle
+      if (dueAgents.indexOf(agent) < dueAgents.length - 1) {
+        await this.delay(TICK_DELAY_MS);
       }
-      if (executing.length > 0) {
-        await Promise.race(executing);
+    }
+  }
+
+  /**
+   * Delay helper.
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Clean up stale lock files that are older than STALE_LOCK_THRESHOLD_MS.
+   * This prevents deadlocks from crashed processes leaving locks behind.
+   */
+  private cleanStaleLocks(): void {
+    const { agentsDir, logger } = this.deps;
+    if (!agentsDir) return;
+
+    try {
+      const now = Date.now();
+      const agentDirs = fs.readdirSync(agentsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+
+      for (const agentDir of agentDirs) {
+        const sessionsDir = path.join(agentsDir, agentDir, "sessions");
+        if (!fs.existsSync(sessionsDir)) continue;
+
+        const files = fs.readdirSync(sessionsDir);
+        for (const file of files) {
+          if (!file.endsWith(".lock")) continue;
+
+          const lockPath = path.join(sessionsDir, file);
+          try {
+            const stat = fs.statSync(lockPath);
+            const age = now - stat.mtimeMs;
+            if (age > STALE_LOCK_THRESHOLD_MS) {
+              fs.unlinkSync(lockPath);
+              logger.info(`[flock:loop] Cleaned stale lock: ${lockPath} (age: ${Math.floor(age / 1000)}s)`);
+            }
+          } catch {
+            // Lock file may have been deleted by another process
+          }
+        }
       }
+    } catch (err) {
+      logger.debug?.(`[flock:loop] Error cleaning stale locks: ${err}`);
     }
   }
 

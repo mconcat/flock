@@ -474,12 +474,18 @@ export function register(api: PluginApi) {
   // Wire agent loop store and scheduler into tool deps
   toolDeps.agentLoop = db.agentLoop;
 
+  // Determine agents directory for stale lock cleanup
+  // OpenClaw stores sessions at ~/.openclaw/agents/<agentId>/sessions/
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
+  const agentsDir = `${homeDir}/.openclaw/agents`;
+
   const workLoopScheduler = new WorkLoopScheduler({
     agentLoop: db.agentLoop,
     a2aClient,
     threadMessages: db.threadMessages,
     audit,
     logger,
+    agentsDir,
   });
   toolDeps.workLoopScheduler = workLoopScheduler;
 

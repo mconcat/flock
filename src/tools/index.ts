@@ -1356,14 +1356,15 @@ function notifyAgent(
   threadId: string,
   taskId: string,
   currentMaxSeq: number,
+  additionalDelayMs: number = 0,
 ): void {
-  // Skip notification for SLEEP agents — they only wake on explicit triggers.
-  // Thread notifications are not explicit triggers; direct messages and flock_wake are.
+  // Wake sleeping agents for broadcast/thread notifications.
+  // Broadcasts are explicit communication requests that should wake agents.
   if (deps.agentLoop) {
     const loopState = deps.agentLoop.get(target);
     if (loopState?.state === "SLEEP") {
-      deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for thread ${threadId} — agent is SLEEP`);
-      return;
+      deps.agentLoop.setState(target, "AWAKE");
+      deps.logger?.info?.(`[flock:notify] Waking "${target}" for thread ${threadId} notification`);
     }
   }
 
@@ -1380,10 +1381,11 @@ function notifyAgent(
   }
   setLastNotifiedSeq(threadId, target, currentMaxSeq);
 
-  // Random delay (1-5s) to prevent broadcast storm — like Ethernet collision avoidance.
-  // After delay, re-check if new messages arrived; if so, skip this notification
-  // (the newer message's notification will cover it with fresher context).
-  const delayMs = 1000 + Math.floor(Math.random() * 4000);
+  // Sequential delay to prevent lock contention, plus random jitter to avoid clustering.
+  // additionalDelayMs spaces out notifications from the same broadcast (0s, 3s, 6s, 9s...).
+  // Random jitter (0-1s) adds slight variation to prevent exact alignment.
+  const jitterMs = Math.floor(Math.random() * 1000);
+  const delayMs = additionalDelayMs + jitterMs;
   deps.logger?.debug?.(`[flock:notify] Delaying notification to "${target}" for ${delayMs}ms (thread ${threadId}, seq ${currentMaxSeq})`);
 
   setTimeout(() => {
@@ -1607,8 +1609,10 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
         }
 
         // Fire-and-forget: notify agent without waiting
+        // Use sequential delays (index * 3s) to prevent lock contention
         const maxSeq = history.length > 0 ? Math.max(...history.map(m => m.seq)) : 0;
-        notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
+        const targetIndex = targets.indexOf(target);
+        notifyAgent(deps, target, notification, threadId, taskId, maxSeq, targetIndex * 3000);
       }
 
       return toOCResult({
@@ -1709,8 +1713,10 @@ function createThreadPostTool(deps: ToolDeps): ToolDefinition {
             const notification = buildThreadNotification(threadId, allAgents, history);
             for (const target of otherParticipants) {
               // notifyAgent internally checks dedup (lastNotifiedSeq)
+              // Use sequential delays (index * 3s) to prevent lock contention
               const taskId = `tp-${threadId}-${target}-${now}`;
-              notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
+              const targetIndex = otherParticipants.indexOf(target);
+              notifyAgent(deps, target, notification, threadId, taskId, maxSeq, targetIndex * 3000);
             }
           }
         }
