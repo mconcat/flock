@@ -137,18 +137,34 @@ async function cmdInit(): Promise<void> {
     loadList.push(pluginPath);
   }
 
-  // Configure flock plugin
+  // Configure flock plugin (merge with existing to avoid wiping agents)
   const entries = plugins.entries as Record<string, unknown>;
+  const existingFlock = entries.flock as Record<string, unknown> | undefined;
+  const existingConfig = (existingFlock?.config ?? {}) as Record<string, unknown>;
+  const existingGatewayAgents = Array.isArray(existingConfig.gatewayAgents)
+    ? (existingConfig.gatewayAgents as Array<unknown>)
+    : [];
+  const mergedGatewayAgents = [...existingGatewayAgents];
+  const hasGatewayOrchestrator = mergedGatewayAgents.some((a) => {
+    if (typeof a === "string") return a === "orchestrator";
+    if (typeof a === "object" && a !== null) return (a as Record<string, unknown>).id === "orchestrator";
+    return false;
+  });
+  if (!hasGatewayOrchestrator) {
+    mergedGatewayAgents.push({ id: "orchestrator", role: "orchestrator" });
+  }
+
   entries.flock = {
+    ...(existingFlock ?? {}),
     enabled: true,
     config: {
-      dataDir: ".flock",
-      dbBackend: "sqlite",
-      gatewayAgents: [
-        { id: "orchestrator", role: "orchestrator" },
-      ],
+      ...existingConfig,
+      dataDir: (existingConfig.dataDir as string | undefined) ?? ".flock",
+      dbBackend: (existingConfig.dbBackend as string | undefined) ?? "sqlite",
+      gatewayAgents: mergedGatewayAgents,
       gateway: {
-        port: 3779,
+        ...(existingConfig.gateway as Record<string, unknown> | undefined),
+        port: (existingConfig.gateway as Record<string, unknown> | undefined)?.port ?? 3779,
         token,
       },
     },
@@ -253,7 +269,8 @@ async function cmdAdd(args: string[]): Promise<void> {
   if (!agents.list) agents.list = [];
   const agentsList = agents.list as Array<Record<string, unknown>>;
 
-  if (!agentsList.some((a) => a.id === agentId)) {
+  const existingAgent = agentsList.find((a) => a.id === agentId);
+  if (!existingAgent) {
     const newAgent: Record<string, unknown> = {
       id: agentId,
       workspace: `~/.openclaw/workspace-${agentId}`,
@@ -275,6 +292,13 @@ async function cmdAdd(args: string[]): Promise<void> {
       newAgent.model = { primary: model };
     }
     agentsList.push(newAgent);
+  } else if (model) {
+    const existingModel = existingAgent.model as Record<string, unknown> | undefined;
+    if (existingModel && typeof existingModel === "object") {
+      existingModel.primary = model;
+    } else {
+      existingAgent.model = { primary: model };
+    }
   }
 
   saveConfig(config);
