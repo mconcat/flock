@@ -8,51 +8,35 @@ Flock turns a set of OpenClaw agents into a self-organizing team. Give a project
 
 ## Quick Start
 
-### 1. Install
+### Option A: One-Line Install (Recommended)
 
 ```bash
-cd /path/to/openclaw-workspace
-mkdir -p .openclaw/extensions
-cd .openclaw/extensions
-git clone https://github.com/flock-org/flock.git
-cd flock
+curl -fsSL https://raw.githubusercontent.com/effortprogrammer/flock/main/install.sh | bash
+```
+
+Then initialize:
+
+```bash
+flock init
+```
+
+### Option B: Manual Install
+
+```bash
+# Clone to OpenClaw extensions
+mkdir -p ~/.openclaw/extensions
+git clone https://github.com/effortprogrammer/flock.git ~/.openclaw/extensions/flock
+cd ~/.openclaw/extensions/flock
+
+# Install and build
 npm install
 npm run build
+
+# Initialize (auto-configures openclaw.json)
+node dist/cli/index.js init
 ```
 
-### 2. Configure
-
-Add to your `openclaw.json`:
-
-```jsonc
-{
-  "agents": {
-    "list": [
-      {
-        "id": "orchestrator",
-        "model": { "primary": "anthropic/claude-opus-4-5" },
-        "tools": { "alsoAllow": ["group:plugins"] },
-        "workspace": "~/.openclaw/workspace-orchestrator"
-      }
-    ]
-  },
-  "plugins": {
-    "load": [".openclaw/extensions/flock"],
-    "entries": {
-      "flock": {
-        "enabled": true,
-        "config": {
-          "gatewayAgents": [
-            { "id": "orchestrator", "role": "orchestrator" }
-          ]
-        }
-      }
-    }
-  }
-}
-```
-
-### 3. Start the gateway
+### Start the Gateway
 
 ```bash
 openclaw gateway start
@@ -60,9 +44,58 @@ openclaw gateway start
 
 You now have a single orchestrator agent. Next, let's give it a team.
 
-### 4. Create worker agents
+---
 
-Send a message to the orchestrator and ask it to create agents:
+## CLI Reference
+
+Flock includes a CLI for easy agent management — no manual JSON editing required.
+
+```bash
+flock init                    # Initialize Flock, auto-configure openclaw.json
+flock add <id> [options]      # Add a new agent
+flock remove <id>             # Remove an agent
+flock list                    # List configured agents
+flock status                  # Show configuration status
+```
+
+**Add agent options:**
+- `--role <role>` — worker, sysadmin, orchestrator (default: worker)
+- `--model <model>` — e.g., anthropic/claude-opus-4-5
+- `--archetype <name>` — e.g., code-reviewer, qa, code-first-developer
+
+**Examples:**
+
+```bash
+# Add a code reviewer with Gemini
+flock add reviewer --role worker --model google-gemini-cli/gemini-3-flash-preview --archetype code-reviewer
+
+# Add a developer with GPT
+flock add dev-code --model openai-codex/gpt-5.2 --archetype code-first-developer
+
+# Remove an agent
+flock remove dev-code
+```
+
+---
+
+### Create Worker Agents
+
+**Option A: Using the CLI (no gateway restart needed after each add)**
+
+```bash
+flock add pm        --archetype project-manager              --model anthropic/claude-opus-4-5
+flock add reviewer  --archetype code-reviewer                --model google-gemini-cli/gemini-3-flash-preview
+flock add dev-code  --archetype code-first-developer         --model openai-codex/gpt-5.2
+flock add dev-prod  --archetype production-first-developer   --model anthropic/claude-opus-4-5
+flock add qa        --archetype qa                           --model google-gemini-cli/gemini-3-flash-preview
+
+# Restart once to load all agents
+openclaw gateway restart
+```
+
+**Option B: Ask the orchestrator**
+
+Send a message to the orchestrator:
 
 ```
 Create 5 worker agents:
@@ -184,7 +217,7 @@ Agents get these Flock-specific tools:
         "enabled": true,
         "config": {
           // Where Flock stores its SQLite DB and data
-          "dataDir": ".flock-data",
+          "dataDir": ".flock",
 
           // Agents managed by Flock
           "gatewayAgents": [
@@ -218,7 +251,7 @@ Each agent also needs an entry in `agents.list` with model and workspace:
           "alsoAllow": ["group:plugins"],
           "sandbox": {
             "tools": {
-              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "web_search", "web_fetch"]
+              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "image", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status", "flock_*"]
             }
           }
         },

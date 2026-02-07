@@ -8,51 +8,35 @@ Flock은 OpenClaw 에이전트들을 자율적으로 협업하는 팀으로 구�
 
 ## 빠른 시작
 
-### 1. 설치
+### 방법 A: 원클릭 설치 (권장)
 
 ```bash
-cd /path/to/openclaw-workspace
-mkdir -p .openclaw/extensions
-cd .openclaw/extensions
-git clone https://github.com/flock-org/flock.git
-cd flock
+curl -fsSL https://raw.githubusercontent.com/effortprogrammer/flock/main/install.sh | bash
+```
+
+설치 후 초기화:
+
+```bash
+flock init
+```
+
+### 방법 B: 수동 설치
+
+```bash
+# OpenClaw extensions 폴더에 클론
+mkdir -p ~/.openclaw/extensions
+git clone https://github.com/effortprogrammer/flock.git ~/.openclaw/extensions/flock
+cd ~/.openclaw/extensions/flock
+
+# 설치 및 빌드
 npm install
 npm run build
+
+# 초기화 (openclaw.json 자동 설정)
+node dist/cli/index.js init
 ```
 
-### 2. 설정
-
-`openclaw.json`에 다음을 추가하세요:
-
-```jsonc
-{
-  "agents": {
-    "list": [
-      {
-        "id": "orchestrator",
-        "model": { "primary": "anthropic/claude-opus-4-5" },
-        "tools": { "alsoAllow": ["group:plugins"] },
-        "workspace": "~/.openclaw/workspace-orchestrator"
-      }
-    ]
-  },
-  "plugins": {
-    "load": [".openclaw/extensions/flock"],
-    "entries": {
-      "flock": {
-        "enabled": true,
-        "config": {
-          "gatewayAgents": [
-            { "id": "orchestrator", "role": "orchestrator" }
-          ]
-        }
-      }
-    }
-  }
-}
-```
-
-### 3. 게이트웨이 시작
+### 게이트웨이 시작
 
 ```bash
 openclaw gateway start
@@ -60,7 +44,56 @@ openclaw gateway start
 
 오케스트레이터 에이전트 하나가 실행됩니다. 이제 팀을 구성해봅시다.
 
-### 4. 워커 에이전트 생성
+---
+
+## CLI 사용법
+
+Flock은 CLI를 통해 손쉽게 에이전트를 관리할 수 있습니다. JSON 직접 수정 불필요!
+
+```bash
+flock init                    # Flock 초기화, openclaw.json 자동 설정
+flock add <id> [options]      # 새 에이전트 추가
+flock remove <id>             # 에이전트 제거
+flock list                    # 설정된 에이전트 목록
+flock status                  # 설정 상태 확인
+```
+
+**에이전트 추가 옵션:**
+- `--role <role>` — worker, sysadmin, orchestrator (기본값: worker)
+- `--model <model>` — 예: anthropic/claude-opus-4-5
+- `--archetype <name>` — 예: code-reviewer, qa, code-first-developer
+
+**예시:**
+
+```bash
+# Gemini로 코드 리뷰어 추가
+flock add reviewer --role worker --model google-gemini-cli/gemini-3-flash-preview --archetype code-reviewer
+
+# GPT로 개발자 추가
+flock add dev-code --model openai-codex/gpt-5.2 --archetype code-first-developer
+
+# 에이전트 제거
+flock remove dev-code
+```
+
+---
+
+### 워커 에이전트 생성
+
+**방법 A: CLI 사용 (각 추가마다 재시작 불필요)**
+
+```bash
+flock add pm        --archetype project-manager              --model anthropic/claude-opus-4-5
+flock add reviewer  --archetype code-reviewer                --model google-gemini-cli/gemini-3-flash-preview
+flock add dev-code  --archetype code-first-developer         --model openai-codex/gpt-5.2
+flock add dev-prod  --archetype production-first-developer   --model anthropic/claude-opus-4-5
+flock add qa        --archetype qa                           --model google-gemini-cli/gemini-3-flash-preview
+
+# 한 번만 재시작해서 모든 에이전트 로드
+openclaw gateway restart
+```
+
+**방법 B: 오케스트레이터에게 요청**
 
 오케스트레이터에게 메시지를 보내 에이전트를 생성하세요:
 
@@ -184,7 +217,7 @@ Broadcast this to the team.
         "enabled": true,
         "config": {
           // Flock의 SQLite DB 및 데이터 저장 경로
-          "dataDir": ".flock-data",
+          "dataDir": ".flock",
 
           // Flock이 관리하는 에이전트
           "gatewayAgents": [
@@ -218,7 +251,7 @@ Broadcast this to the team.
           "alsoAllow": ["group:plugins"],
           "sandbox": {
             "tools": {
-              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "web_search", "web_fetch"]
+              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "image", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status", "flock_*"]
             }
           }
         },
