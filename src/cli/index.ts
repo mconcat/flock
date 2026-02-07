@@ -178,7 +178,7 @@ async function cmdInit(): Promise<void> {
   // 3. Ensure gateway token is set at top level
   if (!config.gateway) config.gateway = {};
   const gw = config.gateway as Record<string, unknown>;
-  if (!gw.token) gw.token = token;
+  gw.token = token;
 
   // Save
   saveConfig(config);
