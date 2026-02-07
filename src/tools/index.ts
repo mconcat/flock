@@ -1290,40 +1290,61 @@ function createMessageTool(deps: ToolDeps): ToolDefinition {
 // the Clawdbot Discord/Telegram pattern where a channel is the shared medium
 // and each agent reads history independently — no synchronous call chain.
 
-/** Max messages per thread before notifications stop (prevents runaway threads). */
-const THREAD_MSG_LIMIT = 50;
+/** Max messages included in a single thread notification (delta mode). */
+const THREAD_NOTIFY_MAX_MESSAGES = 20;
+/** Max chars per message included in a thread notification (snippets only). */
+const THREAD_NOTIFY_MAX_CHARS = 400;
 
 /**
- * Per-agent notification dedup tracker.
- * Maps threadId → agentId → lastNotifiedSeq.
- * If the thread has no new messages since lastNotifiedSeq, skip notification.
+ * Per-agent thread notification state.
+ *
+ * We track two seqs:
+ * - sentSeq: highest seq successfully delivered to the agent
+ * - scheduledSeq: highest seq currently scheduled/in-flight (prevents storms)
  */
-const notifiedSeqs = new Map<string, Map<string, number>>();
+const sentSeqs = new Map<string, Map<string, number>>();
+const scheduledSeqs = new Map<string, Map<string, number>>();
 
-function getLastNotifiedSeq(threadId: string, agentId: string): number {
-  return notifiedSeqs.get(threadId)?.get(agentId) ?? 0;
+function getSeq(map: Map<string, Map<string, number>>, threadId: string, agentId: string): number {
+  return map.get(threadId)?.get(agentId) ?? 0;
 }
 
-function setLastNotifiedSeq(threadId: string, agentId: string, seq: number): void {
-  if (!notifiedSeqs.has(threadId)) notifiedSeqs.set(threadId, new Map());
-  notifiedSeqs.get(threadId)!.set(agentId, seq);
+function setSeq(map: Map<string, Map<string, number>>, threadId: string, agentId: string, seq: number): void {
+  if (!map.has(threadId)) map.set(threadId, new Map());
+  map.get(threadId)!.set(agentId, seq);
 }
 
-function buildThreadNotification(
-  threadId: string,
-  participants: string[],
-  history: Array<{ agentId: string; content: string }>,
-): string {
-  const historyBlock = history.map(m => `[${m.agentId}]: ${m.content}`).join("\n");
+function buildThreadDeltaNotification(args: {
+  threadId: string;
+  participants: string[];
+  fromSeq: number;
+  toSeq: number;
+  messages: Array<{ seq: number; agentId: string; content: string }>;
+  truncated?: boolean;
+}): string {
+  const { threadId, participants, fromSeq, toSeq, messages, truncated } = args;
+
+  const msgLines = messages.map((m) => {
+    const raw = m.content ?? "";
+    const snippet = raw.replace(/\s+/g, " ").slice(0, THREAD_NOTIFY_MAX_CHARS);
+    const suffix = snippet.length < raw.length ? "…" : "";
+    return `[seq ${m.seq}] ${m.agentId}: ${snippet}${suffix}`;
+  });
+
+  const truncNote = truncated
+    ? `NOTE: Too many new messages to include inline; showing the most recent ${messages.length}. Use flock_thread_read(threadId="${threadId}") for full context.`
+    : `If you need older context, use flock_thread_read(threadId="${threadId}") to read the full thread.`;
+
   return [
     `[Thread Notification — thread: ${threadId}]`,
     `Participants: ${participants.join(", ")}`,
+    `New messages: seq ${fromSeq}..${toSeq} (${toSeq - fromSeq + 1})`,
     ``,
-    `--- Thread History ---`,
-    historyBlock,
-    `--- End History ---`,
+    `--- New Messages ---`,
+    ...(msgLines.length > 0 ? msgLines : ["(no messages)"]),
+    `--- End New Messages ---`,
     ``,
-    `You are a participant in this thread. Read the history above carefully.`,
+    truncNote,
     ``,
     `IMPORTANT — You do NOT have to respond to every message:`,
     `- If the discussion is converging and others have already covered your points, stay silent.`,
@@ -1338,15 +1359,20 @@ function buildThreadNotification(
   ].join("\n");
 }
 
-/** Fire-and-forget: send notification to an agent without awaiting response. */
-function notifyAgent(
-  deps: ToolDeps,
-  target: string,
-  notification: string,
-  threadId: string,
-  taskId: string,
-  currentMaxSeq: number,
-): void {
+type NotifyAgentArgs = {
+  deps: ToolDeps;
+  target: string;
+  threadId: string;
+  taskId: string;
+  currentMaxSeq: number;
+  participants: string[];
+  fallbackText?: string;
+};
+
+/** Fire-and-forget: send delta notification to an agent without awaiting response. */
+function notifyAgent(args: NotifyAgentArgs): void {
+  const { deps, target, threadId, taskId, currentMaxSeq, participants, fallbackText } = args;
+
   // Skip notification for SLEEP agents — they only wake on explicit triggers.
   // Thread notifications are not explicit triggers; direct messages and flock_wake are.
   if (deps.agentLoop) {
@@ -1362,88 +1388,109 @@ function notifyAgent(
     deps.workLoopScheduler.trackThread(target, threadId, currentMaxSeq);
   }
 
-  // Dedup: skip if agent already notified about all current messages
-  const lastSeq = getLastNotifiedSeq(threadId, target);
-  if (lastSeq >= currentMaxSeq) {
-    deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for thread ${threadId} — already notified up to seq ${lastSeq}`);
+  // Delta dedup / storm prevention
+  const sentSeq = getSeq(sentSeqs, threadId, target);
+  const scheduledSeq = getSeq(scheduledSeqs, threadId, target);
+
+  if (scheduledSeq >= currentMaxSeq) {
+    deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for thread ${threadId} — already scheduled up to seq ${scheduledSeq}`);
     return;
   }
-  setLastNotifiedSeq(threadId, target, currentMaxSeq);
+
+  setSeq(scheduledSeqs, threadId, target, currentMaxSeq);
 
   // Random delay (1-5s) to prevent broadcast storm — like Ethernet collision avoidance.
-  // After delay, re-check if new messages arrived; if so, skip this notification
-  // (the newer message's notification will cover it with fresher context).
   const delayMs = 1000 + Math.floor(Math.random() * 4000);
   deps.logger?.debug?.(`[flock:notify] Delaying notification to "${target}" for ${delayMs}ms (thread ${threadId}, seq ${currentMaxSeq})`);
 
   setTimeout(() => {
+    const threadStore = deps.threadMessages;
+
     // Stale check: if new messages arrived during our delay, skip this notification.
     // The newer thread_post will trigger its own notification with updated context.
-    const threadStore = deps.threadMessages;
     if (threadStore) {
-      const latestMessages = threadStore.list({ threadId });
-      const latestMaxSeq = latestMessages.length > 0 ? Math.max(...latestMessages.map(m => m.seq)) : 0;
+      const latest = threadStore.list({ threadId, since: currentMaxSeq });
+      const latestMaxSeq = latest.length > 0 ? Math.max(...latest.map(m => m.seq)) : currentMaxSeq;
       if (latestMaxSeq > currentMaxSeq) {
         deps.logger?.debug?.(`[flock:notify] Skipping stale notification to "${target}" for thread ${threadId} — seq moved from ${currentMaxSeq} to ${latestMaxSeq}`);
         return;
       }
     }
 
-    // Re-build notification with latest thread history for freshest context
-    let freshNotification = notification;
-    if (threadStore) {
-      const latestHistory = threadStore.list({ threadId });
-      const allAgents = [...new Set(latestHistory.map(m => m.agentId))];
-      freshNotification = buildThreadNotification(threadId, allAgents, latestHistory);
+    let notificationText = fallbackText ?? `[Thread Notification — thread: ${threadId}] (no thread store available)`;
+
+    if (threadStore && currentMaxSeq > 0) {
+      const fromSeq = sentSeq + 1;
+      const tailStart = Math.max(fromSeq, currentMaxSeq - THREAD_NOTIFY_MAX_MESSAGES + 1);
+      const delta = threadStore
+        .list({ threadId, since: tailStart, limit: THREAD_NOTIFY_MAX_MESSAGES })
+        .filter(m => m.seq <= currentMaxSeq);
+
+      const truncated = tailStart > fromSeq;
+      notificationText = buildThreadDeltaNotification({
+        threadId,
+        participants,
+        fromSeq,
+        toSeq: currentMaxSeq,
+        messages: delta,
+        truncated,
+      });
     }
 
-    const a2aParams = { message: userMessage(freshNotification) };
+    const a2aParams = { message: userMessage(notificationText) };
+
     deps.a2aClient!.sendA2A(target, a2aParams).then((result) => {
-    const now = Date.now();
-    // Fire-and-forget: do NOT store inline responses in thread.
-    // Agents must respond via flock_thread_post only — this prevents
-    // double-writes and keeps thread_messages as the single source of truth.
-    if (result.response) {
+      const now = Date.now();
+
+      // Update sent seq only on success
+      setSeq(sentSeqs, threadId, target, Math.max(getSeq(sentSeqs, threadId, target), currentMaxSeq));
+
+      // Fire-and-forget: do NOT store inline responses in thread.
+      if (result.response) {
+        deps.audit.append({
+          id: `notify-ack-${threadId}-${target}-${now}`,
+          timestamp: now,
+          agentId: target,
+          action: "notify-ack",
+          level: "GREEN",
+          detail: `Agent "${target}" acknowledged thread ${threadId}: ${(result.response ?? "").slice(0, 200)}`,
+          result: "completed",
+        });
+      }
+      if (deps.taskStore) {
+        deps.taskStore.update(taskId, {
+          state: result.state === "completed" ? "completed" : "failed",
+          responseText: result.response,
+          updatedAt: now,
+          completedAt: now,
+        });
+      }
+    }).catch((err) => {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      deps.logger?.warn(`[flock:broadcast] Notification to "${target}" failed: ${errorMsg}`);
+
+      // Allow retry on next notify: roll back scheduled seq to last sent seq
+      setSeq(scheduledSeqs, threadId, target, getSeq(sentSeqs, threadId, target));
+
+      // Do NOT store errors in thread_messages — only audit
+      if (deps.taskStore) {
+        deps.taskStore.update(taskId, {
+          state: "failed",
+          responseText: errorMsg,
+          updatedAt: Date.now(),
+          completedAt: Date.now(),
+        });
+      }
       deps.audit.append({
-        id: `notify-ack-${threadId}-${target}-${now}`,
-        timestamp: now,
+        id: `notify-fail-${threadId}-${target}-${Date.now()}`,
+        timestamp: Date.now(),
         agentId: target,
-        action: "notify-ack",
-        level: "GREEN",
-        detail: `Agent "${target}" acknowledged thread ${threadId}: ${(result.response ?? "").slice(0, 200)}`,
-        result: "completed",
+        action: "notify-failed",
+        level: "YELLOW",
+        detail: `Thread ${threadId}: notification to ${target} failed — ${errorMsg.slice(0, 200)}`,
+        result: "failed",
       });
-    }
-    if (deps.taskStore) {
-      deps.taskStore.update(taskId, {
-        state: result.state === "completed" ? "completed" : "failed",
-        responseText: result.response,
-        updatedAt: now,
-        completedAt: now,
-      });
-    }
-  }).catch((err) => {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    deps.logger?.warn(`[flock:broadcast] Notification to "${target}" failed: ${errorMsg}`);
-    // Do NOT store errors in thread_messages — only audit
-    if (deps.taskStore) {
-      deps.taskStore.update(taskId, {
-        state: "failed",
-        responseText: errorMsg,
-        updatedAt: Date.now(),
-        completedAt: Date.now(),
-      });
-    }
-    deps.audit.append({
-      id: `notify-fail-${threadId}-${target}-${Date.now()}`,
-      timestamp: Date.now(),
-      agentId: target,
-      action: "notify-failed",
-      level: "YELLOW",
-      detail: `Thread ${threadId}: notification to ${target} failed — ${errorMsg.slice(0, 200)}`,
-      result: "failed",
     });
-  });
   }, delayMs); // end setTimeout
 }
 
@@ -1452,9 +1499,9 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
     name: "flock_broadcast",
     description:
       "Start or continue a group discussion thread. Posts your message to a shared thread and " +
-      "notifies all recipients asynchronously (fire-and-forget). Recipients see full thread " +
-      "history and respond via flock_thread_post. Returns immediately — no waiting for responses. " +
-      "Use flock_thread_read to check for new responses later.",
+      "notifies all recipients asynchronously (fire-and-forget). Recipients receive only NEW thread " +
+      "messages since their last notification (delta mode) to avoid O(n²) prompt growth. " +
+      "Use flock_thread_read to fetch full history when needed.",
     parameters: {
       type: "object",
       required: ["to", "message"],
@@ -1513,8 +1560,9 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
       }
 
       // --- Append sender's message to shared thread ---
+      let currentMaxSeq = 0;
       if (threadStore) {
-        const senderSeq = threadStore.append({
+        currentMaxSeq = threadStore.append({
           threadId,
           agentId: callerAgentId,
           content: message,
@@ -1523,17 +1571,23 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
 
         // Track thread participation for work loop
         if (deps.workLoopScheduler) {
-          deps.workLoopScheduler.trackThread(callerAgentId, threadId, senderSeq);
+          deps.workLoopScheduler.trackThread(callerAgentId, threadId, currentMaxSeq);
           // Also track all targets so the scheduler knows they're in this thread
           for (const t of targets) {
-            deps.workLoopScheduler.trackThread(t, threadId, senderSeq);
+            deps.workLoopScheduler.trackThread(t, threadId, currentMaxSeq);
           }
         }
       }
 
-      // Build the full thread history for notification context
-      const history = threadStore?.list({ threadId }) ?? [];
-      const notification = buildThreadNotification(threadId, participants, history);
+      const messageCount = threadStore ? threadStore.count(threadId) : 0;
+      const fallbackText = [
+        `[Thread Notification — thread: ${threadId}]`,
+        `Participants: ${participants.join(", ")}`,
+        ``,
+        `[${callerAgentId}]: ${message}`,
+        ``,
+        `Use flock_thread_read(threadId="${threadId}") for full history.`,
+      ].join("\n");
 
       // Audit
       deps.audit.append({
@@ -1570,19 +1624,18 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
           });
         }
 
-        // Fire-and-forget: notify agent without waiting
-        const maxSeq = history.length > 0 ? Math.max(...history.map(m => m.seq)) : 0;
-        notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
+        // Fire-and-forget: notify agent without waiting (delta mode)
+        notifyAgent({ deps, target, threadId, taskId, currentMaxSeq, participants, fallbackText });
       }
 
       return toOCResult({
         ok: true,
         output: [
           `Message posted to thread ${threadId} and ${targets.length} agents notified.`,
-          `Thread history: ${history.length} messages.`,
+          `Thread history: ${messageCount} messages.`, 
           `Use flock_thread_read(threadId="${threadId}") to check for responses.`,
         ].join("\n"),
-        data: { threadId, participants, messageCount: history.length, taskIds },
+        data: { threadId, participants, messageCount, taskIds },
       });
     },
   };
@@ -1659,31 +1712,42 @@ function createThreadPostTool(deps: ToolDeps): ToolDefinition {
       });
 
       const history = threadStore.list({ threadId });
+      const messageCount = threadStore.count(threadId);
 
-      // Notify other participants (fire-and-forget, with dedup + limit)
+      // Notify other participants (fire-and-forget, delta mode)
       if (shouldNotify && deps.a2aClient) {
-        if (history.length > THREAD_MSG_LIMIT) {
-          deps.logger?.info(`[flock:thread-post] Thread ${threadId} reached ${history.length} messages — notifications disabled`);
-        } else {
-          const allAgents = [...new Set(history.map(m => m.agentId))];
-          const otherParticipants = allAgents.filter(a => a !== callerAgentId);
-          const maxSeq = history.length > 0 ? Math.max(...history.map(m => m.seq)) : 0;
+        const allAgents = [...new Set(history.map(m => m.agentId))];
+        const otherParticipants = allAgents.filter(a => a !== callerAgentId);
 
-          if (otherParticipants.length > 0) {
-            const notification = buildThreadNotification(threadId, allAgents, history);
-            for (const target of otherParticipants) {
-              // notifyAgent internally checks dedup (lastNotifiedSeq)
-              const taskId = `tp-${threadId}-${target}-${now}`;
-              notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
-            }
+        if (otherParticipants.length > 0) {
+          const fallbackText = [
+            `[Thread Notification — thread: ${threadId}]`,
+            `Participants: ${allAgents.join(", ")}`,
+            ``,
+            `[${callerAgentId}]: ${message}`,
+            ``,
+            `Use flock_thread_read(threadId="${threadId}") for full history.`,
+          ].join("\n");
+
+          for (const target of otherParticipants) {
+            const taskId = `tp-${threadId}-${target}-${now}`;
+            notifyAgent({
+              deps,
+              target,
+              threadId,
+              taskId,
+              currentMaxSeq: newSeq,
+              participants: allAgents,
+              fallbackText,
+            });
           }
         }
       }
 
       return toOCResult({
         ok: true,
-        output: `Message posted to thread ${threadId}. Thread now has ${history.length} messages.`,
-        data: { threadId, messageCount: history.length },
+        output: `Message posted to thread ${threadId}. Thread now has ${messageCount} messages.`,
+        data: { threadId, messageCount },
       });
     },
   };
@@ -1726,7 +1790,7 @@ function createThreadReadTool(deps: ToolDeps): ToolDefinition {
 
       const allMessages = threadStore.list({ threadId });
       const messages = afterSeq > 0
-        ? threadStore.list({ threadId, since: afterSeq })
+        ? threadStore.list({ threadId, since: afterSeq + 1 })
         : allMessages;
 
       if (messages.length === 0) {

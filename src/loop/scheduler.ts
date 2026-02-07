@@ -169,36 +169,18 @@ export class WorkLoopScheduler {
    * Includes: active thread updates, general status, sleep hint.
    */
   private buildTickMessage(agent: AgentLoopRecord): string {
-    const { threadMessages } = this.deps;
-
-    // Collect new thread messages since last tick
-    const threadUpdates = this.getThreadUpdates(agent.agentId);
-
     const awakeDuration = Date.now() - agent.awakenedAt;
     const awakeMins = Math.floor(awakeDuration / 60_000);
 
     const lines: string[] = [
       `[Work Loop Tick]`,
       `State: AWAKE (${awakeMins}m)`,
+      ``,
+      `Continue your work.`,
+      `- Thread updates are delivered via thread notifications (delta mode).`,
+      `- Use flock_thread_read(threadId="...") to review thread history when needed.`,
+      `- If you have nothing to do and no pending work, call flock_sleep() to conserve resources.`,
     ];
-
-    if (threadUpdates.length > 0) {
-      lines.push(``);
-      lines.push(`--- New Thread Activity ---`);
-      for (const update of threadUpdates) {
-        lines.push(`Thread ${update.threadId} (${update.newMessages.length} new):`);
-        for (const msg of update.newMessages) {
-          lines.push(`  [${msg.agentId}]: ${msg.content.slice(0, 200)}`);
-        }
-      }
-      lines.push(`--- End Thread Activity ---`);
-    } else {
-      lines.push(`No new thread activity since last tick.`);
-    }
-
-    lines.push(``);
-    lines.push(`Continue your work. Review any new thread messages and respond if needed.`);
-    lines.push(`If you have nothing to do and no pending work, call flock_sleep() to conserve resources.`);
 
     return lines.join("\n");
   }
