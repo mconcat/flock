@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), ".openclaw", "openclaw.json");
 
@@ -67,7 +68,7 @@ function getFlockPluginPath(): string {
   const candidates = [
     path.join(os.homedir(), ".openclaw", "extensions", "flock"),
     path.join(os.homedir(), ".openclaw", "plugins", "flock"),
-    path.dirname(path.dirname(import.meta.url.replace("file://", ""))),
+    path.dirname(path.dirname(fileURLToPath(import.meta.url))),
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(path.join(candidate, "package.json"))) {
@@ -221,6 +222,10 @@ async function cmdAdd(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  if (!flockConfig.config || typeof flockConfig.config !== "object") {
+    console.error("❌ Flock config is missing or invalid. Run 'flock init' first.");
+    process.exit(1);
+  }
   const flockInner = flockConfig.config as Record<string, unknown>;
   if (!flockInner.gatewayAgents) flockInner.gatewayAgents = [];
   const gatewayAgents = flockInner.gatewayAgents as Array<Record<string, unknown>>;
