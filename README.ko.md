@@ -217,7 +217,7 @@ Broadcast this to the team.
         "enabled": true,
         "config": {
           // Flock의 SQLite DB 및 데이터 저장 경로
-          "dataDir": ".flock-data",
+          "dataDir": ".flock",
 
           // Flock이 관리하는 에이전트
           "gatewayAgents": [
@@ -251,7 +251,7 @@ Broadcast this to the team.
           "alsoAllow": ["group:plugins"],
           "sandbox": {
             "tools": {
-              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "web_search", "web_fetch"]
+              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "image", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status", "flock_*"]
             }
           }
         },

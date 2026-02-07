@@ -31,13 +31,23 @@ npm run build --silent
 
 # Link globally (optional, for 'flock' command)
 echo "   Linking CLI..."
-npm link --silent 2>/dev/null || true
+if npm link --silent 2>/dev/null; then
+  LINK_OK=true
+else
+  LINK_OK=false
+fi
 
 echo ""
 echo "✅ Flock installed successfully!"
 echo ""
 echo "🚀 Next steps:"
-echo "   1. Run: flock init"
-echo "   2. Start gateway: openclaw gateway start"
+if [ "$LINK_OK" = true ]; then
+  echo "   1. Run: flock init"
+  echo "   2. Start gateway: openclaw gateway start"
+else
+  echo "   ⚠️ Global CLI link failed. You can still run Flock directly."
+  echo "   1. Run: $FLOCK_DIR/dist/cli/index.js init"
+  echo "   2. Start gateway: openclaw gateway start"
+fi
 echo ""
 echo "   Or run directly: $FLOCK_DIR/dist/cli/index.js init"

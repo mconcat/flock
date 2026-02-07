@@ -217,7 +217,7 @@ Agents get these Flock-specific tools:
         "enabled": true,
         "config": {
           // Where Flock stores its SQLite DB and data
-          "dataDir": ".flock-data",
+          "dataDir": ".flock",
 
           // Agents managed by Flock
           "gatewayAgents": [
@@ -251,7 +251,7 @@ Each agent also needs an entry in `agents.list` with model and workspace:
           "alsoAllow": ["group:plugins"],
           "sandbox": {
             "tools": {
-              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "web_search", "web_fetch"]
+              "allow": ["exec", "process", "read", "write", "edit", "apply_patch", "image", "sessions_list", "sessions_history", "sessions_send", "sessions_spawn", "session_status", "flock_*"]
             }
           }
         },

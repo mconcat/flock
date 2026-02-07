@@ -74,7 +74,7 @@ function getFlockPluginPath(): string {
       return candidate;
     }
   }
-  return ".openclaw/extensions/flock";
+  return path.join(os.homedir(), ".openclaw", "extensions", "flock");
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ async function cmdInit(): Promise<void> {
   const agents = config.agents as Record<string, unknown>;
   if (!agents.list) agents.list = [];
 
-  // Add orchestrator agent if not present
+  // Add orchestrator agent if not present, otherwise update its model
   const agentsList = agents.list as Array<Record<string, unknown>>;
   const hasOrchestrator = agentsList.some((a) => a.id === "orchestrator");
   if (!hasOrchestrator) {
@@ -163,6 +163,16 @@ async function cmdInit(): Promise<void> {
       tools: { alsoAllow: ["group:plugins"] },
       workspace: `~/.openclaw/workspace-orchestrator`,
     });
+  } else {
+    const orchestrator = agentsList.find((a) => a.id === "orchestrator");
+    if (orchestrator) {
+      const model = orchestrator.model as Record<string, unknown> | undefined;
+      if (model && typeof model === "object") {
+        model.primary = orchestratorModel;
+      } else {
+        orchestrator.model = { primary: orchestratorModel };
+      }
+    }
   }
 
   // 3. Ensure gateway token is set at top level
@@ -270,25 +280,42 @@ async function cmdRemove(args: string[]): Promise<void> {
   }
 
   const config = loadConfig();
+  let removedFromGateway = false;
+  let removedFromAgents = false;
 
   // Remove from gatewayAgents
   const flockConfig = ((config.plugins as Record<string, unknown>)?.entries as Record<string, unknown>)?.flock as Record<string, unknown> | undefined;
   if (flockConfig?.config) {
     const inner = flockConfig.config as Record<string, unknown>;
     if (Array.isArray(inner.gatewayAgents)) {
-      inner.gatewayAgents = (inner.gatewayAgents as Array<unknown>).filter((a) => {
-        if (typeof a === "string") return a !== agentId;
-        if (typeof a === "object" && a !== null) return (a as Record<string, unknown>).id !== agentId;
-        return true;
+      const gatewayAgents = inner.gatewayAgents as Array<unknown>;
+      removedFromGateway = gatewayAgents.some((a) => {
+        if (typeof a === "string") return a === agentId;
+        if (typeof a === "object" && a !== null) return (a as Record<string, unknown>).id === agentId;
+        return false;
       });
+      if (removedFromGateway) {
+        inner.gatewayAgents = gatewayAgents.filter((a) => {
+          if (typeof a === "string") return a !== agentId;
+          if (typeof a === "object" && a !== null) return (a as Record<string, unknown>).id !== agentId;
+          return true;
+        });
+      }
     }
   }
 
   // Remove from agents.list
   if (config.agents && Array.isArray((config.agents as Record<string, unknown>).list)) {
-    (config.agents as Record<string, unknown>).list = (
-      (config.agents as Record<string, unknown>).list as Array<Record<string, unknown>>
-    ).filter((a) => a.id !== agentId);
+    const agentsList = (config.agents as Record<string, unknown>).list as Array<Record<string, unknown>>;
+    removedFromAgents = agentsList.some((a) => a.id === agentId);
+    if (removedFromAgents) {
+      (config.agents as Record<string, unknown>).list = agentsList.filter((a) => a.id !== agentId);
+    }
+  }
+
+  if (!removedFromGateway && !removedFromAgents) {
+    console.error(`❌ Agent '${agentId}' not found in config.`);
+    process.exit(1);
   }
 
   saveConfig(config);
