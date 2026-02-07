@@ -2,6 +2,14 @@
 
 These templates map to OpenClaw's workspace file structure. At provisioning time, the orchestrator assembles these into an agent's workspace.
 
+**All prompts are defined as markdown files** in this directory, following a consistent pattern:
+- Agent role instructions: `agents/*.md`
+- Soul archetypes: `soul/*.md`
+- Communication protocol: `COMMUNICATION.md`
+- System context templates: `USER.md`, `IDENTITY.md`, `MEMORY.md`, `HEARTBEAT.md`, `TOOLS.md`
+
+Code modules load these markdown files at runtime rather than embedding prompts as inline strings, ensuring a single source of truth and easier maintenance.
+
 ## File Mapping
 
 ### Immutable Layer (agent cannot modify)
@@ -11,6 +19,7 @@ These templates map to OpenClaw's workspace file structure. At provisioning time
 | `AGENTS.md` | `agents/base.md` + `agents/{role}.md` | Layer 1 + Layer 2 merged. Role = sysadmin, worker, or orchestrator. |
 | `USER.md` | `USER.md` | Flock system context + human operator info. Template vars filled at provision time. |
 | `TOOLS.md` | `TOOLS.md` | Available tools and node info. Programmatically generated. |
+| `COMMUNICATION.md` | `COMMUNICATION.md` | Message type expectations and communication protocol. Loaded programmatically. |
 
 ### Mutable Layer (agent can modify, lives in sandbox)
 
