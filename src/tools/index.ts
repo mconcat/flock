@@ -1551,7 +1551,7 @@ function createBroadcastTool(deps: ToolDeps): ToolDefinition {
       const taskStore = deps.taskStore;
       const taskIds: Record<string, string> = {};
       for (const target of targets) {
-        const taskId = `bc-${threadId}-${target}-${Date.now()}`;
+        const taskId = uniqueId(`bc-${threadId}-${target}`);
         taskIds[target] = taskId;
         if (taskStore) {
           taskStore.insert({
@@ -1674,7 +1674,7 @@ function createThreadPostTool(deps: ToolDeps): ToolDefinition {
             const notification = buildThreadNotification(threadId, allAgents, history);
             for (const target of otherParticipants) {
               // notifyAgent internally checks dedup (lastNotifiedSeq)
-              const taskId = `tp-${threadId}-${target}-${now}`;
+              const taskId = uniqueId(`tp-${threadId}-${target}`);
               notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
             }
           }
@@ -2208,7 +2208,7 @@ function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
 
       // Audit the response
       deps.audit.append({
-        id: `task-respond-${now}`,
+        id: uniqueId("task-respond"),
         timestamp: now,
         agentId: callerAgentId,
         action: "task-respond",
