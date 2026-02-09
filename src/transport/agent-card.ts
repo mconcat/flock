@@ -96,6 +96,24 @@ export function createSysadminCard(nodeId: string, endpointUrl: string, agentId 
 }
 
 /**
+ * Create an Agent Card for the orchestrator agent.
+ * The orchestrator manages channels, assigns agents, and monitors swarm health.
+ * It does NOT have sysadmin/triage capabilities.
+ */
+export function createOrchestratorCard(nodeId: string, endpointUrl: string, agentId = "orchestrator"): { card: AgentCard; meta: FlockCardMetadata } {
+  const params: CreateCardParams = {
+    agentId,
+    nodeId,
+    role: "orchestrator",
+    name: agentId,
+    description: `Flock orchestrator for ${nodeId}. Manages channels, assigns agents to channels, monitors swarm health, and relays human operator requests.`,
+    endpointUrl,
+    skills: [ORCHESTRATOR_CHANNEL_SKILL, ORCHESTRATOR_LIFECYCLE_SKILL],
+  };
+  return { card: createAgentCard(params), meta: buildFlockMetadata(params) };
+}
+
+/**
  * Create an Agent Card for a worker agent.
  *
  * When `archetype` and `archetypeContent` are provided, initial skills
@@ -156,6 +174,34 @@ const SYSADMIN_HEALTH_SKILL: AgentSkill = {
   name: "Node Health Check",
   description: "Reports node resource status (CPU, memory, disk, GPU).",
   tags: ["sysadmin", "monitoring", "health"],
+};
+
+const ORCHESTRATOR_CHANNEL_SKILL: AgentSkill = {
+  id: "orchestrator-channels",
+  name: "Channel Management",
+  description:
+    "Creates and manages channels for projects, features, and issues. " +
+    "Assigns agents to channels based on expertise and A2A Card profiles. " +
+    "Archives channels when work is complete.",
+  tags: ["orchestrator", "channels", "management"],
+  examples: [
+    "Create a channel for the logging library project with PM, dev, and reviewer",
+    "Add QA to the project-logging channel",
+    "Archive the completed project channel",
+  ],
+};
+
+const ORCHESTRATOR_LIFECYCLE_SKILL: AgentSkill = {
+  id: "orchestrator-lifecycle",
+  name: "Agent Lifecycle Management",
+  description:
+    "Creates and decommissions agents on human operator request. " +
+    "Manages agent fleet composition and monitors swarm health.",
+  tags: ["orchestrator", "lifecycle", "agents"],
+  examples: [
+    "Create a new code reviewer agent with the reviewer archetype",
+    "Decommission an idle agent that is no longer needed",
+  ],
 };
 
 // --- Card Registry (in-memory for Phase 1) ---

@@ -4,7 +4,7 @@
  * Tools:
  * - flock_create_agent: Create a new agent on the current node (orchestrator only)
  * - flock_decommission_agent: Remove an agent from the current node (orchestrator only)
- * - flock_restart_gateway: Restart the gateway process (sysadmin or orchestrator)
+ * - flock_restart_gateway: Restart the gateway process (sysadmin only)
  *
  * These tools enable the orchestrator to manage the agent fleet
  * programmatically without manual config editing.
@@ -23,7 +23,7 @@ import { toOCResult } from "../types.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
 import { createGatewaySessionSend } from "../transport/gateway-send.js";
-import { createWorkerCard, createSysadminCard } from "../transport/agent-card.js";
+import { createWorkerCard, createSysadminCard, createOrchestratorCard } from "../transport/agent-card.js";
 import { createFlockExecutor } from "../transport/executor.js";
 import type { ToolDeps } from "./index.js";
 
@@ -192,16 +192,14 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
         logger: deps.logger,
       });
 
-      // Create agent card
+      // Create agent card — each role gets its own card type
       const nodeId = deps.config.nodeId;
       const endpointUrl = `http://localhost:${deps.config.gateway.port}/flock/a2a/${newAgentId}`;
-      const { card, meta } = (role === "sysadmin" || role === "orchestrator")
-        ? createSysadminCard(nodeId, endpointUrl, newAgentId)
-        : createWorkerCard(newAgentId, nodeId, endpointUrl);
-      // For orchestrator, override the role metadata
-      if (role === "orchestrator") {
-        meta.role = "orchestrator";
-      }
+      const { card, meta } = role === "orchestrator"
+        ? createOrchestratorCard(nodeId, endpointUrl, newAgentId)
+        : role === "sysadmin"
+          ? createSysadminCard(nodeId, endpointUrl, newAgentId)
+          : createWorkerCard(newAgentId, nodeId, endpointUrl);
 
       // Create executor
       const executor = createFlockExecutor({
@@ -519,7 +517,7 @@ export function createRestartGatewayTool(deps: ToolDeps, callerAgentIdFromCtx?: 
   return {
     name: "flock_restart_gateway",
     description:
-      "Restart the gateway process. Only sysadmin or orchestrator role agents can use this tool. " +
+      "Restart the gateway process. Only sysadmin role agents can use this tool. " +
       "Sends SIGUSR1 to trigger a graceful gateway restart.",
     parameters: {
       type: "object",
@@ -528,16 +526,16 @@ export function createRestartGatewayTool(deps: ToolDeps, callerAgentIdFromCtx?: 
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
       const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, params, sessionKeyFromCtx);
 
-      // Authorization: sysadmin or orchestrator
+      // Authorization: sysadmin only (infrastructure operation)
       if (!deps.a2aServer) {
         return toOCResult({ ok: false, error: "A2A server not initialized." });
       }
 
-      if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["orchestrator", "sysadmin"])) {
+      if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["sysadmin"])) {
         const callerMeta = deps.a2aServer.getAgentMeta(callerAgentId);
         return toOCResult({
           ok: false,
-          error: `Permission denied: only sysadmin or orchestrator agents can restart the gateway. Caller '${callerAgentId}' has role: ${callerMeta?.role ?? "unknown"}`,
+          error: `Permission denied: only sysadmin agents can restart the gateway. Caller '${callerAgentId}' has role: ${callerMeta?.role ?? "unknown"}`,
         });
       }
 

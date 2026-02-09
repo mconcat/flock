@@ -1950,7 +1950,7 @@ function createDiscoverTool(deps: ToolDeps): ToolDefinition {
         },
         role: {
           type: "string",
-          enum: ["worker", "sysadmin"],
+          enum: ["worker", "sysadmin", "orchestrator"],
           description: "Filter by agent role",
         },
         skill: {
@@ -1978,7 +1978,7 @@ function createDiscoverTool(deps: ToolDeps): ToolDefinition {
       let entries = registry.list();
 
       // Filter by role
-      if (role === "worker" || role === "sysadmin") {
+      if (role === "worker" || role === "sysadmin" || role === "orchestrator") {
         entries = entries.filter((e) => e.meta.role === role);
       }
 

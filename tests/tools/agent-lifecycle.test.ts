@@ -584,18 +584,13 @@ describe("flock_restart_gateway", () => {
     killSpy.mockRestore();
   });
 
-  it("allows orchestrator to restart gateway", async () => {
-    const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
-
+  it("rejects orchestrator callers (infrastructure is sysadmin-only)", async () => {
     const result = await tool.execute("test-call", {
       agentId: "orchestrator",
     });
 
-    expect(result.details?.ok).toBe(true);
-    expect(result.content[0].text).toContain("SIGUSR1");
-    expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGUSR1");
-
-    killSpy.mockRestore();
+    expect(result.details?.ok).toBe(false);
+    expect(result.content[0].text).toContain("Permission denied");
   });
 
   it("rejects worker callers", async () => {

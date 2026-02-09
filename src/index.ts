@@ -24,7 +24,7 @@ import type { A2AClient } from "./transport/client.js";
 import { createPeerResolver, createPeerSysadminResolver } from "./transport/topologies/peer.js";
 import { createCentralResolver, createCentralSysadminResolver } from "./transport/topologies/central.js";
 import { createAssignmentStore } from "./nodes/assignment.js";
-import { createWorkerCard, createSysadminCard } from "./transport/agent-card.js";
+import { createWorkerCard, createSysadminCard, createOrchestratorCard } from "./transport/agent-card.js";
 import { createEchoExecutor } from "./transport/echo-executor.js";
 import { createFlockExecutor } from "./transport/executor.js";
 import { createGatewaySessionSend } from "./transport/gateway-send.js";
@@ -385,13 +385,11 @@ export function register(api: PluginApi) {
         logger,
       });
       const endpointUrl = `${baseUrl}/a2a/${agent.id}`;
-      const { card, meta } = (role === "sysadmin" || role === "orchestrator")
-        ? createSysadminCard(nodeId, endpointUrl, agent.id)
-        : createWorkerCard(agent.id, nodeId, endpointUrl);
-      // For orchestrator, override the role metadata to "orchestrator"
-      if (role === "orchestrator") {
-        meta.role = "orchestrator";
-      }
+      const { card, meta } = role === "orchestrator"
+        ? createOrchestratorCard(nodeId, endpointUrl, agent.id)
+        : role === "sysadmin"
+          ? createSysadminCard(nodeId, endpointUrl, agent.id)
+          : createWorkerCard(agent.id, nodeId, endpointUrl);
 
       const executor = createFlockExecutor({
         flockMeta: meta,

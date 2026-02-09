@@ -64,7 +64,7 @@ export function createFlockExecutor(params: FlockExecutorParams): AgentExecutor 
     responseTimeoutMs = 600_000,
   } = params;
 
-  const isSysadmin = flockMeta.role === "sysadmin" || flockMeta.role === "orchestrator";
+  const isSysadmin = flockMeta.role === "sysadmin";
 
   return {
     async execute(ctx: RequestContext, eventBus: ExecutionEventBus): Promise<void> {

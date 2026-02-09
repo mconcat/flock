@@ -12,12 +12,12 @@
 
 | # | 영역 | 심각도 | 상태 |
 |---|------|--------|------|
-| 1 | [채널 모델](#1-채널-모델) | **Critical** | 완전 부재 — thread 기반, 채널 메타데이터/멤버십 없음 |
-| 2 | [Orchestrator/Sysadmin 역할 분리](#2-orchestratorsysadmin-역할-분리) | **Critical** | 반대로 구현됨 — Orchestrator가 Sysadmin 책임 상속 |
-| 3 | [Per-Channel 세션 모델](#3-per-channel-세션-모델) | **Critical** | 부재 — agent-level 세션만 존재 |
-| 4 | [아카이브 프로토콜](#4-아카이브-프로토콜) | Major | 부재 |
+| 1 | [채널 모델](#1-채널-모델) | **Critical** | ✅ **완료** — channel 모델 구현, thread→channel 마이그레이션 |
+| 2 | [Orchestrator/Sysadmin 역할 분리](#2-orchestratorsysadmin-역할-분리) | **Critical** | ✅ **완료** — 프롬프트 재작성, 카드 분리, executor/권한 수정 |
+| 3 | [Per-Channel 세션 모델](#3-per-channel-세션-모델) | **Critical** | 미구현 — OpenClaw 네이티브 지원 확인, 세션 키 매핑 문서화 완료 |
+| 4 | [아카이브 프로토콜](#4-아카이브-프로토콜) | Major | 부분 구현 — flock_channel_archive 기본만 존재, 전체 프로토콜 부재 |
 | 5 | [Slack/Discord 브릿지](#5-slackdiscord-브릿지) | Major | 부재 |
-| 6 | [Delta 알림 채널 컨텍스트](#6-delta-알림-채널-컨텍스트) | Minor | 채널 모델 구현 후 소규모 변경 필요 |
+| 6 | [Delta 알림 채널 컨텍스트](#6-delta-알림-채널-컨텍스트) | Minor | ✅ **완료** — buildChannelNotification에 이름/topic 포함 |
 | 7 | [메모리 모델](#7-메모리-모델) | Minor | 기반 존재 (workspace tools), 보강 필요 |
 | 8 | [A2A Card 업데이트](#8-a2a-card-업데이트) | OK | 이미 동작 중 |
 
@@ -243,7 +243,7 @@ role: {
 
 ## 3. Per-Channel 세션 모델
 
-### 심각도: Critical — 부재
+### 심각도: Critical — 미구현 (OpenClaw 지원 확인됨)
 
 ### 비전 (VISION.md §2.3)
 
@@ -260,6 +260,64 @@ agent: "dev-code"
 - 각 에이전트는 참여하는 채널마다 독립 세션을 보유
 - 세션 간 컨텍스트 완전 격리
 - Delta 알림은 해당 채널의 세션으로 라우팅
+
+### OpenClaw 세션 키 매핑 (조사 완료)
+
+OpenClaw는 **네이티브 per-channel 세션**을 지원한다. 세션 키 형식:
+
+```
+agent:{agentId}:{channel}:{chatType}:{peerId}
+```
+
+| 세션 키 필드 | 설명 | Flock에서의 값 |
+|-------------|------|---------------|
+| `agentId` | OpenClaw 에이전트 ID | Flock 에이전트 ID (예: `dev-code`) |
+| `channel` | 트랜스포트 채널 이름 | `"flock"` (고정) |
+| `chatType` | 대화 유형 | `"channel"` (채널) 또는 `"dm"` (DM) |
+| **`peerId`** | **대화 상대/공간 식별자** | **Flock `channelId`** (예: `project-logging`) |
+
+**핵심 매핑: Flock `channelId` = OpenClaw 세션 키의 `peerId`**
+
+예시:
+
+```
+agent:dev-code:flock:channel:project-logging   ← dev-code의 #project-logging 세션
+agent:dev-code:flock:channel:backend-api       ← dev-code의 #backend-api 세션
+agent:dev-code:flock:dm:pm                     ← dev-code ↔ pm 1:1 DM 세션
+```
+
+관련 OpenClaw 코드:
+- `routing/session-key.ts` — `buildAgentPeerSessionKey()` 세션 키 생성
+- `agents/tools/sessions-send-tool.ts` — `sessions_send` 크로스 세션 메시지
+- `gateway/server-methods/sessions.ts` — `sessions.resolve` 세션 관리 RPC
+
+### OpenClaw 디스코드 다중 에이전트 대화 메커니즘 (참고)
+
+디스코드에서 한 채널에 여러 에이전트를 넣으면 자기들끼리 대화가 되는 이유:
+
+OpenClaw 디스코드 모니터가 **채널별 인메모리 히스토리 버퍼** (`guildHistories[channelId]`)를 유지한다. 새 메시지가 채널에 도착하면, 해당 채널의 모든 에이전트에게 이전 대화 내역이 LLM 컨텍스트에 자동 주입된다.
+
+```
+guildHistories[discord-channel-id] → [msg1(user), msg2(agent-a), msg3(agent-b), ...]
+                                      ↑ 새 메시지 도착 시 모든 에이전트에게 주입
+```
+
+관련 OpenClaw 코드:
+- `discord/monitor/provider.ts` — `guildHistories` 맵 생성 (인메모리, 채널 ID 키)
+- `discord/monitor/message-handler.process.ts` — `buildPendingHistoryContextFromMap()`으로 컨텍스트 주입
+- `discord/monitor/message-handler.preflight.ts` — 히스토리 엔트리 기록, 봇 자기 메시지 필터
+
+**이 메커니즘은 `sessions_send`와 무관하다.** 디스코드 모니터 레이어에서 동작하며, Flock 채널 프레임워크와의 차이:
+
+| | 디스코드 `guildHistories` | Flock 채널 |
+|---|---|---|
+| 저장 | 인메모리 (재시작 시 유실) | SQLite (영속적) |
+| 전달 | passive (새 메시지 도착 시) | active (delta push 알림) |
+| 스코프 | 디스코드 전용 | 플랫폼 독립 |
+| 조회 | 불가 (자동 주입만) | `flock_channel_read` |
+| 멤버십 | 디스코드 채널 설정 | `ChannelRecord.members` |
+
+Gap #5 (Slack/Discord 브릿지) 구현 시, Flock 채널 ↔ 디스코드 `guildHistories`를 연동하는 것이 자연스러운 접근이다.
 
 ### 현재 구현
 
@@ -286,30 +344,27 @@ export type SessionSendFn = (
 
 요청 헤더에 `agentId`만 있고 `channelId`가 없다. 게이트웨이가 에이전트 세션을 하나만 관리한다.
 
-#### 3-c. OpenClaw 플랫폼 지원 확인 필요
-
-Per-channel 세션은 OpenClaw의 multi-session 기능에 의존한다. OpenClaw가 한 에이전트에 대해 여러 세션을 동시에 관리할 수 있는지 확인이 필요하다.
-
 ### 필요한 작업
 
-1. **OpenClaw multi-session 지원 확인** — 플랫폼 제약 사항 파악
+1. ~~**OpenClaw multi-session 지원 확인**~~ ✅ 확인 완료 — 네이티브 지원
 2. **`SessionSendFn` 시그니처 확장** — `channelId` 파라미터 추가
-3. **Gateway Send에 채널 라우팅 추가** — 헤더 또는 세션 키에 channelId 포함
+3. **Gateway Send에 채널 세션 키 사용** — `agent:{agentId}:flock:channel:{channelId}` 형태로 요청
 4. **Delta 알림의 채널 세션 라우팅** — 알림이 해당 채널 세션으로 전달
+5. **DM 세션 분리** — `flock_message`도 `agent:{agentId}:flock:dm:{peerId}` 형태로 라우팅
 
 ### 관련 파일
 
 | 파일 | 변경 내용 |
 |------|----------|
 | `src/transport/executor.ts` | SessionSendFn에 channelId 추가 |
-| `src/transport/gateway-send.ts` | 채널별 세션 라우팅 |
+| `src/transport/gateway-send.ts` | 세션 키 기반 채널별 라우팅 |
 | `src/tools/index.ts` | 알림 시 채널 세션 타겟팅 |
 | `src/loop/scheduler.ts` | 틱 메시지의 채널 세션 라우팅 |
 
 ### 의존성
 
-- 채널 모델 (#1)이 먼저 구현되어야 한다
-- OpenClaw 플랫폼의 multi-session 지원이 전제 조건
+- ✅ 채널 모델 (#1) — 완료
+- ✅ OpenClaw multi-session 지원 — 확인됨
 
 ---
 

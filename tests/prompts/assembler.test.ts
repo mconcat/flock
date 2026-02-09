@@ -38,7 +38,7 @@ describe("assembleAgentsMd", () => {
     expect(content).toContain("Flock Agent Operating Protocol");
     // Must contain orchestrator role content
     expect(content).toContain("Your Role: Orchestrator");
-    expect(content).toContain("Flock-Level Responsibilities");
+    expect(content).toContain("Core Responsibilities");
   });
 
   it("system role returns only base content (no role-specific file)", () => {
