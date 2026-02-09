@@ -18,7 +18,7 @@ import type { HomeManager } from "../homes/manager.js";
 import type { HomeProvisioner } from "../homes/provisioner.js";
 import { formatBindMountsForConfig } from "../homes/provisioner.js";
 import type { AuditLog } from "../audit/log.js";
-import type { HomeFilter, AuditFilter, TaskStore, TaskFilter, TaskRecord } from "../db/index.js";
+import type { HomeFilter, AuditFilter, TaskStore, TaskFilter, TaskRecord, ChannelStore, ChannelMessageStore } from "../db/index.js";
 import { isTaskState, TASK_STATES } from "../db/index.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
@@ -52,8 +52,10 @@ export interface ToolDeps {
   sysadminAgentId?: string;
   /** Task store for async task lifecycle tracking. */
   taskStore?: TaskStore;
-  /** Thread message store for shared thread history. */
-  threadMessages?: import("../db/index.js").ThreadMessageStore;
+  /** Channel metadata store for named conversation spaces. */
+  channelStore?: ChannelStore;
+  /** Channel message store for shared channel history. */
+  channelMessages?: ChannelMessageStore;
   /** Migration engine for triggering migrations. */
   migrationEngine?: MigrationEngine;
   /** Migration orchestrator for running complete migrations. */
@@ -64,7 +66,7 @@ export interface ToolDeps {
   vaultsBasePath?: string;
   /** Agent loop state store for AWAKE/SLEEP management. */
   agentLoop?: AgentLoopStore;
-  /** Work loop scheduler for thread tracking. */
+  /** Work loop scheduler for channel tracking. */
   workLoopScheduler?: WorkLoopScheduler;
 }
 
@@ -112,9 +114,12 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     createSysadminProtocolTool(),
     createSysadminRequestTool(deps),
     createMessageTool(deps),
-    createBroadcastTool(deps),
-    createThreadPostTool(deps),
-    createThreadReadTool(deps),
+    createChannelCreateTool(deps),
+    createChannelPostTool(deps),
+    createChannelReadTool(deps),
+    createChannelListTool(deps),
+    createAssignMembersTool(deps),
+    createChannelArchiveTool(deps),
     createDiscoverTool(deps),
     createHistoryTool(deps),
     createTasksTool(deps),
@@ -945,7 +950,7 @@ function createSleepTool(deps: ToolDeps): ToolDefinition {
   return {
     name: "flock_sleep",
     description:
-      "Enter SLEEP state. You stop receiving work loop ticks and thread notifications. " +
+      "Enter SLEEP state. You stop receiving work loop ticks and channel notifications. " +
       "Only call this when you have no pending work and nothing to contribute. " +
       "You will stay asleep until explicitly woken by another agent (direct message, " +
       "mention, or flock_wake). Use sparingly — if you might have work soon, stay AWAKE.",
@@ -990,7 +995,7 @@ function createSleepTool(deps: ToolDeps): ToolDefinition {
 
       return toOCResult({
         ok: true,
-        output: `Entering SLEEP state. You will not receive ticks or thread notifications until woken. Reason: ${reason}`,
+        output: `Entering SLEEP state. You will not receive ticks or channel notifications until woken. Reason: ${reason}`,
         data: { state: "SLEEP", reason },
       });
     },
@@ -1062,7 +1067,7 @@ function createWakeTool(deps: ToolDeps): ToolDefinition {
           `You were woken by ${callerAgentId}.`,
           `Reason: ${reason}`,
           ``,
-          `You are now AWAKE. Check your threads and pending work.`,
+          `You are now AWAKE. Check your channels and pending work.`,
         ].join("\n");
 
         deps.a2aClient.sendA2A(targetAgentId, {
@@ -1285,46 +1290,52 @@ function createMessageTool(deps: ToolDeps): ToolDefinition {
   };
 }
 
-// --- flock_broadcast ---
-// Async fire-and-forget: posts to shared thread, notifies agents without
-// waiting for responses. Agents respond via flock_thread_post. This mirrors
-// the Clawdbot Discord/Telegram pattern where a channel is the shared medium
-// and each agent reads history independently — no synchronous call chain.
+// --- Channel tools ---
+// Named, persistent conversation spaces with membership.
+// Agents interact via channels: create, post, read, manage members.
 
-/** Max messages per thread before notifications stop (prevents runaway threads). */
-const THREAD_MSG_LIMIT = 50;
+/** Max messages per channel before notifications stop (prevents runaway channels). */
+const CHANNEL_MSG_LIMIT = 50;
 
 /**
  * Per-agent notification dedup tracker.
- * Maps threadId → agentId → lastNotifiedSeq.
- * If the thread has no new messages since lastNotifiedSeq, skip notification.
+ * Maps channelId → agentId → lastNotifiedSeq.
  */
 const notifiedSeqs = new Map<string, Map<string, number>>();
 
-function getLastNotifiedSeq(threadId: string, agentId: string): number {
-  return notifiedSeqs.get(threadId)?.get(agentId) ?? 0;
+function getLastNotifiedSeq(channelId: string, agentId: string): number {
+  return notifiedSeqs.get(channelId)?.get(agentId) ?? 0;
 }
 
-function setLastNotifiedSeq(threadId: string, agentId: string, seq: number): void {
-  if (!notifiedSeqs.has(threadId)) notifiedSeqs.set(threadId, new Map());
-  notifiedSeqs.get(threadId)!.set(agentId, seq);
+function setLastNotifiedSeq(channelId: string, agentId: string, seq: number): void {
+  if (!notifiedSeqs.has(channelId)) notifiedSeqs.set(channelId, new Map());
+  notifiedSeqs.get(channelId)!.set(agentId, seq);
 }
 
-function buildThreadNotification(
-  threadId: string,
-  participants: string[],
-  history: Array<{ agentId: string; content: string }>,
+/**
+ * Build a channel notification with delta messages only (not full history).
+ * Includes channel name, topic, and member list for rich context.
+ */
+function buildChannelNotification(
+  channel: { channelId: string; topic: string; members: string[] },
+  newMessages: Array<{ seq: number; agentId: string; content: string }>,
+  allMessageCount: number,
 ): string {
-  const historyBlock = history.map(m => `[${m.agentId}]: ${m.content}`).join("\n");
+  const firstSeq = newMessages[0]?.seq ?? 0;
+  const lastSeq = newMessages[newMessages.length - 1]?.seq ?? 0;
+  const newBlock = newMessages.map(m => `[seq ${m.seq}] ${m.agentId}: ${m.content}`).join("\n");
+
   return [
-    `[Thread Notification — thread: ${threadId}]`,
-    `Participants: ${participants.join(", ")}`,
+    `[Channel: #${channel.channelId}]`,
+    channel.topic ? `Topic: ${channel.topic}` : null,
+    `Members: ${channel.members.join(", ")}`,
+    `New messages: seq ${firstSeq}..${lastSeq} (${newMessages.length} new, ${allMessageCount} total)`,
     ``,
-    `--- Thread History ---`,
-    historyBlock,
-    `--- End History ---`,
+    `--- New Messages ---`,
+    newBlock,
+    `--- End New Messages ---`,
     ``,
-    `You are a participant in this thread. Read the history above carefully.`,
+    `You are a member of this channel. Read the new messages above carefully.`,
     ``,
     `IMPORTANT — You do NOT have to respond to every message:`,
     `- If the discussion is converging and others have already covered your points, stay silent.`,
@@ -1333,349 +1344,337 @@ function buildThreadNotification(
     `- Respond ONLY when you have genuinely new information, a different perspective, or a decision that needs your role's input.`,
     `- It is perfectly fine to not respond. Silence is a valid and valuable choice.`,
     ``,
-    `If you decide to respond, use flock_thread_post(threadId="${threadId}", message="your response").`,
-    `Do NOT use flock_broadcast to respond — use flock_thread_post only.`,
-    `If you have nothing new to add, simply acknowledge internally and do NOT call flock_thread_post.`,
-  ].join("\n");
+    `Full history: flock_channel_read(channelId="${channel.channelId}")`,
+    `Respond: flock_channel_post(channelId="${channel.channelId}", message="...")`,
+    `If you have nothing new to add, simply acknowledge internally and do NOT call flock_channel_post.`,
+  ].filter(Boolean).join("\n");
 }
 
-/** Fire-and-forget: send notification to an agent without awaiting response. */
+/** Fire-and-forget: send notification to an agent about channel activity. */
 function notifyAgent(
   deps: ToolDeps,
   target: string,
   notification: string,
-  threadId: string,
+  channelId: string,
   taskId: string,
   currentMaxSeq: number,
 ): void {
   // Skip notification for SLEEP agents — they only wake on explicit triggers.
-  // Thread notifications are not explicit triggers; direct messages and flock_wake are.
   if (deps.agentLoop) {
     const loopState = deps.agentLoop.get(target);
     if (loopState?.state === "SLEEP") {
-      deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for thread ${threadId} — agent is SLEEP`);
+      deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for channel ${channelId} — agent is SLEEP`);
       return;
     }
   }
 
-  // Track thread participation for the work loop scheduler
+  // Track channel participation for the work loop scheduler
   if (deps.workLoopScheduler) {
-    deps.workLoopScheduler.trackThread(target, threadId, currentMaxSeq);
+    deps.workLoopScheduler.trackChannel(target, channelId, currentMaxSeq);
   }
 
   // Dedup: skip if agent already notified about all current messages
-  const lastSeq = getLastNotifiedSeq(threadId, target);
+  const lastSeq = getLastNotifiedSeq(channelId, target);
   if (lastSeq >= currentMaxSeq) {
-    deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for thread ${threadId} — already notified up to seq ${lastSeq}`);
+    deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for channel ${channelId} — already notified up to seq ${lastSeq}`);
     return;
   }
-  setLastNotifiedSeq(threadId, target, currentMaxSeq);
+  setLastNotifiedSeq(channelId, target, currentMaxSeq);
 
   // Random delay (1-5s) to prevent broadcast storm — like Ethernet collision avoidance.
-  // After delay, re-check if new messages arrived; if so, skip this notification
-  // (the newer message's notification will cover it with fresher context).
   const delayMs = 1000 + Math.floor(Math.random() * 4000);
-  deps.logger?.debug?.(`[flock:notify] Delaying notification to "${target}" for ${delayMs}ms (thread ${threadId}, seq ${currentMaxSeq})`);
+  deps.logger?.debug?.(`[flock:notify] Delaying notification to "${target}" for ${delayMs}ms (channel ${channelId}, seq ${currentMaxSeq})`);
 
   setTimeout(() => {
-    // Stale check: if new messages arrived during our delay, skip this notification.
-    // The newer thread_post will trigger its own notification with updated context.
-    const threadStore = deps.threadMessages;
-    if (threadStore) {
-      const latestMessages = threadStore.list({ threadId });
+    const msgStore = deps.channelMessages;
+    if (msgStore) {
+      // Stale check: if new messages arrived during our delay, skip this notification.
+      const latestMessages = msgStore.list({ channelId });
       const latestMaxSeq = latestMessages.length > 0 ? Math.max(...latestMessages.map(m => m.seq)) : 0;
       if (latestMaxSeq > currentMaxSeq) {
-        deps.logger?.debug?.(`[flock:notify] Skipping stale notification to "${target}" for thread ${threadId} — seq moved from ${currentMaxSeq} to ${latestMaxSeq}`);
+        deps.logger?.debug?.(`[flock:notify] Skipping stale notification to "${target}" for channel ${channelId} — seq moved from ${currentMaxSeq} to ${latestMaxSeq}`);
         return;
       }
     }
 
-    // Re-build notification with latest thread history for freshest context
+    // Re-build notification with delta messages for freshest context
     let freshNotification = notification;
-    if (threadStore) {
-      const latestHistory = threadStore.list({ threadId });
-      const allAgents = [...new Set(latestHistory.map(m => m.agentId))];
-      freshNotification = buildThreadNotification(threadId, allAgents, latestHistory);
+    if (msgStore && deps.channelStore) {
+      const channel = deps.channelStore.get(channelId);
+      if (channel) {
+        const deltaMessages = msgStore.list({ channelId, since: lastSeq + 1 });
+        const totalCount = msgStore.count(channelId);
+        freshNotification = buildChannelNotification(channel, deltaMessages, totalCount);
+      }
     }
 
     const a2aParams = { message: userMessage(freshNotification) };
     deps.a2aClient!.sendA2A(target, a2aParams).then((result) => {
-    const now = Date.now();
-    // Fire-and-forget: do NOT store inline responses in thread.
-    // Agents must respond via flock_thread_post only — this prevents
-    // double-writes and keeps thread_messages as the single source of truth.
-    if (result.response) {
+      const now = Date.now();
+      // Fire-and-forget: do NOT store inline responses in channel.
+      // Agents must respond via flock_channel_post only.
+      if (result.response) {
+        deps.audit.append({
+          id: uniqueId(`notify-ack-${channelId}-${target}`),
+          timestamp: now,
+          agentId: target,
+          action: "notify-ack",
+          level: "GREEN",
+          detail: `Agent "${target}" acknowledged channel ${channelId}: ${(result.response ?? "").slice(0, 200)}`,
+          result: "completed",
+        });
+      }
+      if (deps.taskStore) {
+        deps.taskStore.update(taskId, {
+          state: result.state === "completed" ? "completed" : "failed",
+          responseText: result.response,
+          updatedAt: now,
+          completedAt: now,
+        });
+      }
+    }).catch((err) => {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      deps.logger?.warn(`[flock:channel] Notification to "${target}" failed: ${errorMsg}`);
+      if (deps.taskStore) {
+        deps.taskStore.update(taskId, {
+          state: "failed",
+          responseText: errorMsg,
+          updatedAt: Date.now(),
+          completedAt: Date.now(),
+        });
+      }
       deps.audit.append({
-        id: uniqueId(`notify-ack-${threadId}-${target}`),
-        timestamp: now,
+        id: uniqueId(`notify-fail-${channelId}-${target}`),
+        timestamp: Date.now(),
         agentId: target,
-        action: "notify-ack",
-        level: "GREEN",
-        detail: `Agent "${target}" acknowledged thread ${threadId}: ${(result.response ?? "").slice(0, 200)}`,
-        result: "completed",
+        action: "notify-failed",
+        level: "YELLOW",
+        detail: `Channel ${channelId}: notification to ${target} failed — ${errorMsg.slice(0, 200)}`,
+        result: "failed",
       });
-    }
-    if (deps.taskStore) {
-      deps.taskStore.update(taskId, {
-        state: result.state === "completed" ? "completed" : "failed",
-        responseText: result.response,
-        updatedAt: now,
-        completedAt: now,
-      });
-    }
-  }).catch((err) => {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    deps.logger?.warn(`[flock:broadcast] Notification to "${target}" failed: ${errorMsg}`);
-    // Do NOT store errors in thread_messages — only audit
-    if (deps.taskStore) {
-      deps.taskStore.update(taskId, {
-        state: "failed",
-        responseText: errorMsg,
-        updatedAt: Date.now(),
-        completedAt: Date.now(),
-      });
-    }
-    deps.audit.append({
-      id: uniqueId(`notify-fail-${threadId}-${target}`),
-      timestamp: Date.now(),
-      agentId: target,
-      action: "notify-failed",
-      level: "YELLOW",
-      detail: `Thread ${threadId}: notification to ${target} failed — ${errorMsg.slice(0, 200)}`,
-      result: "failed",
     });
-  });
-  }, delayMs); // end setTimeout
+  }, delayMs);
 }
 
-function createBroadcastTool(deps: ToolDeps): ToolDefinition {
+// --- flock_channel_create ---
+
+function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
   return {
-    name: "flock_broadcast",
+    name: "flock_channel_create",
     description:
-      "Start or continue a group discussion thread. Posts your message to a shared thread and " +
-      "notifies all recipients asynchronously (fire-and-forget). Recipients see full thread " +
-      "history and respond via flock_thread_post. Returns immediately — no waiting for responses. " +
-      "Use flock_thread_read to check for new responses later.",
+      "Create a new named channel for group discussion. Channels are persistent conversation " +
+      "spaces with a topic, membership list, and message history. Optionally post the first " +
+      "message and notify all members. Members are auto-woken if sleeping.",
     parameters: {
       type: "object",
-      required: ["to", "message"],
+      required: ["channelId", "topic", "members"],
       properties: {
-        to: {
+        channelId: {
+          type: "string",
+          description: "Human-readable channel ID (alphanumeric + dashes, e.g. 'project-logging-lib').",
+        },
+        topic: {
+          type: "string",
+          description: "Channel purpose description (injected into agent prompts for context).",
+        },
+        members: {
           type: "array",
           items: { type: "string" },
-          description: "Array of target agent IDs. Use flock_discover to find available agents.",
+          description: "Initial member agent IDs. The caller is automatically included.",
         },
         message: {
           type: "string",
-          description: "Message to post to the thread and broadcast to all participants.",
-        },
-        threadId: {
-          type: "string",
-          description: "Optional thread ID to continue an existing group conversation. " +
-            "If omitted, a new thread is created. Pass the returned threadId in subsequent calls for continuity.",
+          description: "Optional first message to post after channel creation.",
         },
       },
     },
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      if (!deps.a2aClient) {
-        return toOCResult({ ok: false, error: "A2A transport not initialized." });
+      if (!deps.channelStore || !deps.channelMessages) {
+        return toOCResult({ ok: false, error: "Channel stores not available." });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
-      const toRaw = params.to;
-      const targets: string[] = Array.isArray(toRaw)
-        ? toRaw.filter((t): t is string => typeof t === "string" && t.trim().length > 0).map(s => s.trim())
-        : typeof toRaw === "string" ? toRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
+      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
+      const topic = typeof params.topic === "string" ? params.topic.trim() : "";
+      const membersRaw = params.members;
+      const members: string[] = Array.isArray(membersRaw)
+        ? membersRaw.filter((m): m is string => typeof m === "string" && m.trim().length > 0).map(s => s.trim())
+        : [];
       const message = typeof params.message === "string" ? params.message.trim() : "";
-      const threadId = typeof params.threadId === "string" && params.threadId.trim()
-        ? params.threadId.trim()
-        : uniqueId("thread");
 
-      if (targets.length === 0) {
-        return toOCResult({ ok: false, error: "'to' must contain at least one agent ID." });
+      // Validate channelId format
+      if (!channelId || !/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(channelId)) {
+        return toOCResult({ ok: false, error: "'channelId' must be alphanumeric with dashes (e.g. 'project-logging')." });
       }
-      if (!message) {
-        return toOCResult({ ok: false, error: "'message' is required." });
+      if (!topic) {
+        return toOCResult({ ok: false, error: "'topic' is required." });
       }
 
-      const startTime = Date.now();
-      const participants = [...new Set([callerAgentId, ...targets])];
-      const threadStore = deps.threadMessages;
+      // Check channel doesn't already exist
+      if (deps.channelStore.get(channelId)) {
+        return toOCResult({ ok: false, error: `Channel '${channelId}' already exists.` });
+      }
 
-      // Auto-wake: broadcast targets are explicit wake triggers
+      const now = Date.now();
+      const allMembers = [...new Set([callerAgentId, ...members])];
+
+      // Create the channel record
+      deps.channelStore.insert({
+        channelId,
+        name: channelId,
+        topic,
+        createdBy: callerAgentId,
+        members: allMembers,
+        archived: false,
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      // Auto-wake SLEEP members
       if (deps.agentLoop) {
-        for (const target of targets) {
-          const targetState = deps.agentLoop.get(target);
-          if (targetState?.state === "SLEEP") {
-            deps.agentLoop.setState(target, "AWAKE");
-            deps.logger?.info(`[flock:broadcast] Auto-woke "${target}" as broadcast target`);
+        for (const member of allMembers) {
+          if (member === callerAgentId) continue;
+          const state = deps.agentLoop.get(member);
+          if (state?.state === "SLEEP") {
+            deps.agentLoop.setState(member, "AWAKE");
+            deps.logger?.info(`[flock:channel-create] Auto-woke "${member}" as channel member`);
           }
         }
       }
 
-      // --- Append sender's message to shared thread ---
-      if (threadStore) {
-        const senderSeq = threadStore.append({
-          threadId,
+      let messageCount = 0;
+
+      // Post first message if provided
+      if (message) {
+        const seq = deps.channelMessages.append({
+          channelId,
           agentId: callerAgentId,
           content: message,
-          timestamp: startTime,
+          timestamp: now,
         });
+        messageCount = 1;
 
-        // Track thread participation for work loop
+        // Track channel participation for work loop
         if (deps.workLoopScheduler) {
-          deps.workLoopScheduler.trackThread(callerAgentId, threadId, senderSeq);
-          // Also track all targets so the scheduler knows they're in this thread
-          for (const t of targets) {
-            deps.workLoopScheduler.trackThread(t, threadId, senderSeq);
+          for (const member of allMembers) {
+            deps.workLoopScheduler.trackChannel(member, channelId, seq);
+          }
+        }
+
+        // Notify members (excluding caller)
+        if (deps.a2aClient) {
+          const channel = deps.channelStore.get(channelId)!;
+          const notification = buildChannelNotification(channel, [{ seq, agentId: callerAgentId, content: message }], 1);
+          for (const target of allMembers) {
+            if (target === callerAgentId) continue;
+            const taskId = uniqueId(`cc-${channelId}-${target}`);
+            notifyAgent(deps, target, notification, channelId, taskId, seq);
           }
         }
       }
-
-      // Build the full thread history for notification context
-      const history = threadStore?.list({ threadId }) ?? [];
-      const notification = buildThreadNotification(threadId, participants, history);
 
       // Audit
       deps.audit.append({
-        id: uniqueId(`broadcast-${threadId}`),
-        timestamp: startTime,
+        id: uniqueId(`channel-create-${channelId}`),
+        timestamp: now,
         agentId: callerAgentId,
-        action: "broadcast",
+        action: "channel-create",
         level: "GREEN",
-        detail: `Broadcast to [${targets.join(", ")}]: ${message.slice(0, 200)}`,
-        result: "submitted",
+        detail: `Created channel #${channelId} (topic: ${topic}) with members: [${allMembers.join(", ")}]`,
+        result: "completed",
       });
-
-      // Record tasks + fire-and-forget notifications
-      const taskStore = deps.taskStore;
-      const taskIds: Record<string, string> = {};
-      for (const target of targets) {
-        const taskId = uniqueId(`bc-${threadId}-${target}`);
-        taskIds[target] = taskId;
-        if (taskStore) {
-          taskStore.insert({
-            taskId,
-            contextId: threadId,
-            fromAgentId: callerAgentId,
-            toAgentId: target,
-            state: "submitted",
-            messageType: "broadcast",
-            summary: message.slice(0, 200),
-            payload: JSON.stringify({ message, threadId, participants }),
-            responseText: null,
-            responsePayload: null,
-            createdAt: startTime,
-            updatedAt: startTime,
-            completedAt: null,
-          });
-        }
-
-        // Fire-and-forget: notify agent without waiting
-        const maxSeq = history.length > 0 ? Math.max(...history.map(m => m.seq)) : 0;
-        notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
-      }
 
       return toOCResult({
         ok: true,
         output: [
-          `Message posted to thread ${threadId} and ${targets.length} agents notified.`,
-          `Thread history: ${history.length} messages.`,
-          `Use flock_thread_read(threadId="${threadId}") to check for responses.`,
-        ].join("\n"),
-        data: { threadId, participants, messageCount: history.length, taskIds },
+          `Channel #${channelId} created.`,
+          `Topic: ${topic}`,
+          `Members: ${allMembers.join(", ")}`,
+          messageCount > 0 ? `First message posted.` : null,
+          `Post messages: flock_channel_post(channelId="${channelId}", message="...")`,
+        ].filter(Boolean).join("\n"),
+        data: { channelId, topic, members: allMembers, messageCount },
       });
     },
   };
 }
 
-// --- flock_thread_post ---
-// Agents use this to respond to a thread. Appends to thread_messages and
-// optionally notifies other participants (fire-and-forget).
+// --- flock_channel_post ---
 
-function createThreadPostTool(deps: ToolDeps): ToolDefinition {
+function createChannelPostTool(deps: ToolDeps): ToolDefinition {
   return {
-    name: "flock_thread_post",
+    name: "flock_channel_post",
     description:
-      "Post a message to a shared discussion thread. Your message is appended to the thread " +
-      "history and other participants are notified asynchronously. Use this to respond in " +
-      "group discussions instead of flock_broadcast.",
+      "Post a message to a channel. Your message is appended to the channel history " +
+      "and other members are notified asynchronously (with dedup). " +
+      "Cannot post to archived channels.",
     parameters: {
       type: "object",
-      required: ["threadId", "message"],
+      required: ["channelId", "message"],
       properties: {
-        threadId: {
+        channelId: {
           type: "string",
-          description: "Thread ID to post to (from a previous flock_broadcast or notification).",
+          description: "Channel ID to post to.",
         },
         message: {
           type: "string",
-          description: "Your response message to post to the thread.",
+          description: "Message to post.",
         },
         notify: {
           type: "boolean",
-          description: "If true (default), notify other thread participants of your new message. " +
-            "Notifications are automatically deduplicated — agents won't be notified if they " +
-            "already saw all current messages. Set to false to post silently.",
+          description: "If true (default), notify other channel members. Set to false to post silently.",
         },
       },
     },
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const threadStore = deps.threadMessages;
-      if (!threadStore) {
-        return toOCResult({ ok: false, error: "Thread store not available." });
+      if (!deps.channelStore || !deps.channelMessages) {
+        return toOCResult({ ok: false, error: "Channel stores not available." });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
-      const threadId = typeof params.threadId === "string" ? params.threadId.trim() : "";
+      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const message = typeof params.message === "string" ? params.message.trim() : "";
       const shouldNotify = params.notify !== false;
 
-      if (!threadId) {
-        return toOCResult({ ok: false, error: "'threadId' is required." });
-      }
-      if (!message) {
-        return toOCResult({ ok: false, error: "'message' is required." });
-      }
+      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+      if (!message) return toOCResult({ ok: false, error: "'message' is required." });
+
+      const channel = deps.channelStore.get(channelId);
+      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (channel.archived) return toOCResult({ ok: false, error: `Channel '${channelId}' is archived (read-only).` });
 
       const now = Date.now();
+      const newSeq = deps.channelMessages.append({ channelId, agentId: callerAgentId, content: message, timestamp: now });
 
-      // Append to thread
-      const newSeq = threadStore.append({ threadId, agentId: callerAgentId, content: message, timestamp: now });
-
-      // Track thread participation for work loop
+      // Track channel participation for work loop
       if (deps.workLoopScheduler) {
-        deps.workLoopScheduler.trackThread(callerAgentId, threadId, newSeq);
+        deps.workLoopScheduler.trackChannel(callerAgentId, channelId, newSeq);
       }
 
       // Audit
       deps.audit.append({
-        id: uniqueId(`thread-post-${threadId}-${callerAgentId}`),
+        id: uniqueId(`channel-post-${channelId}-${callerAgentId}`),
         timestamp: now,
         agentId: callerAgentId,
-        action: "thread-post",
+        action: "channel-post",
         level: "GREEN",
-        detail: `Posted to thread ${threadId}: ${message.slice(0, 200)}`,
+        detail: `Posted to #${channelId}: ${message.slice(0, 200)}`,
         result: "completed",
       });
 
-      const history = threadStore.list({ threadId });
+      const totalCount = deps.channelMessages.count(channelId);
 
-      // Notify other participants (fire-and-forget, with dedup + limit)
+      // Notify other members from channel record (not from message history)
       if (shouldNotify && deps.a2aClient) {
-        if (history.length > THREAD_MSG_LIMIT) {
-          deps.logger?.info(`[flock:thread-post] Thread ${threadId} reached ${history.length} messages — notifications disabled`);
+        if (totalCount > CHANNEL_MSG_LIMIT) {
+          deps.logger?.info(`[flock:channel-post] Channel ${channelId} reached ${totalCount} messages — notifications disabled`);
         } else {
-          const allAgents = [...new Set(history.map(m => m.agentId))];
-          const otherParticipants = allAgents.filter(a => a !== callerAgentId);
-          const maxSeq = history.length > 0 ? Math.max(...history.map(m => m.seq)) : 0;
-
-          if (otherParticipants.length > 0) {
-            const notification = buildThreadNotification(threadId, allAgents, history);
-            for (const target of otherParticipants) {
-              // notifyAgent internally checks dedup (lastNotifiedSeq)
-              const taskId = uniqueId(`tp-${threadId}-${target}`);
-              notifyAgent(deps, target, notification, threadId, taskId, maxSeq);
+          const otherMembers = channel.members.filter(m => m !== callerAgentId);
+          if (otherMembers.length > 0) {
+            const notification = buildChannelNotification(channel, [{ seq: newSeq, agentId: callerAgentId, content: message }], totalCount);
+            for (const target of otherMembers) {
+              const taskId = uniqueId(`cp-${channelId}-${target}`);
+              notifyAgent(deps, target, notification, channelId, taskId, newSeq);
             }
           }
         }
@@ -1683,60 +1682,60 @@ function createThreadPostTool(deps: ToolDeps): ToolDefinition {
 
       return toOCResult({
         ok: true,
-        output: `Message posted to thread ${threadId}. Thread now has ${history.length} messages.`,
-        data: { threadId, messageCount: history.length },
+        output: `Message posted to #${channelId}. Channel now has ${totalCount} messages.`,
+        data: { channelId, messageCount: totalCount, seq: newSeq },
       });
     },
   };
 }
 
-// --- flock_thread_read ---
+// --- flock_channel_read ---
 
-function createThreadReadTool(deps: ToolDeps): ToolDefinition {
+function createChannelReadTool(deps: ToolDeps): ToolDefinition {
   return {
-    name: "flock_thread_read",
+    name: "flock_channel_read",
     description:
-      "Read the message history of a shared discussion thread. Returns all messages " +
-      "in chronological order with author and content.",
+      "Read the message history of a channel. Returns messages in chronological order " +
+      "with channel metadata (name, topic, members). Use 'after' for delta reading.",
     parameters: {
       type: "object",
-      required: ["threadId"],
+      required: ["channelId"],
       properties: {
-        threadId: {
+        channelId: {
           type: "string",
-          description: "Thread ID to read.",
+          description: "Channel ID to read.",
         },
         after: {
           type: "number",
-          description: "Only return messages with seq greater than this value (for polling new messages).",
+          description: "Only return messages with seq greater than this value (for delta reading).",
         },
       },
     },
     async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const threadStore = deps.threadMessages;
-      if (!threadStore) {
-        return toOCResult({ ok: false, error: "Thread store not available." });
+      if (!deps.channelStore || !deps.channelMessages) {
+        return toOCResult({ ok: false, error: "Channel stores not available." });
       }
 
-      const threadId = typeof params.threadId === "string" ? params.threadId.trim() : "";
+      const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const afterSeq = typeof params.after === "number" ? params.after : 0;
 
-      if (!threadId) {
-        return toOCResult({ ok: false, error: "'threadId' is required." });
-      }
+      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
 
-      const allMessages = threadStore.list({ threadId });
+      const channel = deps.channelStore.get(channelId);
+      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+
+      const totalCount = deps.channelMessages.count(channelId);
       const messages = afterSeq > 0
-        ? threadStore.list({ threadId, since: afterSeq })
-        : allMessages;
+        ? deps.channelMessages.list({ channelId, since: afterSeq + 1 })
+        : deps.channelMessages.list({ channelId });
 
       if (messages.length === 0) {
         return toOCResult({
           ok: true,
           output: afterSeq > 0
-            ? `No new messages in thread ${threadId} after seq ${afterSeq}.`
-            : `Thread ${threadId} is empty or does not exist.`,
-          data: { threadId, messages: [], total: allMessages.length },
+            ? `No new messages in #${channelId} after seq ${afterSeq}.`
+            : `Channel #${channelId} has no messages yet.`,
+          data: { channelId, messages: [], total: totalCount },
         });
       }
 
@@ -1744,18 +1743,243 @@ function createThreadReadTool(deps: ToolDeps): ToolDefinition {
         `[seq ${m.seq}] ${m.agentId}: ${m.content}`
       ).join("\n\n");
 
-      const participants = [...new Set(allMessages.map(m => m.agentId))];
-
       return toOCResult({
         ok: true,
         output: [
-          `## Thread ${threadId} — ${messages.length} messages${afterSeq > 0 ? ` (after seq ${afterSeq})` : ""}`,
-          `Participants: ${participants.join(", ")}`,
-          `Total messages: ${allMessages.length}`,
+          `## #${channelId} — ${channel.topic}`,
+          `Members: ${channel.members.join(", ")}`,
+          `${messages.length} messages${afterSeq > 0 ? ` (after seq ${afterSeq})` : ""} — ${totalCount} total`,
+          channel.archived ? `[ARCHIVED — read-only]` : null,
           ``,
           formatted,
-        ].join("\n"),
-        data: { threadId, messages, total: allMessages.length, participants },
+        ].filter(Boolean).join("\n"),
+        data: { channelId, messages, total: totalCount, members: channel.members },
+      });
+    },
+  };
+}
+
+// --- flock_channel_list ---
+
+function createChannelListTool(deps: ToolDeps): ToolDefinition {
+  return {
+    name: "flock_channel_list",
+    description:
+      "List channels. Filter by membership or archive state.",
+    parameters: {
+      type: "object",
+      properties: {
+        member: {
+          type: "string",
+          description: "Filter channels containing this member agent ID.",
+        },
+        archived: {
+          type: "boolean",
+          description: "Filter by archive state. Omit for all channels.",
+        },
+      },
+    },
+    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+      if (!deps.channelStore) {
+        return toOCResult({ ok: false, error: "Channel store not available." });
+      }
+
+      const member = typeof params.member === "string" ? params.member.trim() || undefined : undefined;
+      const archived = typeof params.archived === "boolean" ? params.archived : undefined;
+
+      const channels = deps.channelStore.list({ member, archived });
+
+      if (channels.length === 0) {
+        return toOCResult({ ok: true, output: "No channels found.", data: { channels: [] } });
+      }
+
+      const lines = channels.map(ch => {
+        const msgCount = deps.channelMessages?.count(ch.channelId) ?? 0;
+        const status = ch.archived ? " [ARCHIVED]" : "";
+        return `#${ch.channelId}${status} — ${ch.topic} (${ch.members.length} members, ${msgCount} msgs)`;
+      });
+
+      return toOCResult({
+        ok: true,
+        output: [`## Channels (${channels.length})`, ``, ...lines].join("\n"),
+        data: { channels: channels.map(ch => ({ channelId: ch.channelId, topic: ch.topic, members: ch.members, archived: ch.archived })) },
+      });
+    },
+  };
+}
+
+// --- flock_assign_members ---
+
+function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
+  return {
+    name: "flock_assign_members",
+    description:
+      "Add or remove members from a channel. Newly added members are auto-woken if sleeping.",
+    parameters: {
+      type: "object",
+      required: ["channelId"],
+      properties: {
+        channelId: {
+          type: "string",
+          description: "Channel to modify membership of.",
+        },
+        add: {
+          type: "array",
+          items: { type: "string" },
+          description: "Agent IDs to add to the channel.",
+        },
+        remove: {
+          type: "array",
+          items: { type: "string" },
+          description: "Agent IDs to remove from the channel.",
+        },
+      },
+    },
+    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+      if (!deps.channelStore) {
+        return toOCResult({ ok: false, error: "Channel store not available." });
+      }
+
+      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
+      const addRaw = params.add;
+      const removeRaw = params.remove;
+      const toAdd: string[] = Array.isArray(addRaw)
+        ? addRaw.filter((m): m is string => typeof m === "string" && m.trim().length > 0).map(s => s.trim()) : [];
+      const toRemove = new Set<string>(
+        Array.isArray(removeRaw)
+          ? removeRaw.filter((m): m is string => typeof m === "string" && m.trim().length > 0).map(s => s.trim()) : []
+      );
+
+      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+      if (toAdd.length === 0 && toRemove.size === 0) {
+        return toOCResult({ ok: false, error: "Provide 'add' and/or 'remove' arrays." });
+      }
+
+      const channel = deps.channelStore.get(channelId);
+      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+
+      const updatedMembers = [...new Set([...channel.members, ...toAdd])].filter(m => !toRemove.has(m));
+      const now = Date.now();
+
+      deps.channelStore.update(channelId, { members: updatedMembers, updatedAt: now });
+
+      // Auto-wake newly added SLEEP members
+      if (deps.agentLoop) {
+        for (const member of toAdd) {
+          if (channel.members.includes(member)) continue; // was already a member
+          const state = deps.agentLoop.get(member);
+          if (state?.state === "SLEEP") {
+            deps.agentLoop.setState(member, "AWAKE");
+            deps.logger?.info(`[flock:assign-members] Auto-woke "${member}" — added to #${channelId}`);
+          }
+        }
+      }
+
+      // Track newly added members in work loop scheduler
+      if (deps.workLoopScheduler && deps.channelMessages) {
+        const latestCount = deps.channelMessages.count(channelId);
+        for (const member of toAdd) {
+          if (!channel.members.includes(member)) {
+            deps.workLoopScheduler.trackChannel(member, channelId, latestCount);
+          }
+        }
+      }
+
+      // Post system message about membership change
+      if (deps.channelMessages) {
+        const parts: string[] = [];
+        const newlyAdded = toAdd.filter(m => !channel.members.includes(m));
+        if (newlyAdded.length > 0) parts.push(`${newlyAdded.join(", ")} joined`);
+        const actuallyRemoved = [...toRemove].filter(m => channel.members.includes(m));
+        if (actuallyRemoved.length > 0) parts.push(`${actuallyRemoved.join(", ")} left`);
+        if (parts.length > 0) {
+          deps.channelMessages.append({
+            channelId,
+            agentId: "[system]",
+            content: `[membership] ${parts.join("; ")}`,
+            timestamp: now,
+          });
+        }
+      }
+
+      deps.audit.append({
+        id: uniqueId(`assign-members-${channelId}`),
+        timestamp: now,
+        agentId: callerAgentId,
+        action: "assign-members",
+        level: "GREEN",
+        detail: `Channel #${channelId}: add=[${toAdd.join(",")}] remove=[${[...toRemove].join(",")}]`,
+        result: "completed",
+      });
+
+      return toOCResult({
+        ok: true,
+        output: `Updated #${channelId} members: ${updatedMembers.join(", ")}`,
+        data: { channelId, members: updatedMembers },
+      });
+    },
+  };
+}
+
+// --- flock_channel_archive ---
+
+function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
+  return {
+    name: "flock_channel_archive",
+    description:
+      "Archive a channel, making it read-only. Archived channels can still be read but no new messages can be posted.",
+    parameters: {
+      type: "object",
+      required: ["channelId"],
+      properties: {
+        channelId: {
+          type: "string",
+          description: "Channel ID to archive.",
+        },
+      },
+    },
+    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+      if (!deps.channelStore) {
+        return toOCResult({ ok: false, error: "Channel store not available." });
+      }
+
+      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
+
+      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+
+      const channel = deps.channelStore.get(channelId);
+      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (channel.archived) return toOCResult({ ok: true, output: `Channel #${channelId} is already archived.` });
+
+      const now = Date.now();
+      deps.channelStore.update(channelId, { archived: true, updatedAt: now });
+
+      // Post system message
+      if (deps.channelMessages) {
+        deps.channelMessages.append({
+          channelId,
+          agentId: "[system]",
+          content: "[system] Channel archived. Read-only.",
+          timestamp: now,
+        });
+      }
+
+      deps.audit.append({
+        id: uniqueId(`channel-archive-${channelId}`),
+        timestamp: now,
+        agentId: callerAgentId,
+        action: "channel-archive",
+        level: "GREEN",
+        detail: `Archived channel #${channelId}`,
+        result: "completed",
+      });
+
+      return toOCResult({
+        ok: true,
+        output: `Channel #${channelId} archived. No new messages can be posted.`,
+        data: { channelId, archived: true },
       });
     },
   };

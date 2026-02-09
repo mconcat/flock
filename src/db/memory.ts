@@ -14,9 +14,12 @@ import type {
   TransitionStore,
   AuditStore,
   TaskStore,
-  ThreadMessageStore,
-  ThreadMessage,
-  ThreadMessageFilter,
+  ChannelStore,
+  ChannelRecord,
+  ChannelFilter,
+  ChannelMessageStore,
+  ChannelMessage,
+  ChannelMessageFilter,
   HomeFilter,
   TransitionFilter,
   AuditFilter,
@@ -157,25 +160,60 @@ function createMemoryTaskStore(): TaskStore {
   };
 }
 
-function createMemoryThreadMessageStore(): ThreadMessageStore {
-  const threads = new Map<string, ThreadMessage[]>();
+function createMemoryChannelStore(): ChannelStore {
+  const store = new Map<string, ChannelRecord>();
 
   return {
-    append(msg: Omit<ThreadMessage, "seq">): number {
-      const list = threads.get(msg.threadId) ?? [];
+    insert(record) {
+      store.set(record.channelId, { ...record, members: [...record.members] });
+    },
+    update(channelId, fields) {
+      const existing = store.get(channelId);
+      if (!existing) throw new Error(`channel not found: ${channelId}`);
+      if (fields.name !== undefined) existing.name = fields.name;
+      if (fields.topic !== undefined) existing.topic = fields.topic;
+      if (fields.members !== undefined) existing.members = [...fields.members];
+      if (fields.archived !== undefined) existing.archived = fields.archived;
+      if (fields.updatedAt !== undefined) existing.updatedAt = fields.updatedAt;
+    },
+    get(channelId) {
+      const record = store.get(channelId);
+      return record ? { ...record, members: [...record.members] } : null;
+    },
+    list(filter?: ChannelFilter) {
+      let results = Array.from(store.values());
+      if (filter?.channelId) results = results.filter(r => r.channelId === filter.channelId);
+      if (filter?.createdBy) results = results.filter(r => r.createdBy === filter.createdBy);
+      if (filter?.archived !== undefined) results = results.filter(r => r.archived === filter.archived);
+      if (filter?.member) results = results.filter(r => r.members.includes(filter.member!));
+      if (filter?.limit) results = results.slice(0, filter.limit);
+      return results.map(r => ({ ...r, members: [...r.members] }));
+    },
+    delete(channelId) {
+      store.delete(channelId);
+    },
+  };
+}
+
+function createMemoryChannelMessageStore(): ChannelMessageStore {
+  const channels = new Map<string, ChannelMessage[]>();
+
+  return {
+    append(msg: Omit<ChannelMessage, "seq">): number {
+      const list = channels.get(msg.channelId) ?? [];
       const seq = list.length + 1;
       list.push({ ...msg, seq });
-      threads.set(msg.threadId, list);
+      channels.set(msg.channelId, list);
       return seq;
     },
-    list(filter: ThreadMessageFilter): ThreadMessage[] {
-      const list = threads.get(filter.threadId) ?? [];
+    list(filter: ChannelMessageFilter): ChannelMessage[] {
+      const list = channels.get(filter.channelId) ?? [];
       const since = filter.since ?? 0;
       const limit = filter.limit ?? 1000;
       return list.filter(m => m.seq >= since).slice(0, limit);
     },
-    count(threadId: string): number {
-      return (threads.get(threadId) ?? []).length;
+    count(channelId: string): number {
+      return (channels.get(channelId) ?? []).length;
     },
   };
 }
@@ -239,7 +277,8 @@ export function createMemoryDatabase(): FlockDatabase {
     transitions: createMemoryTransitionStore(),
     audit: createMemoryAuditStore(),
     tasks: createMemoryTaskStore(),
-    threadMessages: createMemoryThreadMessageStore(),
+    channels: createMemoryChannelStore(),
+    channelMessages: createMemoryChannelMessageStore(),
     agentLoop: createMemoryAgentLoopStore(),
     migrate() { /* no-op */ },
     close() { /* no-op */ },

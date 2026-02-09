@@ -758,16 +758,19 @@ describe("registerFlockTools", () => {
     expect(tools.has("flock_sysadmin_request")).toBe(true);
     expect(tools.has("flock_message")).toBe(true);
 
-    // Phase 2 tools
-    expect(tools.has("flock_broadcast")).toBe(true);
-    expect(tools.has("flock_thread_post")).toBe(true);
-    expect(tools.has("flock_thread_read")).toBe(true);
+    // Phase 2 tools — channel-based
+    expect(tools.has("flock_channel_create")).toBe(true);
+    expect(tools.has("flock_channel_post")).toBe(true);
+    expect(tools.has("flock_channel_read")).toBe(true);
+    expect(tools.has("flock_channel_list")).toBe(true);
+    expect(tools.has("flock_assign_members")).toBe(true);
+    expect(tools.has("flock_channel_archive")).toBe(true);
     expect(tools.has("flock_discover")).toBe(true);
     expect(tools.has("flock_history")).toBe(true);
     expect(tools.has("flock_tasks")).toBe(true);
     expect(tools.has("flock_task_respond")).toBe(true);
     expect(tools.has("flock_update_card")).toBe(true);
 
-    expect(tools.size).toBe(21); // 16 + flock_create_agent + flock_decommission_agent + flock_restart_gateway + flock_sleep + flock_wake
+    expect(tools.size).toBe(24); // 19 + flock_create_agent + flock_decommission_agent + flock_restart_gateway + flock_sleep + flock_wake
   });
 });

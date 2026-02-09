@@ -107,30 +107,60 @@ export interface TaskStore {
   count(filter?: TaskFilter): number;
 }
 
-// --- Thread message store (shared history for group discussions) ---
+// --- Channel store (named conversation spaces with membership) ---
 
-/** A single message in a shared thread. */
-export interface ThreadMessage {
-  threadId: string;
-  seq: number;         // auto-incrementing sequence within thread
+/** A persistent channel with name, topic, and membership. */
+export interface ChannelRecord {
+  channelId: string;       // human-readable, e.g. "project-logging-lib"
+  name: string;            // display name
+  topic: string;           // purpose description (injected into agent prompts)
+  createdBy: string;       // agent ID or "human:username"
+  members: string[];       // agent IDs + human identifiers
+  archived: boolean;       // true = read-only
+  createdAt: number;       // epoch ms
+  updatedAt: number;       // epoch ms
+}
+
+export interface ChannelFilter {
+  channelId?: string;
+  createdBy?: string;
+  archived?: boolean;
+  member?: string;         // filter channels containing this member
+  limit?: number;
+}
+
+export interface ChannelStore {
+  insert(record: ChannelRecord): void;
+  update(channelId: string, fields: Partial<Pick<ChannelRecord, "name" | "topic" | "members" | "archived" | "updatedAt">>): void;
+  get(channelId: string): ChannelRecord | null;
+  list(filter?: ChannelFilter): ChannelRecord[];
+  delete(channelId: string): void;
+}
+
+// --- Channel message store (shared history within channels) ---
+
+/** A single message in a channel. */
+export interface ChannelMessage {
+  channelId: string;
+  seq: number;         // auto-incrementing sequence within channel
   agentId: string;     // who sent this message
   content: string;     // message text
   timestamp: number;   // epoch ms
 }
 
-export interface ThreadMessageFilter {
-  threadId: string;
+export interface ChannelMessageFilter {
+  channelId: string;
   since?: number;      // seq number to start from
   limit?: number;
 }
 
-export interface ThreadMessageStore {
-  /** Append a message to a thread. Returns the assigned seq number. */
-  append(msg: Omit<ThreadMessage, "seq">): number;
-  /** Get all messages in a thread, ordered by seq. */
-  list(filter: ThreadMessageFilter): ThreadMessage[];
-  /** Count messages in a thread. */
-  count(threadId: string): number;
+export interface ChannelMessageStore {
+  /** Append a message to a channel. Returns the assigned seq number. */
+  append(msg: Omit<ChannelMessage, "seq">): number;
+  /** Get messages in a channel, ordered by seq. */
+  list(filter: ChannelMessageFilter): ChannelMessage[];
+  /** Count messages in a channel. */
+  count(channelId: string): number;
 }
 
 // --- Agent loop state (work loop AWAKE/SLEEP) ---
@@ -193,7 +223,8 @@ export interface FlockDatabase {
   transitions: TransitionStore;
   audit: AuditStore;
   tasks: TaskStore;
-  threadMessages: ThreadMessageStore;
+  channels: ChannelStore;
+  channelMessages: ChannelMessageStore;
   agentLoop: AgentLoopStore;
 
   /** Run all stores' schema migrations. */

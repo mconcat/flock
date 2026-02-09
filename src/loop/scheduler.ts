@@ -2,18 +2,18 @@
  * Work Loop Scheduler
  *
  * Drives the agent work loop. AWAKE agents receive periodic "tick" messages
- * via A2A, giving them a chance to continue work, check threads, and decide
+ * via A2A, giving them a chance to continue work, check channels, and decide
  * whether to sleep.
  *
  * Design:
  * - Global tick interval: 60s ± 10s jitter (prevents synchronized ticks)
  * - AWAKE agents get ticked; SLEEP agents are skipped
- * - Each tick sends an A2A message with context (new thread messages, etc.)
+ * - Each tick sends an A2A message with context (new channel messages, etc.)
  * - Agents control their own SLEEP transition via flock_sleep tool
  * - SLEEP agents wake only on explicit triggers (direct message, mention, flock_wake)
  */
 
-import type { AgentLoopStore, AgentLoopRecord, ThreadMessageStore } from "../db/interface.js";
+import type { AgentLoopStore, AgentLoopRecord, ChannelMessageStore, ChannelStore } from "../db/interface.js";
 import type { A2AClient } from "../transport/client.js";
 import type { AuditLog } from "../audit/log.js";
 import type { PluginLogger } from "../types.js";
@@ -34,7 +34,8 @@ const MAX_CONCURRENT_TICKS = 4;
 export interface WorkLoopSchedulerDeps {
   agentLoop: AgentLoopStore;
   a2aClient: A2AClient;
-  threadMessages: ThreadMessageStore;
+  channelMessages: ChannelMessageStore;
+  channelStore: ChannelStore;
   audit: AuditLog;
   logger: PluginLogger;
 }
@@ -44,8 +45,8 @@ export class WorkLoopScheduler {
   private running = false;
   private deps: WorkLoopSchedulerDeps;
 
-  /** Track which threads each agent last saw (agentId → threadId → lastSeenSeq). */
-  private agentThreadSeqs = new Map<string, Map<string, number>>();
+  /** Track which channels each agent last saw (agentId → channelId → lastSeenSeq). */
+  private agentChannelSeqs = new Map<string, Map<string, number>>();
 
 
   constructor(deps: WorkLoopSchedulerDeps) {
@@ -166,13 +167,10 @@ export class WorkLoopScheduler {
 
   /**
    * Build the tick message content for an agent.
-   * Includes: active thread updates, general status, sleep hint.
+   * Includes: active channel updates with name/topic, general status, sleep hint.
    */
   private buildTickMessage(agent: AgentLoopRecord): string {
-    const { threadMessages } = this.deps;
-
-    // Collect new thread messages since last tick
-    const threadUpdates = this.getThreadUpdates(agent.agentId);
+    const channelUpdates = this.getChannelUpdates(agent.agentId);
 
     const awakeDuration = Date.now() - agent.awakenedAt;
     const awakeMins = Math.floor(awakeDuration / 60_000);
@@ -182,60 +180,65 @@ export class WorkLoopScheduler {
       `State: AWAKE (${awakeMins}m)`,
     ];
 
-    if (threadUpdates.length > 0) {
+    if (channelUpdates.length > 0) {
       lines.push(``);
-      lines.push(`--- New Thread Activity ---`);
-      for (const update of threadUpdates) {
-        lines.push(`Thread ${update.threadId} (${update.newMessages.length} new):`);
+      lines.push(`--- New Channel Activity ---`);
+      for (const update of channelUpdates) {
+        const header = update.topic
+          ? `#${update.channelId} — ${update.topic}`
+          : `#${update.channelId}`;
+        lines.push(`${header} (${update.newMessages.length} new):`);
         for (const msg of update.newMessages) {
           lines.push(`  [${msg.agentId}]: ${msg.content.slice(0, 200)}`);
         }
       }
-      lines.push(`--- End Thread Activity ---`);
+      lines.push(`--- End Channel Activity ---`);
     } else {
-      lines.push(`No new thread activity since last tick.`);
+      lines.push(`No new channel activity since last tick.`);
     }
 
     lines.push(``);
-    lines.push(`Continue your work. Review any new thread messages and respond if needed.`);
+    lines.push(`Continue your work. Review any new channel messages and respond if needed.`);
     lines.push(`If you have nothing to do and no pending work, call flock_sleep() to conserve resources.`);
 
     return lines.join("\n");
   }
 
   /**
-   * Get thread updates for an agent since their last tick.
-   * Tracks which threads the agent has seen via agentThreadSeqs.
+   * Get channel updates for an agent since their last tick.
+   * Tracks which channels the agent has seen via agentChannelSeqs.
    */
-  private getThreadUpdates(agentId: string): Array<{
-    threadId: string;
+  private getChannelUpdates(agentId: string): Array<{
+    channelId: string;
+    topic: string;
     newMessages: Array<{ agentId: string; content: string; seq: number }>;
   }> {
-    const { threadMessages } = this.deps;
+    const { channelMessages, channelStore } = this.deps;
     const updates: Array<{
-      threadId: string;
+      channelId: string;
+      topic: string;
       newMessages: Array<{ agentId: string; content: string; seq: number }>;
     }> = [];
 
-    // Get the agent's tracked thread seqs
-    if (!this.agentThreadSeqs.has(agentId)) {
-      this.agentThreadSeqs.set(agentId, new Map());
+    if (!this.agentChannelSeqs.has(agentId)) {
+      this.agentChannelSeqs.set(agentId, new Map());
     }
-    const seqs = this.agentThreadSeqs.get(agentId)!;
+    const seqs = this.agentChannelSeqs.get(agentId)!;
 
-    // We need to know which threads this agent participates in.
-    // For now, check all threads the agent has ever posted to.
-    // This is a pragmatic approach — we can optimize later with a participation index.
-    // For efficiency, we only check threads where the agent has a tracked seq.
-    for (const [threadId, lastSeenSeq] of seqs) {
-      const newMessages = threadMessages.list({
-        threadId,
+    // Check all channels the agent has been tracked in
+    for (const [channelId, lastSeenSeq] of seqs) {
+      const newMessages = channelMessages.list({
+        channelId,
         since: lastSeenSeq + 1,
       });
 
       if (newMessages.length > 0) {
+        // Look up channel metadata for rich context
+        const channel = channelStore.get(channelId);
+
         updates.push({
-          threadId,
+          channelId,
+          topic: channel?.topic ?? "",
           newMessages: newMessages.map(m => ({
             agentId: m.agentId,
             content: m.content,
@@ -243,9 +246,8 @@ export class WorkLoopScheduler {
           })),
         });
 
-        // Update the last seen seq
         const maxSeq = Math.max(...newMessages.map(m => m.seq));
-        seqs.set(threadId, maxSeq);
+        seqs.set(channelId, maxSeq);
       }
     }
 
@@ -253,18 +255,17 @@ export class WorkLoopScheduler {
   }
 
   /**
-   * Register that an agent is participating in a thread.
-   * Called when an agent posts to or is notified about a thread.
+   * Register that an agent is participating in a channel.
+   * Called when an agent posts to or is notified about a channel.
    */
-  trackThread(agentId: string, threadId: string, currentSeq: number): void {
-    if (!this.agentThreadSeqs.has(agentId)) {
-      this.agentThreadSeqs.set(agentId, new Map());
+  trackChannel(agentId: string, channelId: string, currentSeq: number): void {
+    if (!this.agentChannelSeqs.has(agentId)) {
+      this.agentChannelSeqs.set(agentId, new Map());
     }
-    const seqs = this.agentThreadSeqs.get(agentId)!;
-    // Only update if this is a newer seq than what we have
-    const existing = seqs.get(threadId) ?? 0;
+    const seqs = this.agentChannelSeqs.get(agentId)!;
+    const existing = seqs.get(channelId) ?? 0;
     if (currentSeq > existing) {
-      seqs.set(threadId, currentSeq);
+      seqs.set(channelId, currentSeq);
     }
   }
 

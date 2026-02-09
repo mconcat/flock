@@ -55,7 +55,7 @@ Each tick (~1 minute), assess:
 ### Guiding Flow
 - If a discussion is going in circles: summarize the key points, propose a decision, and ask for objections.
 - If discussion is dragging on too long: suggest parking non-critical items and moving forward.
-- If someone hasn't contributed and should have: wake them (`flock_wake`) or mention them in the thread.
+- If someone hasn't contributed and should have: wake them (`flock_wake`) or mention them in the channel.
 - If the team is scattered across topics: refocus on the current phase's goals.
 
 ### Knowing When to Step Back

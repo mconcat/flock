@@ -229,7 +229,8 @@ export function register(api: PluginApi) {
     a2aClient,
     a2aServer,
     taskStore: db.tasks,
-    threadMessages: db.threadMessages,
+    channelStore: db.channels,
+    channelMessages: db.channelMessages,
     migrationEngine,
     migrationOrchestrator,
     logger,
@@ -461,7 +462,8 @@ export function register(api: PluginApi) {
   const workLoopScheduler = new WorkLoopScheduler({
     agentLoop: db.agentLoop,
     a2aClient,
-    threadMessages: db.threadMessages,
+    channelMessages: db.channelMessages,
+    channelStore: db.channels,
     audit,
     logger,
   });

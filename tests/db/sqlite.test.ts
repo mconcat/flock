@@ -107,6 +107,126 @@ describe("SQLite Backend", () => {
     });
   });
 
+  describe("ChannelStore", () => {
+    it("inserts and retrieves a channel", () => {
+      db.channels.insert({
+        channelId: "project-logging",
+        name: "project-logging",
+        topic: "TypeScript structured logging library",
+        createdBy: "pm-alpha",
+        members: ["pm-alpha", "dev-code", "qa-tester"],
+        archived: false,
+        createdAt: 1000,
+        updatedAt: 1000,
+      });
+
+      const ch = db.channels.get("project-logging");
+      expect(ch).not.toBeNull();
+      expect(ch!.channelId).toBe("project-logging");
+      expect(ch!.topic).toBe("TypeScript structured logging library");
+      expect(ch!.members).toEqual(["pm-alpha", "dev-code", "qa-tester"]);
+      expect(ch!.archived).toBe(false);
+    });
+
+    it("updates fields", () => {
+      db.channels.insert({
+        channelId: "ch-1",
+        name: "ch-1",
+        topic: "original topic",
+        createdBy: "a",
+        members: ["a", "b"],
+        archived: false,
+        createdAt: 1000,
+        updatedAt: 1000,
+      });
+
+      db.channels.update("ch-1", {
+        topic: "updated topic",
+        members: ["a", "b", "c"],
+        archived: true,
+        updatedAt: 2000,
+      });
+
+      const ch = db.channels.get("ch-1");
+      expect(ch!.topic).toBe("updated topic");
+      expect(ch!.members).toEqual(["a", "b", "c"]);
+      expect(ch!.archived).toBe(true);
+      expect(ch!.updatedAt).toBe(2000);
+    });
+
+    it("lists with filters", () => {
+      db.channels.insert({ channelId: "ch-1", name: "ch-1", topic: "t1", createdBy: "a", members: ["a", "b"], archived: false, createdAt: 1, updatedAt: 1 });
+      db.channels.insert({ channelId: "ch-2", name: "ch-2", topic: "t2", createdBy: "b", members: ["b", "c"], archived: false, createdAt: 2, updatedAt: 2 });
+      db.channels.insert({ channelId: "ch-3", name: "ch-3", topic: "t3", createdBy: "a", members: ["a"], archived: true, createdAt: 3, updatedAt: 3 });
+
+      expect(db.channels.list()).toHaveLength(3);
+      expect(db.channels.list({ createdBy: "a" })).toHaveLength(2);
+      expect(db.channels.list({ archived: false })).toHaveLength(2);
+      expect(db.channels.list({ archived: true })).toHaveLength(1);
+      expect(db.channels.list({ member: "a" })).toHaveLength(2);
+      expect(db.channels.list({ member: "b" })).toHaveLength(2);
+      expect(db.channels.list({ member: "c" })).toHaveLength(1);
+      expect(db.channels.list({ limit: 1 })).toHaveLength(1);
+    });
+
+    it("deletes a channel", () => {
+      db.channels.insert({ channelId: "ch-1", name: "ch-1", topic: "t", createdBy: "a", members: ["a"], archived: false, createdAt: 1, updatedAt: 1 });
+      db.channels.delete("ch-1");
+      expect(db.channels.get("ch-1")).toBeNull();
+    });
+  });
+
+  describe("ChannelMessageStore", () => {
+    it("appends and lists messages", () => {
+      const seq1 = db.channelMessages.append({ channelId: "ch-1", agentId: "a", content: "hello", timestamp: 100 });
+      const seq2 = db.channelMessages.append({ channelId: "ch-1", agentId: "b", content: "hi", timestamp: 200 });
+      const seq3 = db.channelMessages.append({ channelId: "ch-1", agentId: "a", content: "bye", timestamp: 300 });
+
+      expect(seq1).toBe(1);
+      expect(seq2).toBe(2);
+      expect(seq3).toBe(3);
+
+      const msgs = db.channelMessages.list({ channelId: "ch-1" });
+      expect(msgs).toHaveLength(3);
+      expect(msgs[0].agentId).toBe("a");
+      expect(msgs[0].content).toBe("hello");
+      expect(msgs[2].seq).toBe(3);
+    });
+
+    it("supports delta reading with since", () => {
+      db.channelMessages.append({ channelId: "ch-1", agentId: "a", content: "m1", timestamp: 100 });
+      db.channelMessages.append({ channelId: "ch-1", agentId: "b", content: "m2", timestamp: 200 });
+      db.channelMessages.append({ channelId: "ch-1", agentId: "a", content: "m3", timestamp: 300 });
+
+      const delta = db.channelMessages.list({ channelId: "ch-1", since: 3 });
+      expect(delta).toHaveLength(1);
+      expect(delta[0].content).toBe("m3");
+    });
+
+    it("counts messages per channel", () => {
+      db.channelMessages.append({ channelId: "ch-1", agentId: "a", content: "m1", timestamp: 100 });
+      db.channelMessages.append({ channelId: "ch-1", agentId: "b", content: "m2", timestamp: 200 });
+      db.channelMessages.append({ channelId: "ch-2", agentId: "a", content: "m3", timestamp: 300 });
+
+      expect(db.channelMessages.count("ch-1")).toBe(2);
+      expect(db.channelMessages.count("ch-2")).toBe(1);
+      expect(db.channelMessages.count("ch-nonexistent")).toBe(0);
+    });
+
+    it("isolates messages across channels", () => {
+      db.channelMessages.append({ channelId: "ch-1", agentId: "a", content: "in ch-1", timestamp: 100 });
+      db.channelMessages.append({ channelId: "ch-2", agentId: "b", content: "in ch-2", timestamp: 200 });
+
+      const ch1 = db.channelMessages.list({ channelId: "ch-1" });
+      const ch2 = db.channelMessages.list({ channelId: "ch-2" });
+
+      expect(ch1).toHaveLength(1);
+      expect(ch1[0].content).toBe("in ch-1");
+      expect(ch2).toHaveLength(1);
+      expect(ch2[0].content).toBe("in ch-2");
+    });
+  });
+
   describe("Persistence", () => {
     it("survives close and reopen", () => {
       db.homes.insert({ homeId: "a@n", agentId: "a", nodeId: "n", state: "ACTIVE", leaseExpiresAt: null, metadata: {}, createdAt: 1, updatedAt: 1 });

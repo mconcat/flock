@@ -19,9 +19,12 @@ import type {
   TransitionStore,
   AuditStore,
   TaskStore,
-  ThreadMessageStore,
-  ThreadMessage,
-  ThreadMessageFilter,
+  ChannelStore,
+  ChannelRecord,
+  ChannelFilter,
+  ChannelMessageStore,
+  ChannelMessage,
+  ChannelMessageFilter,
   HomeFilter,
   TransitionFilter,
   AuditFilter,
@@ -105,15 +108,28 @@ CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_tasks_messageType ON tasks(messageType);
 CREATE INDEX IF NOT EXISTS idx_tasks_createdAt ON tasks(createdAt);
 
-CREATE TABLE IF NOT EXISTS thread_messages (
-  threadId TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS channels (
+  channelId TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  topic TEXT NOT NULL DEFAULT '',
+  createdBy TEXT NOT NULL,
+  members TEXT NOT NULL DEFAULT '[]',
+  archived INTEGER NOT NULL DEFAULT 0,
+  createdAt INTEGER NOT NULL,
+  updatedAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_channels_createdBy ON channels(createdBy);
+CREATE INDEX IF NOT EXISTS idx_channels_archived ON channels(archived);
+
+CREATE TABLE IF NOT EXISTS channel_messages (
+  channelId TEXT NOT NULL,
   seq INTEGER NOT NULL,
   agentId TEXT NOT NULL,
   content TEXT NOT NULL,
   timestamp INTEGER NOT NULL,
-  PRIMARY KEY (threadId, seq)
+  PRIMARY KEY (channelId, seq)
 );
-CREATE INDEX IF NOT EXISTS idx_thread_messages_threadId ON thread_messages(threadId);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_channelId ON channel_messages(channelId);
 
 CREATE TABLE IF NOT EXISTS agent_loop_states (
   agentId TEXT PRIMARY KEY,
@@ -606,32 +622,165 @@ function createSqliteTaskStore(db: Database.Database): TaskStore {
   };
 }
 
-// --- Thread message store ---
+// --- Channel store ---
 
-function createSqliteThreadMessageStore(db: Database.Database): ThreadMessageStore {
+interface ChannelRow {
+  channelId: string;
+  name: string;
+  topic: string;
+  createdBy: string;
+  members: string;     // JSON array
+  archived: number;    // 0 or 1
+  createdAt: number;
+  updatedAt: number;
+}
+
+function safeParseJsonArray(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToChannel(row: ChannelRow): ChannelRecord {
+  return {
+    channelId: row.channelId,
+    name: row.name,
+    topic: row.topic,
+    createdBy: row.createdBy,
+    members: safeParseJsonArray(row.members),
+    archived: row.archived === 1,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function createSqliteChannelStore(db: Database.Database): ChannelStore {
   const stmts = {
-    nextSeq: db.prepare(`SELECT COALESCE(MAX(seq), 0) + 1 as next FROM thread_messages WHERE threadId = ?`),
-    insert: db.prepare(`INSERT INTO thread_messages (threadId, seq, agentId, content, timestamp) VALUES (@threadId, @seq, @agentId, @content, @timestamp)`),
-    list: db.prepare(`SELECT * FROM thread_messages WHERE threadId = @threadId AND seq >= @since ORDER BY seq ASC LIMIT @limit`),
-    count: db.prepare(`SELECT COUNT(*) as count FROM thread_messages WHERE threadId = ?`),
+    insert: db.prepare(`
+      INSERT INTO channels (channelId, name, topic, createdBy, members, archived, createdAt, updatedAt)
+      VALUES (@channelId, @name, @topic, @createdBy, @members, @archived, @createdAt, @updatedAt)
+    `),
+    get: db.prepare(`SELECT * FROM channels WHERE channelId = ?`),
+    delete: db.prepare(`DELETE FROM channels WHERE channelId = ?`),
   };
 
   return {
-    append(msg: Omit<ThreadMessage, "seq">): number {
-      const row = stmts.nextSeq.get(msg.threadId) as { next: number };
+    insert(record) {
+      stmts.insert.run({
+        channelId: record.channelId,
+        name: record.name,
+        topic: record.topic,
+        createdBy: record.createdBy,
+        members: JSON.stringify(record.members),
+        archived: record.archived ? 1 : 0,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+      });
+    },
+
+    update(channelId, fields) {
+      const sets: string[] = [];
+      const values: Record<string, unknown> = { channelId };
+
+      if (fields.name !== undefined) {
+        sets.push("name = @name");
+        values.name = fields.name;
+      }
+      if (fields.topic !== undefined) {
+        sets.push("topic = @topic");
+        values.topic = fields.topic;
+      }
+      if (fields.members !== undefined) {
+        sets.push("members = @members");
+        values.members = JSON.stringify(fields.members);
+      }
+      if (fields.archived !== undefined) {
+        sets.push("archived = @archived");
+        values.archived = fields.archived ? 1 : 0;
+      }
+      if (fields.updatedAt !== undefined) {
+        sets.push("updatedAt = @updatedAt");
+        values.updatedAt = fields.updatedAt;
+      }
+
+      if (sets.length === 0) return;
+      db.prepare(`UPDATE channels SET ${sets.join(", ")} WHERE channelId = @channelId`).run(values);
+    },
+
+    get(channelId) {
+      const row = stmts.get.get(channelId) as ChannelRow | undefined;
+      return row ? rowToChannel(row) : null;
+    },
+
+    list(filter?: ChannelFilter) {
+      const conditions: string[] = [];
+      const values: Record<string, unknown> = {};
+
+      if (filter?.channelId) {
+        conditions.push("channelId = @channelId");
+        values.channelId = filter.channelId;
+      }
+      if (filter?.createdBy) {
+        conditions.push("createdBy = @createdBy");
+        values.createdBy = filter.createdBy;
+      }
+      if (filter?.archived !== undefined) {
+        conditions.push("archived = @archived");
+        values.archived = filter.archived ? 1 : 0;
+      }
+      if (filter?.member) {
+        // Search JSON array for member presence
+        conditions.push("members LIKE @memberPattern");
+        values.memberPattern = `%"${filter.member}"%`;
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      if (filter?.limit) {
+        values._limit = Math.floor(filter.limit);
+      }
+      const limitClause = filter?.limit ? "LIMIT @_limit" : "";
+      const sql = `SELECT * FROM channels ${where} ORDER BY createdAt ASC ${limitClause}`;
+
+      const rows = db.prepare(sql).all(values) as ChannelRow[];
+      return rows.map(rowToChannel);
+    },
+
+    delete(channelId) {
+      stmts.delete.run(channelId);
+    },
+  };
+}
+
+// --- Channel message store ---
+
+function createSqliteChannelMessageStore(db: Database.Database): ChannelMessageStore {
+  const stmts = {
+    nextSeq: db.prepare(`SELECT COALESCE(MAX(seq), 0) + 1 as next FROM channel_messages WHERE channelId = ?`),
+    insert: db.prepare(`INSERT INTO channel_messages (channelId, seq, agentId, content, timestamp) VALUES (@channelId, @seq, @agentId, @content, @timestamp)`),
+    list: db.prepare(`SELECT * FROM channel_messages WHERE channelId = @channelId AND seq >= @since ORDER BY seq ASC LIMIT @limit`),
+    count: db.prepare(`SELECT COUNT(*) as count FROM channel_messages WHERE channelId = ?`),
+  };
+
+  return {
+    append(msg: Omit<ChannelMessage, "seq">): number {
+      const row = stmts.nextSeq.get(msg.channelId) as { next: number };
       const seq = row.next;
       stmts.insert.run({ ...msg, seq });
       return seq;
     },
-    list(filter: ThreadMessageFilter): ThreadMessage[] {
+    list(filter: ChannelMessageFilter): ChannelMessage[] {
       return stmts.list.all({
-        threadId: filter.threadId,
+        channelId: filter.channelId,
         since: filter.since ?? 0,
         limit: filter.limit ?? 1000,
-      }) as ThreadMessage[];
+      }) as ChannelMessage[];
     },
-    count(threadId: string): number {
-      const row = stmts.count.get(threadId) as { count: number };
+    count(channelId: string): number {
+      const row = stmts.count.get(channelId) as { count: number };
       return row.count;
     },
   };
@@ -748,7 +897,8 @@ export function createSqliteDatabase(dataDir: string): FlockDatabase {
   let transitions: TransitionStore | null = null;
   let audit: AuditStore | null = null;
   let tasks: TaskStore | null = null;
-  let threadMessages: ThreadMessageStore | null = null;
+  let channels: ChannelStore | null = null;
+  let channelMessages: ChannelMessageStore | null = null;
   let agentLoop: AgentLoopStore | null = null;
 
   return {
@@ -770,9 +920,13 @@ export function createSqliteDatabase(dataDir: string): FlockDatabase {
       if (!tasks) tasks = createSqliteTaskStore(db);
       return tasks;
     },
-    get threadMessages() {
-      if (!threadMessages) threadMessages = createSqliteThreadMessageStore(db);
-      return threadMessages;
+    get channels() {
+      if (!channels) channels = createSqliteChannelStore(db);
+      return channels;
+    },
+    get channelMessages() {
+      if (!channelMessages) channelMessages = createSqliteChannelMessageStore(db);
+      return channelMessages;
     },
     get agentLoop() {
       if (!agentLoop) agentLoop = createSqliteAgentLoopStore(db);
@@ -785,7 +939,8 @@ export function createSqliteDatabase(dataDir: string): FlockDatabase {
       transitions = null;
       audit = null;
       tasks = null;
-      threadMessages = null;
+      channels = null;
+      channelMessages = null;
       agentLoop = null;
     },
 
