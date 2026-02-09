@@ -112,7 +112,125 @@ describe("executor", () => {
       });
 
       await executor.execute(makeRequestContext("hello"), makeEventBus());
-      expect(sessionSend).toHaveBeenCalledWith("worker-1", expect.any(String));
+      expect(sessionSend).toHaveBeenCalledWith("worker-1", expect.any(String), undefined);
+    });
+  });
+
+  describe("session routing", () => {
+    it("passes sessionKey when sessionRouting is in DataPart", async () => {
+      const sessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+      const executor = createFlockExecutor({
+        flockMeta: workerMeta,
+        sessionSend,
+        logger: makeLogger(),
+      });
+
+      await executor.execute(
+        makeRequestContext("hello", {
+          sessionRouting: { chatType: "channel", peerId: "project-alpha" },
+        }),
+        makeEventBus(),
+      );
+
+      expect(sessionSend).toHaveBeenCalledWith(
+        "worker-1",
+        expect.any(String),
+        "agent:worker-1:flock:channel:project-alpha",
+      );
+    });
+
+    it("passes DM session key for dm chatType", async () => {
+      const sessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+      const executor = createFlockExecutor({
+        flockMeta: workerMeta,
+        sessionSend,
+        logger: makeLogger(),
+      });
+
+      await executor.execute(
+        makeRequestContext("hey", {
+          sessionRouting: { chatType: "dm", peerId: "pm" },
+        }),
+        makeEventBus(),
+      );
+
+      expect(sessionSend).toHaveBeenCalledWith(
+        "worker-1",
+        expect.any(String),
+        "agent:worker-1:flock:dm:pm",
+      );
+    });
+
+    it("passes undefined sessionKey when no sessionRouting", async () => {
+      const sessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+      const executor = createFlockExecutor({
+        flockMeta: workerMeta,
+        sessionSend,
+        logger: makeLogger(),
+      });
+
+      await executor.execute(makeRequestContext("hello"), makeEventBus());
+
+      expect(sessionSend).toHaveBeenCalledWith("worker-1", expect.any(String), undefined);
+    });
+
+    it("ignores invalid sessionRouting (missing fields)", async () => {
+      const sessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+      const executor = createFlockExecutor({
+        flockMeta: workerMeta,
+        sessionSend,
+        logger: makeLogger(),
+      });
+
+      await executor.execute(
+        makeRequestContext("hello", {
+          sessionRouting: { chatType: "channel" }, // missing peerId
+        }),
+        makeEventBus(),
+      );
+
+      expect(sessionSend).toHaveBeenCalledWith("worker-1", expect.any(String), undefined);
+    });
+
+    it("ignores non-object sessionRouting", async () => {
+      const sessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+      const executor = createFlockExecutor({
+        flockMeta: workerMeta,
+        sessionSend,
+        logger: makeLogger(),
+      });
+
+      await executor.execute(
+        makeRequestContext("hello", {
+          sessionRouting: "not-an-object" as any,
+        }),
+        makeEventBus(),
+      );
+
+      expect(sessionSend).toHaveBeenCalledWith("worker-1", expect.any(String), undefined);
+    });
+
+    it("sessionRouting coexists with flockType metadata", async () => {
+      const sessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+      const executor = createFlockExecutor({
+        flockMeta: workerMeta,
+        sessionSend,
+        logger: makeLogger(),
+      });
+
+      await executor.execute(
+        makeRequestContext("do work", {
+          flockType: "worker-task",
+          sessionRouting: { chatType: "channel", peerId: "builds" },
+        }),
+        makeEventBus(),
+      );
+
+      expect(sessionSend).toHaveBeenCalledWith(
+        "worker-1",
+        expect.any(String),
+        "agent:worker-1:flock:channel:builds",
+      );
     });
   });
 

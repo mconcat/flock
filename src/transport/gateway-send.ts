@@ -31,15 +31,16 @@ export interface GatewaySessionSendOptions {
  * Create a SessionSendFn that routes messages through the OpenClaw gateway.
  *
  * Uses the gateway's OpenAI-compatible /v1/chat/completions endpoint with
- * X-Clawdbot-Agent-Id header to target specific agents. The gateway handles
- * all LLM provider routing, authentication, and session management.
+ * X-OpenClaw-Agent-Id header to target specific agents. When a sessionKey
+ * is provided, X-OpenClaw-Session-Key routes to a per-channel/DM session.
  */
 export function createGatewaySessionSend(opts: GatewaySessionSendOptions): SessionSendFn {
   const { port, token, logger, timeoutMs = 600_000 } = opts;
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  return async (agentId: string, message: string): Promise<string | null> => {
-    logger.info(`[flock:gateway-send] Sending to agent "${agentId}": ${message.slice(0, 100)}...`);
+  return async (agentId: string, message: string, sessionKey?: string): Promise<string | null> => {
+    const target = sessionKey ? `"${agentId}" [${sessionKey}]` : `"${agentId}"`;
+    logger.info(`[flock:gateway-send] Sending to ${target}: ${message.slice(0, 100)}...`);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -50,14 +51,19 @@ export function createGatewaySessionSend(opts: GatewaySessionSendOptions): Sessi
     const messages: Array<{ role: string; content: string }> = [];
     messages.push({ role: "user", content: message });
 
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`,
+      "X-OpenClaw-Agent-Id": agentId,
+    };
+    if (sessionKey) {
+      headers["X-OpenClaw-Session-Key"] = sessionKey;
+    }
+
     try {
       const res = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-          "X-OpenClaw-Agent-Id": agentId,
-        },
+        headers,
         body: JSON.stringify({
           model: `openclaw/${agentId}`,
           messages,

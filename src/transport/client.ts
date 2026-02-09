@@ -190,7 +190,11 @@ export function createA2AClient(config: A2AClientConfig): A2AClient {
       fromHome: options?.fromHome,
     };
 
-    const msg = userMessage(fullRequest, [dataPart(metadata)]);
+    const fromAgent = options?.fromHome ?? "unknown";
+    const msg = userMessage(fullRequest, [dataPart({
+      ...metadata,
+      sessionRouting: { chatType: "request", peerId: fromAgent },
+    })]);
     const params: MessageSendParams = { message: msg };
 
     // If we have a sysadmin resolver and a requesting agent, use it to

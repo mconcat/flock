@@ -33,10 +33,16 @@ import {
 /**
  * Function signature for sending a message to a Clawdbot agent session.
  * Injected as dependency — actual implementation uses sessions_send.
+ *
+ * When sessionKey is provided, the message is routed to a specific
+ * OpenClaw session (e.g. per-channel or per-DM). Format:
+ *   agent:{agentId}:flock:channel:{channelId}
+ *   agent:{agentId}:flock:dm:{peerId}
  */
 export type SessionSendFn = (
   agentId: string,
   message: string,
+  sessionKey?: string,
 ) => Promise<string | null>;
 
 export interface FlockExecutorParams {
@@ -81,6 +87,12 @@ export function createFlockExecutor(params: FlockExecutorParams): AgentExecutor 
         : undefined;
 
       const agentId = flockMeta.homeId.split("@")[0];
+
+      // Per-channel/DM session routing from DataPart metadata
+      const routing = toSessionRouting(data);
+      const sessionKey = routing
+        ? `agent:${agentId}:flock:${routing.chatType}:${routing.peerId}`
+        : undefined;
       const fromHome = taskMeta?.fromHome ?? "unknown";
       const startTime = Date.now();
 
@@ -119,7 +131,7 @@ export function createFlockExecutor(params: FlockExecutorParams): AgentExecutor 
 
       try {
         const response = await Promise.race([
-          sessionSend(agentId, prompt),
+          sessionSend(agentId, prompt, sessionKey),
           timeout(responseTimeoutMs),
         ]);
 
@@ -262,6 +274,21 @@ export function createFlockExecutor(params: FlockExecutorParams): AgentExecutor 
 const VALID_FLOCK_TYPES = new Set(["sysadmin-request", "worker-task", "review", "system-op"]);
 const VALID_URGENCIES = new Set(["low", "normal", "high"]);
 const VALID_TRIAGE_LEVELS = new Set(["GREEN", "YELLOW", "RED"]);
+
+interface SessionRouting {
+  chatType: string;
+  peerId: string;
+}
+
+/** Extract session routing info from DataPart data, or undefined. */
+function toSessionRouting(data: Record<string, unknown> | null): SessionRouting | undefined {
+  if (!data) return undefined;
+  const r = data.sessionRouting;
+  if (typeof r !== "object" || r === null) return undefined;
+  const obj = r as Record<string, unknown>;
+  if (typeof obj.chatType !== "string" || typeof obj.peerId !== "string") return undefined;
+  return { chatType: obj.chatType, peerId: obj.peerId };
+}
 
 /** Safely extract and validate FlockTaskMetadata from DataPart data, or null. */
 function toFlockTaskMeta(data: Record<string, unknown> | null): FlockTaskMetadata | null {

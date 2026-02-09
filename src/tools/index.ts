@@ -1109,9 +1109,10 @@ function createMessageTool(deps: ToolDeps): ToolDefinition {
           }
         }
 
-        // Construct A2A message directly
-        const extraParts = contextData ? [dataPart(contextData)] : undefined;
-        const a2aParams = { message: userMessage(message, extraParts) };
+        // Construct A2A message with DM session routing
+        const routingData = { sessionRouting: { chatType: "dm", peerId: callerAgentId } };
+        const mergedData = contextData ? { ...contextData, ...routingData } : routingData;
+        const a2aParams = { message: userMessage(message, [dataPart(mergedData)]) };
 
         // Fire-and-forget: send A2A request in background (non-blocking)
         const sendPromise = deps.a2aClient.sendA2A(to, a2aParams);
@@ -1342,7 +1343,11 @@ function notifyAgent(
       }
     }
 
-    const a2aParams = { message: userMessage(freshNotification) };
+    const a2aParams = {
+      message: userMessage(freshNotification, [
+        dataPart({ sessionRouting: { chatType: "channel", peerId: channelId } }),
+      ]),
+    };
     deps.a2aClient!.sendA2A(target, a2aParams).then((result) => {
       const now = Date.now();
       // Fire-and-forget: do NOT store inline responses in channel.
@@ -2362,7 +2367,9 @@ function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
 
       // Send follow-up A2A message to the original requester (fire-and-forget)
       if (deps.a2aClient) {
-        const followUpMessage = userMessage(`Response to task ${taskId}: ${response}`);
+        const followUpMessage = userMessage(`Response to task ${taskId}: ${response}`, [
+          dataPart({ sessionRouting: { chatType: "dm", peerId: callerAgentId } }),
+        ]);
 
         deps.a2aClient.sendA2A(task.fromAgentId, { message: followUpMessage }).catch((err: unknown) => {
           const errorMsg = err instanceof Error ? err.message : String(err);

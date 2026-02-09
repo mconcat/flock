@@ -17,7 +17,8 @@ import type { AgentLoopStore, AgentLoopRecord, ChannelMessageStore, ChannelStore
 import type { A2AClient } from "../transport/client.js";
 import type { AuditLog } from "../audit/log.js";
 import type { PluginLogger } from "../types.js";
-import { userMessage } from "../transport/a2a-helpers.js";
+import { userMessage, dataPart } from "../transport/a2a-helpers.js";
+import { uniqueId } from "../utils/id.js";
 
 /** Base tick interval for AWAKE agents (ms). */
 const TICK_INTERVAL_MS = 60_000;
@@ -192,7 +193,9 @@ export class WorkLoopScheduler {
     for (let attempt = 0; attempt <= TICK_MAX_RETRIES; attempt++) {
       try {
         await a2aClient.sendA2A(agent.agentId, {
-          message: userMessage(tickMessage),
+          message: userMessage(tickMessage, [
+            dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
+          ]),
         });
         delivered = true;
         break;
@@ -216,7 +219,7 @@ export class WorkLoopScheduler {
       this.consecutiveFailures.set(agent.agentId, failures);
 
       audit.append({
-        id: `tick-err-${agent.agentId}-${now}`,
+        id: uniqueId("tick-err"),
         timestamp: now,
         agentId: agent.agentId,
         action: "tick-failed",
@@ -234,7 +237,7 @@ export class WorkLoopScheduler {
         this.consecutiveFailures.delete(agent.agentId);
 
         audit.append({
-          id: `auto-sleep-${agent.agentId}-${now}`,
+          id: uniqueId("auto-sleep"),
           timestamp: now,
           agentId: agent.agentId,
           action: "agent-auto-sleep",
@@ -273,7 +276,9 @@ export class WorkLoopScheduler {
 
     try {
       await a2aClient.sendA2A(agent.agentId, {
-        message: userMessage(message),
+        message: userMessage(message, [
+          dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
+        ]),
       });
       logger.debug?.(`[flock:loop] Slow-tick sent to SLEEP agent "${agent.agentId}"`);
     } catch (err) {
@@ -281,7 +286,7 @@ export class WorkLoopScheduler {
       logger.warn(`[flock:loop] Slow-tick failed for SLEEP agent "${agent.agentId}": ${errorMsg}`);
 
       audit.append({
-        id: `slow-tick-err-${agent.agentId}-${now}`,
+        id: uniqueId("slow-tick-err"),
         timestamp: now,
         agentId: agent.agentId,
         action: "slow-tick-failed",
