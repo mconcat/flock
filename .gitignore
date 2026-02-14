@@ -16,6 +16,9 @@ e2e/.env.*
 auth-profiles.json
 **/auth-profiles.json
 
+# OpenClaw (cloned at runtime by `flock init`)
+openclaw/
+
 # Build artifacts
 *.tsbuildinfo
 

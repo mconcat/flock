@@ -1,0 +1,43 @@
+# Flock — Standalone CLI E2E Test
+#
+# Tests the full user-facing lifecycle in an isolated Docker container:
+#   flock init → flock add → flock start → chat completion → flock stop
+#
+# Run (infrastructure tests only — no LLM credentials needed):
+#   docker compose -f docker-compose.standalone.yml up --build --abort-on-container-exit
+#
+# Run with LLM tests (setup token from `claude setup-token`):
+#   SETUP_TOKEN=sk-ant-oat01-... \
+#     docker compose -f docker-compose.standalone.yml up --build --abort-on-container-exit
+#
+# Run with LLM tests (auth-profiles.json file):
+#   AUTH_PROFILES=~/.openclaw/agents/main/agent/auth-profiles.json \
+#     docker compose -f docker-compose.standalone.yml up --build --abort-on-container-exit
+#
+# Verbose:
+#   E2E_VERBOSE=1 docker compose -f docker-compose.standalone.yml up --build --abort-on-container-exit
+#
+# Clean up:
+#   docker compose -f docker-compose.standalone.yml down -v
+
+services:
+  standalone:
+    build:
+      context: .
+      dockerfile: standalone/Dockerfile
+    environment:
+      - NODE_ENV=test
+      - E2E_VERBOSE=${E2E_VERBOSE:-}
+      - SETUP_TOKEN=${SETUP_TOKEN:-}
+    volumes:
+      # Docker socket — sandbox containers run as sibling containers on host daemon
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared path for sandbox volume mounts — MUST be identical inside container
+      # and on host so that sandbox container `-v` paths resolve correctly.
+      - /tmp/flock-e2e:/tmp/flock-e2e
+      # AUTH_PROFILES: path to auth-profiles.json for LLM tests.
+      # Falls back to /dev/null (empty file) when not set — LLM tests are skipped.
+      - ${AUTH_PROFILES:-/dev/null}:/tmp/host-auth-profiles.json:ro
+    tmpfs:
+      - /tmp:exec,size=512m
+    command: ["node", "/test/test-harness.mjs"]

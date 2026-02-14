@@ -40,6 +40,13 @@ import { createA2ATransport, createLocalDispatch, createHttpDispatch } from "./m
 import type { HandlerDispatch } from "./migration/a2a-transport.js";
 import { createMigrationOrchestrator } from "./migration/orchestrator.js";
 import { WorkLoopScheduler } from "./loop/scheduler.js";
+import { EchoTracker } from "./bridge/index.js";
+import type { BridgeDeps } from "./bridge/index.js";
+import { handleInbound } from "./bridge/inbound.js";
+import type { InboundEvent, InboundContext } from "./bridge/inbound.js";
+import { handleOutbound } from "./bridge/outbound.js";
+import { sendViaWebhook } from "./bridge/discord-webhook.js";
+import type { BridgePlatform } from "./db/interface.js";
 
 /**
  * Safely access an extended method on PluginApi that may not be
@@ -219,6 +226,26 @@ export function register(api: PluginApi) {
   // Register flock_nodes tool (Phase 3 — node management)
   api.registerTool(createNodesTool({ nodeRegistry, logger }));
 
+  // Resolve Discord bot token for webhook auto-creation.
+  // Try OpenClaw runtime config first, then fall back to env var.
+  let discordBotToken: string | undefined;
+  try {
+    const runtimeAny = (api as unknown as Record<string, unknown>).runtime as Record<string, unknown> | undefined;
+    const configNs = runtimeAny?.config as { loadConfig?: () => Record<string, unknown> } | undefined;
+    const ocConfig = configNs?.loadConfig?.();
+    const discordCfg = (ocConfig?.channels as Record<string, unknown> | undefined)?.discord as Record<string, unknown> | undefined;
+    const cfgToken = discordCfg?.token;
+    if (typeof cfgToken === "string" && cfgToken.trim()) {
+      discordBotToken = cfgToken.trim().replace(/^Bot\s+/i, "");
+    }
+  } catch { /* config not available */ }
+  if (!discordBotToken && process.env.DISCORD_BOT_TOKEN) {
+    discordBotToken = process.env.DISCORD_BOT_TOKEN.trim().replace(/^Bot\s+/i, "");
+  }
+  if (discordBotToken) {
+    logger.info(`[flock] Discord bot token resolved — webhook bridge mode available`);
+  }
+
   // Register agent-facing tools
   // Keep a reference to deps so we can set sysadminAgentId after gateway agents register
   const toolDeps: ToolDeps = {
@@ -235,6 +262,8 @@ export function register(api: PluginApi) {
     migrationOrchestrator,
     logger,
     vaultsBasePath: config.vaultsBasePath,
+    bridgeStore: db.bridges,
+    discordBotToken,
   };
   registerFlockTools(api, toolDeps);
 
@@ -446,10 +475,15 @@ export function register(api: PluginApi) {
   setFlockTransport(a2aServer, a2aClient);
 
   // --- Work Loop Scheduler ---
-  // Initialize agent loop states for all gateway agents (initial state: AWAKE)
+  // Initialize agent loop states for all gateway agents.
+  // Sysadmin agents start as REACTIVE (no periodic ticks, @mention only).
+  // All others start as AWAKE.
   if (config.gatewayAgents.length > 0) {
     for (const agent of config.gatewayAgents) {
-      db.agentLoop.init(agent.id, "AWAKE");
+      let agentRole: FlockAgentRole = agent.role ?? "worker";
+      if (config.orchestratorIds.includes(agent.id)) agentRole = "orchestrator";
+      const initialState = agentRole === "sysadmin" ? "REACTIVE" as const : "AWAKE" as const;
+      db.agentLoop.init(agent.id, initialState);
     }
     logger.info(`[flock] initialized loop state for ${config.gatewayAgents.length} agent(s)`);
   }
@@ -470,6 +504,102 @@ export function register(api: PluginApi) {
   // Start the work loop scheduler
   workLoopScheduler.start();
   logger.info(`[flock] work loop scheduler started`);
+
+  // --- Bridge hooks (Discord/Slack ↔ Flock channels) ---
+  const registerOn = getPluginMethod<(hookName: string, handler: Function, opts?: { priority?: number }) => void>(api, "on");
+  if (registerOn) {
+    const echoTracker = new EchoTracker();
+
+    // Build sendExternal — Discord uses webhooks for per-agent display names,
+    // falls back to OpenClaw runtime send. Slack always uses prefix.
+    const runtime = (api as unknown as Record<string, unknown>).runtime as
+      | { channel?: { discord?: { sendMessageDiscord?: Function }; slack?: { sendMessageSlack?: Function } } }
+      | undefined;
+    const sendDiscord = runtime?.channel?.discord?.sendMessageDiscord;
+    const sendSlack = runtime?.channel?.slack?.sendMessageSlack;
+
+    const sendExternal = async (
+      platform: BridgePlatform,
+      externalChannelId: string,
+      text: string,
+      opts?: { accountId?: string; displayName?: string; webhookUrl?: string },
+    ): Promise<void> => {
+      if (platform === "discord") {
+        if (opts?.webhookUrl) {
+          // Send via webhook with per-agent display name
+          await sendViaWebhook(opts.webhookUrl, text, opts.displayName);
+        } else if (sendDiscord) {
+          // Fallback: bot API with prefix
+          const prefixed = opts?.displayName ? `**[${opts.displayName}]** ${text}` : text;
+          await (sendDiscord as Function)(externalChannelId, prefixed, { verbose: false, accountId: opts?.accountId });
+        } else {
+          logger.warn(`[flock:bridge] No send function available for platform "discord"`);
+        }
+      } else if (platform === "slack") {
+        // Slack: always prefix with agent name (no display name switching)
+        const prefixed = opts?.displayName ? `**[${opts.displayName}]** ${text}` : text;
+        if (sendSlack) {
+          await (sendSlack as Function)(externalChannelId, prefixed, { accountId: opts?.accountId });
+        } else {
+          logger.warn(`[flock:bridge] No send function available for platform "slack"`);
+        }
+      } else {
+        logger.warn(`[flock:bridge] No send function available for platform "${platform}"`);
+      }
+    };
+
+    const bridgeDeps: BridgeDeps = {
+      bridgeStore: db.bridges,
+      channelStore: db.channels,
+      channelMessages: db.channelMessages,
+      audit,
+      logger,
+      sendExternal,
+      agentLoop: db.agentLoop,
+      scheduler: workLoopScheduler,
+    };
+
+    // Make sendExternal available to tools (late-binding — tools run at call time)
+    toolDeps.sendExternal = sendExternal;
+
+    // Inbound: external platform message → Flock channel
+    registerOn("message_received", (event: InboundEvent, ctx: InboundContext) => {
+      try {
+        handleInbound(bridgeDeps, echoTracker, event, ctx);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[flock:bridge:in] Error handling inbound: ${msg}`);
+      }
+    }, { priority: 100 });
+
+    // Outbound: flock_channel_post → external platform
+    registerOn("after_tool_call", (
+      event: { toolName: string; params: Record<string, unknown>; result?: unknown; error?: unknown },
+      ctx: { agentId?: string },
+    ) => {
+      if (event.toolName !== "flock_channel_post" || event.error) return;
+      const p = event.params;
+      const channelId = String(p.channelId ?? "");
+      const message = String(p.message ?? "");
+      const agentId = ctx.agentId ?? String(p.agentId ?? "unknown");
+      // Extract seq from result — toOCResult puts data in `details`
+      const resultObj = event.result as { details?: { seq?: number }; data?: { seq?: number } } | undefined;
+      const seq = resultObj?.details?.seq ?? resultObj?.data?.seq;
+      void handleOutbound(bridgeDeps, echoTracker, { channelId, message, agentId, seq }).catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[flock:bridge:out] Error handling outbound: ${msg}`);
+      });
+    }, { priority: 100 });
+
+    logger.info(`[flock] bridge hooks registered (message_received + after_tool_call)`);
+
+    // Cleanup echo tracker on shutdown
+    process.once("beforeExit", () => {
+      echoTracker.dispose();
+    });
+  } else {
+    logger.info(`[flock] bridge hooks not available (api.on not found) — bridge relay disabled`);
+  }
 
   // Graceful shutdown (once: true to avoid accumulation on hot reload)
   process.once("beforeExit", () => {

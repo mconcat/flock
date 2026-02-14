@@ -35,6 +35,10 @@ import type {
   AgentLoopStore,
   AgentLoopRecord,
   AgentLoopState,
+  BridgeStore,
+  BridgeMapping,
+  BridgePlatform,
+  BridgeFilter,
 } from "./interface.js";
 import { isTaskState } from "./interface.js";
 
@@ -115,6 +119,8 @@ CREATE TABLE IF NOT EXISTS channels (
   createdBy TEXT NOT NULL,
   members TEXT NOT NULL DEFAULT '[]',
   archived INTEGER NOT NULL DEFAULT 0,
+  archiveReadyMembers TEXT NOT NULL DEFAULT '[]',
+  archivingStartedAt INTEGER DEFAULT NULL,
   createdAt INTEGER NOT NULL,
   updatedAt INTEGER NOT NULL
 );
@@ -140,6 +146,21 @@ CREATE TABLE IF NOT EXISTS agent_loop_states (
   sleepReason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_loop_state ON agent_loop_states(state);
+
+CREATE TABLE IF NOT EXISTS bridge_mappings (
+  bridgeId TEXT PRIMARY KEY,
+  channelId TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  externalChannelId TEXT NOT NULL,
+  accountId TEXT,
+  webhookUrl TEXT,
+  createdBy TEXT NOT NULL,
+  createdAt INTEGER NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bridge_channel_platform ON bridge_mappings(channelId, platform);
+CREATE INDEX IF NOT EXISTS idx_bridge_external ON bridge_mappings(platform, externalChannelId);
+CREATE INDEX IF NOT EXISTS idx_bridge_active ON bridge_mappings(active);
 `;
 
 // --- Row types (what SQLite returns) ---
@@ -629,8 +650,10 @@ interface ChannelRow {
   name: string;
   topic: string;
   createdBy: string;
-  members: string;     // JSON array
-  archived: number;    // 0 or 1
+  members: string;                      // JSON array
+  archived: number;                     // 0 or 1
+  archiveReadyMembers: string;          // JSON array
+  archivingStartedAt: number | null;    // epoch ms or null
   createdAt: number;
   updatedAt: number;
 }
@@ -653,6 +676,8 @@ function rowToChannel(row: ChannelRow): ChannelRecord {
     createdBy: row.createdBy,
     members: safeParseJsonArray(row.members),
     archived: row.archived === 1,
+    archiveReadyMembers: safeParseJsonArray(row.archiveReadyMembers),
+    archivingStartedAt: row.archivingStartedAt ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -661,8 +686,8 @@ function rowToChannel(row: ChannelRow): ChannelRecord {
 function createSqliteChannelStore(db: Database.Database): ChannelStore {
   const stmts = {
     insert: db.prepare(`
-      INSERT INTO channels (channelId, name, topic, createdBy, members, archived, createdAt, updatedAt)
-      VALUES (@channelId, @name, @topic, @createdBy, @members, @archived, @createdAt, @updatedAt)
+      INSERT INTO channels (channelId, name, topic, createdBy, members, archived, archiveReadyMembers, archivingStartedAt, createdAt, updatedAt)
+      VALUES (@channelId, @name, @topic, @createdBy, @members, @archived, @archiveReadyMembers, @archivingStartedAt, @createdAt, @updatedAt)
     `),
     get: db.prepare(`SELECT * FROM channels WHERE channelId = ?`),
     delete: db.prepare(`DELETE FROM channels WHERE channelId = ?`),
@@ -677,6 +702,8 @@ function createSqliteChannelStore(db: Database.Database): ChannelStore {
         createdBy: record.createdBy,
         members: JSON.stringify(record.members),
         archived: record.archived ? 1 : 0,
+        archiveReadyMembers: JSON.stringify(record.archiveReadyMembers),
+        archivingStartedAt: record.archivingStartedAt,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
       });
@@ -701,6 +728,14 @@ function createSqliteChannelStore(db: Database.Database): ChannelStore {
       if (fields.archived !== undefined) {
         sets.push("archived = @archived");
         values.archived = fields.archived ? 1 : 0;
+      }
+      if (fields.archiveReadyMembers !== undefined) {
+        sets.push("archiveReadyMembers = @archiveReadyMembers");
+        values.archiveReadyMembers = JSON.stringify(fields.archiveReadyMembers);
+      }
+      if (fields.archivingStartedAt !== undefined) {
+        sets.push("archivingStartedAt = @archivingStartedAt");
+        values.archivingStartedAt = fields.archivingStartedAt;
       }
       if (fields.updatedAt !== undefined) {
         sets.push("updatedAt = @updatedAt");
@@ -800,7 +835,7 @@ interface AgentLoopRow {
 function rowToAgentLoop(row: AgentLoopRow): AgentLoopRecord {
   return {
     agentId: row.agentId,
-    state: (row.state === "AWAKE" || row.state === "SLEEP") ? row.state : "AWAKE",
+    state: (row.state === "AWAKE" || row.state === "SLEEP" || row.state === "REACTIVE") ? row.state : "AWAKE",
     lastTickAt: row.lastTickAt,
     awakenedAt: row.awakenedAt,
     sleptAt: row.sleptAt,
@@ -854,12 +889,13 @@ function createSqliteAgentLoopStore(db: Database.Database): AgentLoopStore {
 
     setState(agentId: string, state: AgentLoopState, reason?: string): void {
       const now = Date.now();
+      const quiescent = state === "SLEEP" || state === "REACTIVE";
       stmts.setState.run({
         agentId,
         state,
-        sleptAt: state === "SLEEP" ? now : null,
-        sleepReason: state === "SLEEP" ? (reason ?? null) : null,
-        awakenedAt: state === "AWAKE" ? now : (stmts.get.get(agentId) as AgentLoopRow | undefined)?.awakenedAt ?? now,
+        sleptAt: quiescent ? now : null,
+        sleepReason: quiescent ? (reason ?? null) : null,
+        awakenedAt: quiescent ? ((stmts.get.get(agentId) as AgentLoopRow | undefined)?.awakenedAt ?? now) : now,
       });
     },
 
@@ -875,6 +911,127 @@ function createSqliteAgentLoopStore(db: Database.Database): AgentLoopStore {
     listAll(): AgentLoopRecord[] {
       const rows = stmts.listAll.all() as AgentLoopRow[];
       return rows.map(rowToAgentLoop);
+    },
+  };
+}
+
+// --- Bridge mapping store ---
+
+interface BridgeRow {
+  bridgeId: string;
+  channelId: string;
+  platform: string;
+  externalChannelId: string;
+  accountId: string | null;
+  webhookUrl: string | null;
+  createdBy: string;
+  createdAt: number;
+  active: number; // 0 or 1
+}
+
+function rowToBridge(row: BridgeRow): BridgeMapping {
+  return {
+    bridgeId: row.bridgeId,
+    channelId: row.channelId,
+    platform: row.platform as BridgePlatform,
+    externalChannelId: row.externalChannelId,
+    accountId: row.accountId,
+    webhookUrl: row.webhookUrl,
+    createdBy: row.createdBy,
+    createdAt: row.createdAt,
+    active: row.active === 1,
+  };
+}
+
+function createSqliteBridgeStore(db: Database.Database): BridgeStore {
+  const stmts = {
+    insert: db.prepare(`
+      INSERT INTO bridge_mappings (bridgeId, channelId, platform, externalChannelId, accountId, webhookUrl, createdBy, createdAt, active)
+      VALUES (@bridgeId, @channelId, @platform, @externalChannelId, @accountId, @webhookUrl, @createdBy, @createdAt, @active)
+    `),
+    get: db.prepare(`SELECT * FROM bridge_mappings WHERE bridgeId = ?`),
+    getByChannel: db.prepare(`SELECT * FROM bridge_mappings WHERE channelId = ? AND active = 1`),
+    getByExternal: db.prepare(`SELECT * FROM bridge_mappings WHERE platform = ? AND externalChannelId = ?`),
+    delete: db.prepare(`DELETE FROM bridge_mappings WHERE bridgeId = ?`),
+  };
+
+  return {
+    insert(record) {
+      stmts.insert.run({
+        bridgeId: record.bridgeId,
+        channelId: record.channelId,
+        platform: record.platform,
+        externalChannelId: record.externalChannelId,
+        accountId: record.accountId,
+        webhookUrl: record.webhookUrl,
+        createdBy: record.createdBy,
+        createdAt: record.createdAt,
+        active: record.active ? 1 : 0,
+      });
+    },
+
+    get(bridgeId) {
+      const row = stmts.get.get(bridgeId) as BridgeRow | undefined;
+      return row ? rowToBridge(row) : null;
+    },
+
+    getByChannel(channelId) {
+      const rows = stmts.getByChannel.all(channelId) as BridgeRow[];
+      return rows.map(rowToBridge);
+    },
+
+    getByExternal(platform: BridgePlatform, externalChannelId: string) {
+      const row = stmts.getByExternal.get(platform, externalChannelId) as BridgeRow | undefined;
+      return row ? rowToBridge(row) : null;
+    },
+
+    list(filter?: BridgeFilter) {
+      const conditions: string[] = [];
+      const values: Record<string, unknown> = {};
+
+      if (filter?.channelId) {
+        conditions.push("channelId = @channelId");
+        values.channelId = filter.channelId;
+      }
+      if (filter?.platform) {
+        conditions.push("platform = @platform");
+        values.platform = filter.platform;
+      }
+      if (filter?.active !== undefined) {
+        conditions.push("active = @active");
+        values.active = filter.active ? 1 : 0;
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      if (filter?.limit) {
+        values._limit = Math.floor(filter.limit);
+      }
+      const limitClause = filter?.limit ? "LIMIT @_limit" : "";
+      const sql = `SELECT * FROM bridge_mappings ${where} ORDER BY createdAt ASC ${limitClause}`;
+
+      const rows = db.prepare(sql).all(values) as BridgeRow[];
+      return rows.map(rowToBridge);
+    },
+
+    update(bridgeId, fields) {
+      const sets: string[] = [];
+      const values: Record<string, unknown> = { bridgeId };
+
+      if (fields.active !== undefined) {
+        sets.push("active = @active");
+        values.active = fields.active ? 1 : 0;
+      }
+      if (fields.webhookUrl !== undefined) {
+        sets.push("webhookUrl = @webhookUrl");
+        values.webhookUrl = fields.webhookUrl;
+      }
+
+      if (sets.length === 0) return;
+      db.prepare(`UPDATE bridge_mappings SET ${sets.join(", ")} WHERE bridgeId = @bridgeId`).run(values);
+    },
+
+    delete(bridgeId) {
+      stmts.delete.run(bridgeId);
     },
   };
 }
@@ -900,6 +1057,7 @@ export function createSqliteDatabase(dataDir: string): FlockDatabase {
   let channels: ChannelStore | null = null;
   let channelMessages: ChannelMessageStore | null = null;
   let agentLoop: AgentLoopStore | null = null;
+  let bridges: BridgeStore | null = null;
 
   return {
     backend: "sqlite",
@@ -932,9 +1090,18 @@ export function createSqliteDatabase(dataDir: string): FlockDatabase {
       if (!agentLoop) agentLoop = createSqliteAgentLoopStore(db);
       return agentLoop;
     },
+    get bridges() {
+      if (!bridges) bridges = createSqliteBridgeStore(db);
+      return bridges;
+    },
 
     migrate() {
       db.exec(SCHEMA_SQL);
+
+      // Add archive protocol columns to existing DBs (idempotent)
+      try { db.exec(`ALTER TABLE channels ADD COLUMN archiveReadyMembers TEXT NOT NULL DEFAULT '[]'`); } catch { /* already exists */ }
+      try { db.exec(`ALTER TABLE channels ADD COLUMN archivingStartedAt INTEGER DEFAULT NULL`); } catch { /* already exists */ }
+
       homes = null;
       transitions = null;
       audit = null;
@@ -942,6 +1109,7 @@ export function createSqliteDatabase(dataDir: string): FlockDatabase {
       channels = null;
       channelMessages = null;
       agentLoop = null;
+      bridges = null;
     },
 
     close() {

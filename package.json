@@ -13,7 +13,7 @@
     ]
   },
   "scripts": {
-    "build": "tsc && cp -r src/prompts/templates dist/prompts/ && chmod +x dist/cli/index.js",
+    "build": "tsc && cp -r src/prompts/templates dist/prompts/ && cp openclaw.plugin.json dist/ && chmod +x dist/cli/index.js",
     "postinstall": "echo '\\n🐦 Run \"flock init\" to configure Flock in your OpenClaw setup.\\n'",
     "lint": "eslint src/",
     "test": "vitest run --project unit && npm run test:integration && npm run test:e2e",
@@ -21,6 +21,7 @@
     "test:integration": "docker compose -f docker-compose.test.yml run --rm --build integration; docker compose -f docker-compose.test.yml down -v",
     "test:e2e": "docker compose -f docker-compose.e2e.yml up --build --abort-on-container-exit; docker compose -f docker-compose.e2e.yml down -v",
     "test:e2e:crossnode": "docker compose -f docker-compose.crossnode.yml up --build --abort-on-container-exit; docker compose -f docker-compose.crossnode.yml down -v",
+    "test:standalone": "docker compose -f docker-compose.standalone.yml up --build --abort-on-container-exit; docker compose -f docker-compose.standalone.yml down -v",
     "test:watch": "vitest --project unit"
   },
   "keywords": [

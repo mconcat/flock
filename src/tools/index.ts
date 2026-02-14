@@ -18,7 +18,7 @@ import type { HomeManager } from "../homes/manager.js";
 import type { HomeProvisioner } from "../homes/provisioner.js";
 import { formatBindMountsForConfig } from "../homes/provisioner.js";
 import type { AuditLog } from "../audit/log.js";
-import type { HomeFilter, AuditFilter, TaskStore, TaskFilter, TaskRecord, ChannelStore, ChannelMessageStore } from "../db/index.js";
+import type { HomeFilter, AuditFilter, TaskStore, TaskFilter, TaskRecord, ChannelStore, ChannelMessageStore, BridgeStore } from "../db/index.js";
 import { isTaskState, TASK_STATES } from "../db/index.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
@@ -35,6 +35,8 @@ import { createCreateAgentTool, createDecommissionAgentTool, createRestartGatewa
 import { createWorkspaceTools } from "./workspace.js";
 import type { AgentLoopStore } from "../db/index.js";
 import type { WorkLoopScheduler } from "../loop/scheduler.js";
+import { createChannelWebhook, createDiscordChannel } from "../bridge/discord-webhook.js";
+import type { SendExternalFn } from "../bridge/index.js";
 
 /** Maximum number of rows any query tool will return. */
 const QUERY_LIMIT_MAX = 100;
@@ -68,6 +70,12 @@ export interface ToolDeps {
   agentLoop?: AgentLoopStore;
   /** Work loop scheduler for channel tracking. */
   workLoopScheduler?: WorkLoopScheduler;
+  /** Bridge store for Discord/Slack channel mappings. */
+  bridgeStore?: BridgeStore;
+  /** Discord bot token — used to auto-create webhooks for bridge channels. */
+  discordBotToken?: string;
+  /** Send function for bridged external platforms (wired at runtime). */
+  sendExternal?: SendExternalFn;
 }
 
 /**
@@ -120,6 +128,7 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     createChannelListTool(deps),
     createAssignMembersTool(deps),
     createChannelArchiveTool(deps),
+    createArchiveReadyTool(deps),
     createDiscoverTool(deps),
     createHistoryTool(deps),
     createTasksTool(deps),
@@ -127,6 +136,7 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     createMigrateTool(deps),
     createUpdateCardTool(deps),
     createSleepTool(deps),
+    createBridgeTool(deps),
   ];
 
   for (const tool of toolFactories) {
@@ -549,6 +559,7 @@ function createSysadminRequestTool(deps: ToolDeps): ToolDefinition {
   return {
     name: "flock_sysadmin_request",
     description:
+      "[DEPRECATED — prefer @sysadmin mention in a channel instead] " +
       "Send a system-level request to the sysadmin agent via A2A protocol. " +
       "The sysadmin will triage the request as GREEN (auto-execute), " +
       "YELLOW (needs clarification), or RED (requires human approval). " +
@@ -1210,9 +1221,6 @@ function createMessageTool(deps: ToolDeps): ToolDefinition {
 // Named, persistent conversation spaces with membership.
 // Agents interact via channels: create, post, read, manage members.
 
-/** Max messages per channel before notifications stop (prevents runaway channels). */
-const CHANNEL_MSG_LIMIT = 50;
-
 /**
  * Extract @mentions from a message. Matches @agentId patterns where agentId
  * is a known channel member. Only returns members that are actually in the
@@ -1228,171 +1236,6 @@ function extractMentions(message: string, members: string[]): string[] {
     }
   }
   return mentioned;
-}
-
-/**
- * Per-agent notification dedup tracker.
- * Maps channelId → agentId → lastNotifiedSeq.
- */
-const notifiedSeqs = new Map<string, Map<string, number>>();
-
-function getLastNotifiedSeq(channelId: string, agentId: string): number {
-  return notifiedSeqs.get(channelId)?.get(agentId) ?? 0;
-}
-
-function setLastNotifiedSeq(channelId: string, agentId: string, seq: number): void {
-  if (!notifiedSeqs.has(channelId)) notifiedSeqs.set(channelId, new Map());
-  notifiedSeqs.get(channelId)!.set(agentId, seq);
-}
-
-/**
- * Build a channel notification with delta messages only (not full history).
- * Includes channel name, topic, and member list for rich context.
- */
-function buildChannelNotification(
-  channel: { channelId: string; topic: string; members: string[] },
-  newMessages: Array<{ seq: number; agentId: string; content: string }>,
-  allMessageCount: number,
-): string {
-  const firstSeq = newMessages[0]?.seq ?? 0;
-  const lastSeq = newMessages[newMessages.length - 1]?.seq ?? 0;
-  const newBlock = newMessages.map(m => `[seq ${m.seq}] ${m.agentId}: ${m.content}`).join("\n");
-
-  return [
-    `[Channel: #${channel.channelId}]`,
-    channel.topic ? `Topic: ${channel.topic}` : null,
-    `Members: ${channel.members.join(", ")}`,
-    `New messages: seq ${firstSeq}..${lastSeq} (${newMessages.length} new, ${allMessageCount} total)`,
-    ``,
-    `--- New Messages ---`,
-    newBlock,
-    `--- End New Messages ---`,
-    ``,
-    `You are a member of this channel. Read the new messages above carefully.`,
-    ``,
-    `IMPORTANT — You do NOT have to respond to every message:`,
-    `- If the discussion is converging and others have already covered your points, stay silent.`,
-    `- If the message is not directed at you or your role, you may skip it.`,
-    `- If you would only be confirming what someone else said ("I agree", "same here"), skip it.`,
-    `- Respond ONLY when you have genuinely new information, a different perspective, or a decision that needs your role's input.`,
-    `- It is perfectly fine to not respond. Silence is a valid and valuable choice.`,
-    ``,
-    `Full history: flock_channel_read(channelId="${channel.channelId}")`,
-    `Respond: flock_channel_post(channelId="${channel.channelId}", message="...")`,
-    `If you have nothing new to add, simply acknowledge internally and do NOT call flock_channel_post.`,
-  ].filter(Boolean).join("\n");
-}
-
-/** Fire-and-forget: send notification to an agent about channel activity.
- *  SLEEP agents are skipped — they use slow-tick polling instead of push
- *  notifications, allowing them to self-wake when they find relevant activity. */
-function notifyAgent(
-  deps: ToolDeps,
-  target: string,
-  notification: string,
-  channelId: string,
-  taskId: string,
-  currentMaxSeq: number,
-): void {
-  // Skip notification for SLEEP agents — they poll via slow-tick instead.
-  if (deps.agentLoop) {
-    const loopState = deps.agentLoop.get(target);
-    if (loopState?.state === "SLEEP") {
-      deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for channel ${channelId} — agent is SLEEP (will poll via slow-tick)`);
-      return;
-    }
-  }
-
-  // Track channel participation for the work loop scheduler
-  if (deps.workLoopScheduler) {
-    deps.workLoopScheduler.trackChannel(target, channelId, currentMaxSeq);
-  }
-
-  // Dedup: skip if agent already notified about all current messages
-  const lastSeq = getLastNotifiedSeq(channelId, target);
-  if (lastSeq >= currentMaxSeq) {
-    deps.logger?.debug?.(`[flock:notify] Skipping "${target}" for channel ${channelId} — already notified up to seq ${lastSeq}`);
-    return;
-  }
-  setLastNotifiedSeq(channelId, target, currentMaxSeq);
-
-  // Random delay (1-5s) to prevent broadcast storm — like Ethernet collision avoidance.
-  const delayMs = 1000 + Math.floor(Math.random() * 4000);
-  deps.logger?.debug?.(`[flock:notify] Delaying notification to "${target}" for ${delayMs}ms (channel ${channelId}, seq ${currentMaxSeq})`);
-
-  setTimeout(() => {
-    const msgStore = deps.channelMessages;
-    if (msgStore) {
-      // Stale check: if new messages arrived during our delay, skip this notification.
-      const latestMessages = msgStore.list({ channelId });
-      const latestMaxSeq = latestMessages.length > 0 ? Math.max(...latestMessages.map(m => m.seq)) : 0;
-      if (latestMaxSeq > currentMaxSeq) {
-        deps.logger?.debug?.(`[flock:notify] Skipping stale notification to "${target}" for channel ${channelId} — seq moved from ${currentMaxSeq} to ${latestMaxSeq}`);
-        return;
-      }
-    }
-
-    // Re-build notification with delta messages for freshest context
-    let freshNotification = notification;
-    if (msgStore && deps.channelStore) {
-      const channel = deps.channelStore.get(channelId);
-      if (channel) {
-        const deltaMessages = msgStore.list({ channelId, since: lastSeq + 1 });
-        const totalCount = msgStore.count(channelId);
-        freshNotification = buildChannelNotification(channel, deltaMessages, totalCount);
-      }
-    }
-
-    const a2aParams = {
-      message: userMessage(freshNotification, [
-        dataPart({ sessionRouting: { chatType: "channel", peerId: channelId } }),
-      ]),
-    };
-    deps.a2aClient!.sendA2A(target, a2aParams).then((result) => {
-      const now = Date.now();
-      // Fire-and-forget: do NOT store inline responses in channel.
-      // Agents must respond via flock_channel_post only.
-      if (result.response) {
-        deps.audit.append({
-          id: uniqueId(`notify-ack-${channelId}-${target}`),
-          timestamp: now,
-          agentId: target,
-          action: "notify-ack",
-          level: "GREEN",
-          detail: `Agent "${target}" acknowledged channel ${channelId}: ${(result.response ?? "").slice(0, 200)}`,
-          result: "completed",
-        });
-      }
-      if (deps.taskStore) {
-        deps.taskStore.update(taskId, {
-          state: result.state === "completed" ? "completed" : "failed",
-          responseText: result.response,
-          updatedAt: now,
-          completedAt: now,
-        });
-      }
-    }).catch((err) => {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      deps.logger?.warn(`[flock:channel] Notification to "${target}" failed: ${errorMsg}`);
-      if (deps.taskStore) {
-        deps.taskStore.update(taskId, {
-          state: "failed",
-          responseText: errorMsg,
-          updatedAt: Date.now(),
-          completedAt: Date.now(),
-        });
-      }
-      deps.audit.append({
-        id: uniqueId(`notify-fail-${channelId}-${target}`),
-        timestamp: Date.now(),
-        agentId: target,
-        action: "notify-failed",
-        level: "YELLOW",
-        detail: `Channel ${channelId}: notification to ${target} failed — ${errorMsg.slice(0, 200)}`,
-        result: "failed",
-      });
-    });
-  }, delayMs);
 }
 
 // --- flock_channel_create ---
@@ -1455,7 +1298,7 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
       }
 
       const now = Date.now();
-      const allMembers = [...new Set([callerAgentId, ...members])];
+      const allMembers = [...new Set([callerAgentId, ...members])].filter(m => m !== "main" && m !== "unknown");
 
       // Create the channel record
       deps.channelStore.insert({
@@ -1465,6 +1308,8 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
         createdBy: callerAgentId,
         members: allMembers,
         archived: false,
+        archiveReadyMembers: [],
+        archivingStartedAt: null,
         createdAt: now,
         updatedAt: now,
       });
@@ -1488,17 +1333,6 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
         if (deps.workLoopScheduler) {
           for (const member of allMembers) {
             deps.workLoopScheduler.trackChannel(member, channelId, seq);
-          }
-        }
-
-        // Notify members (excluding caller)
-        if (deps.a2aClient) {
-          const channel = deps.channelStore.get(channelId)!;
-          const notification = buildChannelNotification(channel, [{ seq, agentId: callerAgentId, content: message }], 1);
-          for (const target of allMembers) {
-            if (target === callerAgentId) continue;
-            const taskId = uniqueId(`cc-${channelId}-${target}`);
-            notifyAgent(deps, target, notification, channelId, taskId, seq);
           }
         }
       }
@@ -1536,7 +1370,7 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
     name: "flock_channel_post",
     description:
       "Post a message to a channel. Your message is appended to the channel history " +
-      "and other members are notified asynchronously (with dedup). " +
+      "and other members see it on their next tick. @mentioned agents get an immediate tick. " +
       "Cannot post to archived channels.",
     parameters: {
       type: "object",
@@ -1603,14 +1437,18 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
 
       const totalCount = deps.channelMessages.count(channelId);
 
-      // Detect @mentions in the message and wake mentioned SLEEP agents.
-      // Mentions act as explicit wake triggers (same as the old flock_wake).
-      if (deps.agentLoop && deps.a2aClient) {
+      // Detect @mentions and trigger immediate ticks for mentioned agents.
+      // SLEEP agents are woken (→ AWAKE). REACTIVE agents get a one-shot tick
+      // but stay REACTIVE. Non-mentioned members see the message on their next
+      // periodic tick via the scheduler's channel delta aggregation.
+      if (shouldNotify && deps.agentLoop) {
         const mentionedAgents = extractMentions(message, channel.members);
         for (const mentioned of mentionedAgents) {
           if (mentioned === callerAgentId) continue;
           const loopState = deps.agentLoop.get(mentioned);
-          if (loopState?.state === "SLEEP") {
+          if (!loopState) continue;
+
+          if (loopState.state === "SLEEP") {
             deps.agentLoop.setState(mentioned, "AWAKE");
             deps.logger?.info(`[flock:channel-post] @mention woke "${mentioned}" in #${channelId}`);
             deps.audit?.append({
@@ -1623,21 +1461,14 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
               result: "completed",
             });
           }
-        }
-      }
 
-      // Notify other members from channel record (not from message history)
-      if (shouldNotify && deps.a2aClient) {
-        if (totalCount > CHANNEL_MSG_LIMIT) {
-          deps.logger?.info(`[flock:channel-post] Channel ${channelId} reached ${totalCount} messages — notifications disabled`);
-        } else {
-          const otherMembers = channel.members.filter(m => m !== callerAgentId);
-          if (otherMembers.length > 0) {
-            const notification = buildChannelNotification(channel, [{ seq: newSeq, agentId: callerAgentId, content: message }], totalCount);
-            for (const target of otherMembers) {
-              const taskId = uniqueId(`cp-${channelId}-${target}`);
-              notifyAgent(deps, target, notification, channelId, taskId, newSeq);
-            }
+          // Trigger immediate tick for mentioned agents (SLEEP→AWAKE or REACTIVE)
+          // so they see the message now rather than waiting for the next periodic tick.
+          if (deps.workLoopScheduler) {
+            deps.workLoopScheduler.requestImmediateTick(mentioned).catch((err) => {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" failed: ${errorMsg}`);
+            });
           }
         }
       }
@@ -1875,13 +1706,81 @@ function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
   };
 }
 
+// --- Archive finalization helper ---
+
+/** Finalize archive: set archived=true, post system message, bridge sync, audit. */
+async function finalizeArchive(
+  deps: ToolDeps,
+  channelId: string,
+  callerAgentId: string,
+): Promise<{ bridgesDeactivated: number }> {
+  const now = Date.now();
+  deps.channelStore!.update(channelId, {
+    archived: true,
+    archivingStartedAt: null,
+    updatedAt: now,
+  });
+
+  if (deps.channelMessages) {
+    deps.channelMessages.append({
+      channelId,
+      agentId: "[system]",
+      content: "[system] Channel archived. Read-only.",
+      timestamp: now,
+    });
+  }
+
+  // Notify bridged external channels and deactivate bridges
+  let bridgesDeactivated = 0;
+  if (deps.bridgeStore && deps.sendExternal) {
+    const activeBridges = deps.bridgeStore.getByChannel(channelId);
+    const archiveMsg = `Channel #${channelId} has been archived and is now read-only.\nBridge relay has been deactivated.`;
+
+    for (const bridge of activeBridges) {
+      try {
+        await deps.sendExternal(bridge.platform, bridge.externalChannelId, archiveMsg, {
+          accountId: bridge.accountId ?? undefined,
+          displayName: "Flock System",
+          webhookUrl: bridge.webhookUrl ?? undefined,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        deps.logger?.warn(`[flock:bridge] Failed to send archive notification to ${bridge.platform}/${bridge.externalChannelId}: ${msg}`);
+      }
+
+      deps.bridgeStore.update(bridge.bridgeId, { active: false });
+      bridgesDeactivated++;
+      deps.logger?.info(`[flock:bridge] Deactivated bridge ${bridge.bridgeId} (channel archived)`);
+    }
+  }
+
+  deps.audit.append({
+    id: uniqueId(`channel-archive-${channelId}`),
+    timestamp: now,
+    agentId: callerAgentId,
+    action: "channel-archive",
+    level: "GREEN",
+    detail: `Archived channel #${channelId}${bridgesDeactivated > 0 ? ` (${bridgesDeactivated} bridge(s) deactivated)` : ""}`,
+    result: "completed",
+  });
+
+  return { bridgesDeactivated };
+}
+
+/** Get agent members (excluding human: prefix and synthetic IDs like "main"/"unknown"). */
+function getAgentMembers(members: string[]): string[] {
+  return members.filter(m => !m.startsWith("human:") && m !== "main" && m !== "unknown");
+}
+
 // --- flock_channel_archive ---
 
 function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
   return {
     name: "flock_channel_archive",
     description:
-      "Archive a channel, making it read-only. Archived channels can still be read but no new messages can be posted.",
+      "Start the archive protocol for a channel. By default, initiates a graceful wind-down: " +
+      "members review history, record learnings, then call flock_archive_ready. " +
+      "Use force=true for immediate archive (admin/emergency).",
     parameters: {
       type: "object",
       required: ["channelId"],
@@ -1889,6 +1788,115 @@ function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
         channelId: {
           type: "string",
           description: "Channel ID to archive.",
+        },
+        force: {
+          type: "boolean",
+          description: "If true, archive immediately without waiting for members. Default: false.",
+        },
+      },
+    },
+    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+      if (!deps.channelStore) {
+        return toOCResult({ ok: false, error: "Channel store not available." });
+      }
+
+      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
+      const force = params.force === true;
+
+      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+
+      const channel = deps.channelStore.get(channelId);
+      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (channel.archived) return toOCResult({ ok: true, output: `Channel #${channelId} is already archived.` });
+
+      // --- Force archive: immediate ---
+      if (force) {
+        const { bridgesDeactivated } = await finalizeArchive(deps, channelId, callerAgentId);
+        const bridgeNote = bridgesDeactivated > 0 ? ` ${bridgesDeactivated} bridge(s) notified and deactivated.` : "";
+        return toOCResult({
+          ok: true,
+          output: `Channel #${channelId} archived (forced). No new messages can be posted.${bridgeNote}`,
+          data: { channelId, archived: true, bridgesDeactivated },
+        });
+      }
+
+      // --- Graceful archive protocol ---
+
+      // Already in archiving state — return current status
+      if (channel.archivingStartedAt !== null) {
+        const agentMembers = getAgentMembers(channel.members);
+        const ready = channel.archiveReadyMembers;
+        return toOCResult({
+          ok: true,
+          output: `Archive protocol already in progress for #${channelId}. ` +
+            `Ready: ${ready.length}/${agentMembers.length} agent members. ` +
+            `Ready: [${ready.join(", ")}]. Waiting: [${agentMembers.filter(m => !ready.includes(m)).join(", ")}].`,
+          data: { channelId, archiving: true, ready: ready.length, total: agentMembers.length },
+        });
+      }
+
+      // Start the archive protocol
+      const now = Date.now();
+      deps.channelStore.update(channelId, {
+        archivingStartedAt: now,
+        archiveReadyMembers: [],
+        updatedAt: now,
+      });
+
+      const agentMembers = getAgentMembers(channel.members);
+
+      // Post system announcement
+      if (deps.channelMessages) {
+        deps.channelMessages.append({
+          channelId,
+          agentId: "[system]",
+          content: `[system] Archive protocol started. All agent members should:\n` +
+            `1. Review channel history\n` +
+            `2. Record important learnings to memory\n` +
+            `3. Update your A2A Card if needed\n` +
+            `4. Call flock_archive_ready(channelId="${channelId}") when done`,
+          timestamp: now,
+        });
+      }
+
+      deps.audit.append({
+        id: uniqueId(`channel-archive-start-${channelId}`),
+        timestamp: now,
+        agentId: callerAgentId,
+        action: "channel-archive-start",
+        level: "GREEN",
+        detail: `Started archive protocol for #${channelId} (${agentMembers.length} agent members)`,
+        result: "completed",
+      });
+
+      return toOCResult({
+        ok: true,
+        output: `Archive protocol started for #${channelId}. ` +
+          `${agentMembers.length} agent member(s) need to call flock_archive_ready. ` +
+          `Agent members: [${agentMembers.join(", ")}]. ` +
+          `Use force=true for immediate archive.`,
+        data: { channelId, archiving: true, agentMembers },
+      });
+    },
+  };
+}
+
+// --- flock_archive_ready ---
+
+function createArchiveReadyTool(deps: ToolDeps): ToolDefinition {
+  return {
+    name: "flock_archive_ready",
+    description:
+      "Signal that you have finished reviewing channel history and recording learnings. " +
+      "When all agent members signal ready, the channel is automatically archived.",
+    parameters: {
+      type: "object",
+      required: ["channelId"],
+      properties: {
+        channelId: {
+          type: "string",
+          description: "Channel ID to signal readiness for.",
         },
       },
     },
@@ -1906,33 +1914,71 @@ function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
       if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
       if (channel.archived) return toOCResult({ ok: true, output: `Channel #${channelId} is already archived.` });
 
-      const now = Date.now();
-      deps.channelStore.update(channelId, { archived: true, updatedAt: now });
+      if (channel.archivingStartedAt === null) {
+        return toOCResult({ ok: false, error: `Channel #${channelId} is not in archive protocol. Call flock_channel_archive first.` });
+      }
 
-      // Post system message
+      if (!channel.members.includes(callerAgentId)) {
+        return toOCResult({ ok: false, error: `You (${callerAgentId}) are not a member of #${channelId}.` });
+      }
+
+      if (channel.archiveReadyMembers.includes(callerAgentId)) {
+        const agentMembers = getAgentMembers(channel.members);
+        return toOCResult({
+          ok: true,
+          output: `You already signaled ready for #${channelId}. (${channel.archiveReadyMembers.length}/${agentMembers.length} ready)`,
+        });
+      }
+
+      // Add caller to ready list
+      const now = Date.now();
+      const newReady = [...channel.archiveReadyMembers, callerAgentId];
+      deps.channelStore.update(channelId, {
+        archiveReadyMembers: newReady,
+        updatedAt: now,
+      });
+
+      const agentMembers = getAgentMembers(channel.members);
+      const readyCount = newReady.length;
+      const totalAgents = agentMembers.length;
+
+      // Post system message about readiness
       if (deps.channelMessages) {
         deps.channelMessages.append({
           channelId,
           agentId: "[system]",
-          content: "[system] Channel archived. Read-only.",
+          content: `[system] ${callerAgentId} is ready for archive. (${readyCount}/${totalAgents} agent members ready)`,
           timestamp: now,
         });
       }
 
       deps.audit.append({
-        id: uniqueId(`channel-archive-${channelId}`),
+        id: uniqueId(`archive-ready-${channelId}-${callerAgentId}`),
         timestamp: now,
         agentId: callerAgentId,
-        action: "channel-archive",
+        action: "archive-ready",
         level: "GREEN",
-        detail: `Archived channel #${channelId}`,
+        detail: `${callerAgentId} ready for archive on #${channelId} (${readyCount}/${totalAgents})`,
         result: "completed",
       });
 
+      // Check if all agent members are ready
+      const allReady = agentMembers.every(m => newReady.includes(m));
+      if (allReady) {
+        const { bridgesDeactivated } = await finalizeArchive(deps, channelId, callerAgentId);
+        const bridgeNote = bridgesDeactivated > 0 ? ` ${bridgesDeactivated} bridge(s) deactivated.` : "";
+        return toOCResult({
+          ok: true,
+          output: `All ${totalAgents} agent member(s) ready. Channel #${channelId} has been archived.${bridgeNote}`,
+          data: { channelId, archived: true, readyCount, totalAgents, bridgesDeactivated },
+        });
+      }
+
+      const waiting = agentMembers.filter(m => !newReady.includes(m));
       return toOCResult({
         ok: true,
-        output: `Channel #${channelId} archived. No new messages can be posted.`,
-        data: { channelId, archived: true },
+        output: `Readiness recorded. ${readyCount}/${totalAgents} agent members ready. Waiting: [${waiting.join(", ")}].`,
+        data: { channelId, readyCount, totalAgents, waiting },
       });
     },
   };
@@ -2405,6 +2451,236 @@ function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
           respondedAt: now,
         },
       });
+    },
+  };
+}
+
+// --- Bridge tool ---
+
+const VALID_BRIDGE_PLATFORMS = new Set(["discord", "slack"]);
+const VALID_BRIDGE_ACTIONS = new Set(["create", "remove", "list", "pause", "resume"]);
+
+function createBridgeTool(deps: ToolDeps): ToolDefinition {
+  return {
+    name: "flock_bridge",
+    description: "Manage bridges between Flock channels and external platforms (Discord/Slack). " +
+      "Bridges relay messages bidirectionally: external platform messages appear in the Flock channel, " +
+      "and agent posts in the Flock channel are sent to the external platform.",
+    parameters: {
+      type: "object" as const,
+      properties: {
+        action: {
+          type: "string",
+          enum: ["create", "remove", "list", "pause", "resume"],
+          description: "Action to perform.",
+        },
+        channelId: {
+          type: "string",
+          description: "Flock channel ID (required for create).",
+        },
+        platform: {
+          type: "string",
+          enum: ["discord", "slack"],
+          description: "External platform (required for create).",
+        },
+        externalChannelId: {
+          type: "string",
+          description: "Discord/Slack channel ID to bridge to (required for create, unless createChannel is true).",
+        },
+        createChannel: {
+          type: "boolean",
+          description: "If true, auto-create a Discord text channel in the specified guild. Requires guildId and platform='discord'.",
+        },
+        guildId: {
+          type: "string",
+          description: "Discord guild (server) ID. Required when createChannel is true.",
+        },
+        channelName: {
+          type: "string",
+          description: "Name for the auto-created Discord channel. Defaults to the Flock channelId. Only used with createChannel=true.",
+        },
+        categoryId: {
+          type: "string",
+          description: "Discord category ID to place the auto-created channel in. Only used with createChannel=true.",
+        },
+        accountId: {
+          type: "string",
+          description: "Optional: specific bot account ID for sending messages.",
+        },
+        bridgeId: {
+          type: "string",
+          description: "Bridge ID (required for remove/pause/resume).",
+        },
+      },
+      required: ["action"],
+    },
+    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+      if (!deps.bridgeStore) {
+        return toOCResult({ ok: false, error: "Bridge store not available." });
+      }
+
+      const action = String(params.action ?? "");
+      if (!VALID_BRIDGE_ACTIONS.has(action)) {
+        return toOCResult({ ok: false, error: `Invalid action: "${action}". Must be one of: ${[...VALID_BRIDGE_ACTIONS].join(", ")}` });
+      }
+
+      const callerAgentId = String(params.agentId ?? "unknown");
+      const store = deps.bridgeStore;
+
+      if (action === "list") {
+        const filter: Record<string, unknown> = {};
+        if (params.channelId) filter.channelId = String(params.channelId);
+        if (params.platform && VALID_BRIDGE_PLATFORMS.has(String(params.platform))) {
+          filter.platform = String(params.platform);
+        }
+        const bridges = store.list(filter as any);
+        return toOCResult({
+          ok: true,
+          output: bridges.length === 0
+            ? "No bridge mappings found."
+            : `Found ${bridges.length} bridge mapping(s).`,
+          data: { bridges },
+        });
+      }
+
+      if (action === "create") {
+        const channelId = String(params.channelId ?? "");
+        const platform = String(params.platform ?? "");
+        let externalChannelId = String(params.externalChannelId ?? "");
+        const shouldCreateChannel = params.createChannel === true;
+        const guildId = String(params.guildId ?? "");
+        const channelName = String(params.channelName ?? "") || channelId;
+        const categoryId = typeof params.categoryId === "string" ? params.categoryId : undefined;
+
+        if (!channelId) return toOCResult({ ok: false, error: "channelId is required for create." });
+        if (!VALID_BRIDGE_PLATFORMS.has(platform)) {
+          return toOCResult({ ok: false, error: `Invalid platform: "${platform}". Must be "discord" or "slack".` });
+        }
+
+        // Verify channel exists
+        const flockChannel = deps.channelStore?.get(channelId);
+        if (deps.channelStore) {
+          if (!flockChannel) return toOCResult({ ok: false, error: `Flock channel "${channelId}" not found.` });
+          if (flockChannel.archived) return toOCResult({ ok: false, error: `Flock channel "${channelId}" is archived.` });
+        }
+
+        // Auto-create external channel if requested
+        let createdChannelName: string | undefined;
+        if (shouldCreateChannel) {
+          if (platform !== "discord") {
+            return toOCResult({ ok: false, error: "createChannel is only supported for platform 'discord'. Slack channel creation is not yet supported." });
+          }
+          if (!guildId) {
+            return toOCResult({ ok: false, error: "guildId is required when createChannel is true." });
+          }
+          if (!deps.discordBotToken) {
+            return toOCResult({ ok: false, error: "Discord bot token not configured. Cannot create channels." });
+          }
+          try {
+            const result = await createDiscordChannel(deps.discordBotToken, guildId, channelName, {
+              topic: flockChannel?.topic,
+              categoryId,
+            });
+            externalChannelId = result.channelId;
+            createdChannelName = result.channelName;
+            deps.logger?.info(`[flock:bridge] Auto-created Discord channel "${result.channelName}" (${result.channelId}) in guild ${guildId}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return toOCResult({ ok: false, error: `Failed to create Discord channel: ${msg}` });
+          }
+        } else {
+          if (!externalChannelId) return toOCResult({ ok: false, error: "externalChannelId is required for create (or use createChannel=true to auto-create)." });
+        }
+
+        // Check for duplicate
+        const existing = store.getByExternal(platform as any, externalChannelId);
+        if (existing) {
+          return toOCResult({
+            ok: false,
+            error: `External channel ${platform}/${externalChannelId} is already bridged to flock/${existing.channelId} (bridge: ${existing.bridgeId}).`,
+          });
+        }
+
+        const bridgeId = uniqueId("bridge");
+        const now = Date.now();
+
+        // Auto-create Discord webhook for per-agent display names
+        let webhookUrl: string | null = null;
+        if (platform === "discord" && deps.discordBotToken) {
+          try {
+            const result = await createChannelWebhook(deps.discordBotToken, externalChannelId);
+            webhookUrl = result.webhookUrl;
+            deps.logger?.info(`[flock:bridge] Auto-created Discord webhook for ${externalChannelId}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            deps.logger?.warn(`[flock:bridge] Failed to auto-create webhook (will use prefix fallback): ${msg}`);
+          }
+        }
+
+        store.insert({
+          bridgeId,
+          channelId,
+          platform: platform as any,
+          externalChannelId,
+          accountId: params.accountId ? String(params.accountId) : null,
+          webhookUrl,
+          createdBy: callerAgentId,
+          createdAt: now,
+          active: true,
+        });
+
+        const createdNote = createdChannelName ? ` (created channel "${createdChannelName}")` : "";
+        deps.audit.append({
+          id: uniqueId("bridge-create"),
+          timestamp: now,
+          agentId: callerAgentId,
+          action: "bridge-create",
+          level: "GREEN",
+          detail: `Created bridge ${bridgeId}: flock/${channelId} ↔ ${platform}/${externalChannelId}${createdNote}${webhookUrl ? " (webhook)" : " (prefix fallback)"}`,
+          result: "created",
+        });
+
+        return toOCResult({
+          ok: true,
+          output: `Bridge created: flock/${channelId} ↔ ${platform}/${externalChannelId}${createdNote}${webhookUrl ? " (webhook enabled — per-agent display names)" : " (prefix mode)"}`,
+          data: { bridgeId, channelId, platform, externalChannelId, webhookUrl: !!webhookUrl, channelCreated: !!createdChannelName },
+        });
+      }
+
+      // remove / pause / resume require bridgeId
+      const bridgeId = String(params.bridgeId ?? "");
+      if (!bridgeId) return toOCResult({ ok: false, error: `bridgeId is required for ${action}.` });
+
+      const bridge = store.get(bridgeId);
+      if (!bridge) return toOCResult({ ok: false, error: `Bridge "${bridgeId}" not found.` });
+
+      if (action === "remove") {
+        store.delete(bridgeId);
+        deps.audit.append({
+          id: uniqueId("bridge-remove"),
+          timestamp: Date.now(),
+          agentId: callerAgentId,
+          action: "bridge-remove",
+          level: "YELLOW",
+          detail: `Removed bridge ${bridgeId}: flock/${bridge.channelId} ↔ ${bridge.platform}/${bridge.externalChannelId}`,
+          result: "removed",
+        });
+        return toOCResult({ ok: true, output: `Bridge "${bridgeId}" removed.` });
+      }
+
+      if (action === "pause") {
+        if (!bridge.active) return toOCResult({ ok: true, output: `Bridge "${bridgeId}" is already paused.` });
+        store.update(bridgeId, { active: false });
+        return toOCResult({ ok: true, output: `Bridge "${bridgeId}" paused.` });
+      }
+
+      if (action === "resume") {
+        if (bridge.active) return toOCResult({ ok: true, output: `Bridge "${bridgeId}" is already active.` });
+        store.update(bridgeId, { active: true });
+        return toOCResult({ ok: true, output: `Bridge "${bridgeId}" resumed.` });
+      }
+
+      return toOCResult({ ok: false, error: `Unknown action: "${action}"` });
     },
   };
 }

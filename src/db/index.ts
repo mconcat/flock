@@ -2,7 +2,7 @@
  * Database factory — creates the appropriate backend based on config.
  */
 
-export type { FlockDatabase, HomeStore, TransitionStore, AuditStore, TaskStore, ChannelStore, ChannelRecord, ChannelFilter, ChannelMessageStore, ChannelMessage, ChannelMessageFilter, HomeFilter, TransitionFilter, AuditFilter, TaskFilter, TaskRecord, TaskState, TaskUpdateFields, AgentLoopStore, AgentLoopRecord, AgentLoopState } from "./interface.js";
+export type { FlockDatabase, HomeStore, TransitionStore, AuditStore, TaskStore, ChannelStore, ChannelRecord, ChannelFilter, ChannelMessageStore, ChannelMessage, ChannelMessageFilter, HomeFilter, TransitionFilter, AuditFilter, TaskFilter, TaskRecord, TaskState, TaskUpdateFields, AgentLoopStore, AgentLoopRecord, AgentLoopState, BridgeStore, BridgeMapping, BridgePlatform, BridgeFilter } from "./interface.js";
 export { TASK_STATES, isTaskState } from "./interface.js";
 export { createMemoryDatabase } from "./memory.js";
 export { createSqliteDatabase } from "./sqlite.js";

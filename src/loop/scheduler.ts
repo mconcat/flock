@@ -462,6 +462,28 @@ export class WorkLoopScheduler {
   }
 
   /**
+   * Request an immediate one-shot tick for an agent.
+   *
+   * Used when an agent is @mentioned in a channel — triggers a tick
+   * so they see the new messages immediately rather than waiting for
+   * the next periodic cycle.
+   *
+   * Key property: does NOT change agent state. A REACTIVE agent stays
+   * REACTIVE, a SLEEP agent stays SLEEP. The tick is purely a one-shot
+   * push through the same `tick:control` session route.
+   */
+  async requestImmediateTick(agentId: string): Promise<void> {
+    const { agentLoop, logger } = this.deps;
+    const record = agentLoop.get(agentId);
+    if (!record) {
+      logger.warn(`[flock:loop] requestImmediateTick: agent "${agentId}" not found in loop state`);
+      return;
+    }
+    logger.info(`[flock:loop] Immediate tick requested for "${agentId}" (state: ${record.state})`);
+    await this.sendTick(record, Date.now());
+  }
+
+  /**
    * Deterministic per-agent jitter based on agent ID hash.
    * Returns a value in [-TICK_JITTER_MS, +TICK_JITTER_MS].
    */

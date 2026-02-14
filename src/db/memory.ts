@@ -29,6 +29,10 @@ import type {
   AgentLoopStore,
   AgentLoopRecord,
   AgentLoopState,
+  BridgeStore,
+  BridgeMapping,
+  BridgePlatform,
+  BridgeFilter,
 } from "./interface.js";
 
 function matchesFilter<T>(record: T, filter: object | undefined): boolean {
@@ -165,7 +169,11 @@ function createMemoryChannelStore(): ChannelStore {
 
   return {
     insert(record) {
-      store.set(record.channelId, { ...record, members: [...record.members] });
+      store.set(record.channelId, {
+        ...record,
+        members: [...record.members],
+        archiveReadyMembers: [...record.archiveReadyMembers],
+      });
     },
     update(channelId, fields) {
       const existing = store.get(channelId);
@@ -174,11 +182,15 @@ function createMemoryChannelStore(): ChannelStore {
       if (fields.topic !== undefined) existing.topic = fields.topic;
       if (fields.members !== undefined) existing.members = [...fields.members];
       if (fields.archived !== undefined) existing.archived = fields.archived;
+      if (fields.archiveReadyMembers !== undefined) existing.archiveReadyMembers = [...fields.archiveReadyMembers];
+      if (fields.archivingStartedAt !== undefined) existing.archivingStartedAt = fields.archivingStartedAt;
       if (fields.updatedAt !== undefined) existing.updatedAt = fields.updatedAt;
     },
     get(channelId) {
       const record = store.get(channelId);
-      return record ? { ...record, members: [...record.members] } : null;
+      return record
+        ? { ...record, members: [...record.members], archiveReadyMembers: [...record.archiveReadyMembers] }
+        : null;
     },
     list(filter?: ChannelFilter) {
       let results = Array.from(store.values());
@@ -187,7 +199,7 @@ function createMemoryChannelStore(): ChannelStore {
       if (filter?.archived !== undefined) results = results.filter(r => r.archived === filter.archived);
       if (filter?.member) results = results.filter(r => r.members.includes(filter.member!));
       if (filter?.limit) results = results.slice(0, filter.limit);
-      return results.map(r => ({ ...r, members: [...r.members] }));
+      return results.map(r => ({ ...r, members: [...r.members], archiveReadyMembers: [...r.archiveReadyMembers] }));
     },
     delete(channelId) {
       store.delete(channelId);
@@ -245,7 +257,7 @@ function createMemoryAgentLoopStore(): AgentLoopStore {
       if (!existing) return;
       const now = Date.now();
       existing.state = state;
-      if (state === "SLEEP") {
+      if (state === "SLEEP" || state === "REACTIVE") {
         existing.sleptAt = now;
         existing.sleepReason = reason ?? null;
       } else {
@@ -270,6 +282,50 @@ function createMemoryAgentLoopStore(): AgentLoopStore {
   };
 }
 
+function createMemoryBridgeStore(): BridgeStore {
+  const store = new Map<string, BridgeMapping>();
+
+  return {
+    insert(record) {
+      store.set(record.bridgeId, { ...record });
+    },
+    get(bridgeId) {
+      const record = store.get(bridgeId);
+      return record ? { ...record } : null;
+    },
+    getByChannel(channelId) {
+      return Array.from(store.values())
+        .filter(r => r.channelId === channelId && r.active)
+        .map(r => ({ ...r }));
+    },
+    getByExternal(platform: BridgePlatform, externalChannelId: string) {
+      for (const r of store.values()) {
+        if (r.platform === platform && r.externalChannelId === externalChannelId) {
+          return { ...r };
+        }
+      }
+      return null;
+    },
+    list(filter?: BridgeFilter) {
+      let results = Array.from(store.values());
+      if (filter?.channelId) results = results.filter(r => r.channelId === filter.channelId);
+      if (filter?.platform) results = results.filter(r => r.platform === filter.platform);
+      if (filter?.active !== undefined) results = results.filter(r => r.active === filter.active);
+      if (filter?.limit) results = results.slice(0, filter.limit);
+      return results.map(r => ({ ...r }));
+    },
+    update(bridgeId, fields) {
+      const existing = store.get(bridgeId);
+      if (!existing) throw new Error(`bridge not found: ${bridgeId}`);
+      if (fields.active !== undefined) existing.active = fields.active;
+      if (fields.webhookUrl !== undefined) existing.webhookUrl = fields.webhookUrl;
+    },
+    delete(bridgeId) {
+      store.delete(bridgeId);
+    },
+  };
+}
+
 export function createMemoryDatabase(): FlockDatabase {
   return {
     backend: "memory",
@@ -280,6 +336,7 @@ export function createMemoryDatabase(): FlockDatabase {
     channels: createMemoryChannelStore(),
     channelMessages: createMemoryChannelMessageStore(),
     agentLoop: createMemoryAgentLoopStore(),
+    bridges: createMemoryBridgeStore(),
     migrate() { /* no-op */ },
     close() { /* no-op */ },
   };

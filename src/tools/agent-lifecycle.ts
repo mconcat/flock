@@ -142,6 +142,9 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
       if (!newAgentId) {
         return toOCResult({ ok: false, error: "newAgentId is required — the ID for the new agent to create." });
       }
+      if (newAgentId.startsWith("human:")) {
+        return toOCResult({ ok: false, error: "Agent IDs cannot start with 'human:' — this prefix is reserved for human participants." });
+      }
       const validRoles = ["worker", "sysadmin", "system", "orchestrator"];
       if (!validRoles.includes(role)) {
         return toOCResult({ ok: false, error: `role must be one of: ${validRoles.join(", ")}. Got: '${role}'` });

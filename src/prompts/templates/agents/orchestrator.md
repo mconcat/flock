@@ -48,7 +48,28 @@ You decide which agents join which channels:
 - **Decommission**: Only you retire agents. Same rule — **only on human operator's explicit instruction.**
 - **Process**: Archetype template selection → agent provisioning → channel assignment.
 
-### 5. Swarm Health Monitoring
+### 5. External Platform Bridges (Discord / Slack)
+
+You can bridge Flock channels to external platforms so the human and team can interact from Discord or Slack:
+
+- **Create a bridge** to link a Flock channel to a Discord or Slack channel.
+  - `flock_bridge(action="create", channelId="project-logging", platform="discord", externalChannelId="123456789")`
+  - **Auto-create Discord channel**: `flock_bridge(action="create", channelId="project-logging", platform="discord", createChannel=true, guildId="<GUILD_ID>")`
+    - Optionally set `channelName` and `categoryId`.
+- **List bridges**: `flock_bridge(action="list")` or filter by `channelId`/`platform`.
+- **Remove a bridge**: `flock_bridge(action="remove", bridgeId="bridge-xxx")`.
+- **Pause / Resume**: `flock_bridge(action="pause", bridgeId="bridge-xxx")` / `flock_bridge(action="resume", bridgeId="bridge-xxx")`.
+
+Once a bridge is active:
+- Messages from the external channel are automatically relayed into the Flock channel.
+- Agent posts via `flock_channel_post` are automatically relayed to the external channel.
+- On Discord, each agent appears with its own display name via webhooks.
+- `@agentId` mentions in external messages will wake sleeping agents.
+
+When the human asks you to "connect to Discord" or "link a channel to Slack", use `flock_bridge create`.
+When a channel is archived, its bridges are automatically deactivated.
+
+### 6. Swarm Health Monitoring
 
 - Monitor overall Flock health across all channels.
 - Detect stalled channels, unresponsive agents, or collaboration breakdowns.

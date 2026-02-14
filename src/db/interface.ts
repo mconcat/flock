@@ -117,6 +117,8 @@ export interface ChannelRecord {
   createdBy: string;       // agent ID or "human:username"
   members: string[];       // agent IDs + human identifiers
   archived: boolean;       // true = read-only
+  archiveReadyMembers: string[];      // agents who signaled ready for archive
+  archivingStartedAt: number | null;  // null = not archiving, epoch ms = protocol start
   createdAt: number;       // epoch ms
   updatedAt: number;       // epoch ms
 }
@@ -131,7 +133,7 @@ export interface ChannelFilter {
 
 export interface ChannelStore {
   insert(record: ChannelRecord): void;
-  update(channelId: string, fields: Partial<Pick<ChannelRecord, "name" | "topic" | "members" | "archived" | "updatedAt">>): void;
+  update(channelId: string, fields: Partial<Pick<ChannelRecord, "name" | "topic" | "members" | "archived" | "archiveReadyMembers" | "archivingStartedAt" | "updatedAt">>): void;
   get(channelId: string): ChannelRecord | null;
   list(filter?: ChannelFilter): ChannelRecord[];
   delete(channelId: string): void;
@@ -163,10 +165,47 @@ export interface ChannelMessageStore {
   count(channelId: string): number;
 }
 
+// --- Bridge mappings (Flock channel ↔ Discord/Slack) ---
+
+/** Supported external platforms for bridging. */
+export type BridgePlatform = "discord" | "slack";
+
+/** A persistent mapping between a Flock channel and an external platform channel. */
+export interface BridgeMapping {
+  bridgeId: string;
+  channelId: string;             // Flock channel ID
+  platform: BridgePlatform;
+  externalChannelId: string;     // Discord/Slack channel ID
+  accountId: string | null;      // Optional: specific bot account ID
+  webhookUrl: string | null;     // Discord webhook URL for per-agent display names
+  createdBy: string;             // agent ID or "human:username"
+  createdAt: number;             // epoch ms
+  active: boolean;               // false = paused
+}
+
+export interface BridgeFilter {
+  channelId?: string;
+  platform?: BridgePlatform;
+  active?: boolean;
+  limit?: number;
+}
+
+export interface BridgeStore {
+  insert(record: BridgeMapping): void;
+  get(bridgeId: string): BridgeMapping | null;
+  /** Get all bridge mappings for a Flock channel. */
+  getByChannel(channelId: string): BridgeMapping[];
+  /** Find a bridge by external platform + channel ID. */
+  getByExternal(platform: BridgePlatform, externalChannelId: string): BridgeMapping | null;
+  list(filter?: BridgeFilter): BridgeMapping[];
+  update(bridgeId: string, fields: Partial<Pick<BridgeMapping, "active" | "webhookUrl">>): void;
+  delete(bridgeId: string): void;
+}
+
 // --- Agent loop state (work loop AWAKE/SLEEP) ---
 
 /** Agent work loop state. */
-export type AgentLoopState = "AWAKE" | "SLEEP";
+export type AgentLoopState = "AWAKE" | "SLEEP" | "REACTIVE";
 
 /** Persistent record of an agent's work loop state. */
 export interface AgentLoopRecord {
@@ -226,6 +265,7 @@ export interface FlockDatabase {
   channels: ChannelStore;
   channelMessages: ChannelMessageStore;
   agentLoop: AgentLoopStore;
+  bridges: BridgeStore;
 
   /** Run all stores' schema migrations. */
   migrate(): void;

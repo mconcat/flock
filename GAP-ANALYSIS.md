@@ -4,7 +4,7 @@
 
 **기준 문서**: VISION.md v0.1 (2026-02-09)
 **분석 대상**: Flock codebase (`src/` 전체)
-**분석 일시**: 2026-02-09
+**분석 일시**: 2026-02-11 (Phase 4: 독립 실행형 CLI + E2E 검증 반영)
 
 ---
 
@@ -14,12 +14,13 @@
 |---|------|--------|------|
 | 1 | [채널 모델](#1-채널-모델) | **Critical** | ✅ **완료** — channel 모델 구현, thread→channel 마이그레이션 |
 | 2 | [Orchestrator/Sysadmin 역할 분리](#2-orchestratorsysadmin-역할-분리) | **Critical** | ✅ **완료** — 프롬프트 재작성, 카드 분리, executor/권한 수정 |
-| 3 | [Per-Channel 세션 모델](#3-per-channel-세션-모델) | **Critical** | 미구현 — OpenClaw 네이티브 지원 확인, 세션 키 매핑 문서화 완료 |
-| 4 | [아카이브 프로토콜](#4-아카이브-프로토콜) | Major | 부분 구현 — flock_channel_archive 기본만 존재, 전체 프로토콜 부재 |
-| 5 | [Slack/Discord 브릿지](#5-slackdiscord-브릿지) | Major | 부재 |
-| 6 | [Delta 알림 채널 컨텍스트](#6-delta-알림-채널-컨텍스트) | Minor | ✅ **완료** — buildChannelNotification에 이름/topic 포함 |
-| 7 | [메모리 모델](#7-메모리-모델) | Minor | 기반 존재 (workspace tools), 보강 필요 |
+| 3 | [Per-Channel 세션 모델](#3-per-channel-세션-모델) | **Critical** | ✅ **완료** — X-OpenClaw-Session-Key 헤더, 모든 경로 명시적 세션 라우팅 |
+| 4 | [아카이브 프로토콜](#4-아카이브-프로토콜) | Major | ✅ **완료** — 3상태 머신(Active→Archiving→Archived), flock_archive_ready, 자동 전환, 브릿지 동기화 |
+| 5 | [Slack/Discord 브릿지](#5-slackdiscord-브릿지) | Major | ✅ **완료** — 단일봇 모델, Discord 웹훅, @mention wake, 양방향 릴레이 |
+| 6 | [Delta 알림 채널 컨텍스트](#6-delta-알림-채널-컨텍스트) | Minor | ✅ **완료** — buildChannelNotification에 이름/topic 포함, delta 상한 50개, stale 체크 수정 |
+| 7 | [메모리 모델](#7-메모리-모델) | Minor | ✅ **완료** — worker.md에 cross-session 참조 가이드 + 아카이브 프로토콜 가이드 추가 |
 | 8 | [A2A Card 업데이트](#8-a2a-card-업데이트) | OK | 이미 동작 중 |
+| 9 | [독립 실행형 CLI](#9-독립-실행형-cli) | **Critical** | ✅ **완료** — `~/.flock/` 격리, 번들 OpenClaw, `flock init/start/stop`, E2E 검증 |
 
 ---
 
@@ -370,7 +371,7 @@ export type SessionSendFn = (
 
 ## 4. 아카이브 프로토콜
 
-### 심각도: Major — 부재
+### 심각도: Major — ✅ 완료
 
 ### 비전 (VISION.md §4.1)
 
@@ -386,35 +387,62 @@ export type SessionSendFn = (
 
 아카이브 후 채널은 읽기 전용이며, 크로스채널 참조를 위해 열람 가능.
 
-### 현재 구현
+### 구현 완료 내역
 
-아카이브 관련 기능이 전혀 없다:
+#### 4-a. 3상태 머신 (Active → Archiving → Archived)
 
-- `archived` 필드가 어떤 데이터 구조에도 없음
-- `flock_archive_ready` 도구 없음
-- `flock_channel_archive` 도구 없음
-- 채널(스레드) 잠금/읽기전용 전환 메커니즘 없음
-- 세션 종료 연동 없음
+`ChannelRecord`에 두 필드를 추가하여 3단계 상태를 표현:
 
-### 필요한 작업
+- `archivingStartedAt: number | null` — `null`이면 Active, timestamp이면 Archiving 진행 중
+- `archiveReadyMembers: string[]` — 아카이브 준비 완료를 신호한 에이전트 목록
 
-1. **ChannelRecord에 `archived` 필드 추가** (채널 모델 #1에 포함)
-2. **`flock_channel_archive` 도구** — 아카이브 프로토콜 시작
-3. **`flock_archive_ready` 도구** — 에이전트의 아카이브 준비 완료 신호
-4. **아카이브 상태 관리** — 모든 멤버 ready → archived 전환
-5. **읽기 전용 강제** — archived 채널에 post 차단
-6. **세션 종료 연동** — archived 채널의 에이전트 세션 정리
+상태 전이:
+- **Active → Archiving**: `flock_channel_archive` (기본, force 없음) — 공지 포스트, `archivingStartedAt` 설정
+- **Archiving → Archived**: 마지막 에이전트 멤버가 `flock_archive_ready` 호출 — 자동 전환
+- **Active → Archived**: `flock_channel_archive(force=true)` — 즉시 아카이브 (기존 동작 유지)
 
-### 의존성
+#### 4-b. flock_archive_ready 도구
 
-- 채널 모델 (#1) 필수
-- Per-channel 세션 (#3) 필요 (세션 종료 연동)
+에이전트가 아카이브 준비 완료를 신호하는 도구:
+
+- 채널 존재 여부, 프로토콜 활성화 여부, 멤버십 검증
+- `human:*` 접두사 멤버는 준비 확인 대상에서 제외
+- 중복 신호는 no-op
+- 모든 에이전트 멤버 완료 시 `finalizeArchive()` 자동 호출
+
+#### 4-c. Bridge 동기화
+
+프로토콜 완료 시 `finalizeArchive()`가 브릿지 처리:
+- 활성 브릿지를 비활성화 (`active: false`)
+- 외부 채널에 아카이브 알림 전송 (`sendExternal`)
+- 알림 실패해도 아카이브는 정상 진행 (graceful degradation)
+
+#### 4-d. Worker 프롬프트 가이드
+
+`worker.md`에 아카이브 프로토콜 참여 가이드 추가:
+- 아카이브 시작 시 체크리스트 (리뷰 → 기록 → 카드 업데이트 → ready 신호)
+- MEMORY.md 기록 패턴 (구체적 학습 사항 기록)
+
+### 관련 파일
+
+| 파일 | 역할 |
+|------|------|
+| `src/db/interface.ts` | `archiveReadyMembers`, `archivingStartedAt` 필드 추가 |
+| `src/db/sqlite.ts` | 새 컬럼, 마이그레이션, insert/update/rowToChannel |
+| `src/db/memory.ts` | 새 필드 처리 |
+| `src/tools/index.ts` | `flock_channel_archive` 재작성, `flock_archive_ready` 추가, `finalizeArchive` 추출 |
+| `src/prompts/templates/agents/worker.md` | 아카이브 프로토콜 가이드 |
+| `tests/tools/archive-protocol.test.ts` | 11개 테스트 케이스 |
+
+### 남은 개선 사항 (낮은 우선순위)
+
+- 세션 종료 연동 (archived 채널의 에이전트 세션 자동 정리) — Per-channel 세션 인프라 위에 구축
 
 ---
 
 ## 5. Slack/Discord 브릿지
 
-### 심각도: Major — 부재
+### 심각도: Major — ✅ 완료
 
 ### 비전 (VISION.md §3.4, §5.3)
 
@@ -429,35 +457,54 @@ Slack/Discord ←→ Bridge Bot ←→ Flock Channel
 
 Slack과 Discord는 별도 브릿지, 크로스 브릿징 없음.
 
-### 현재 구현
+### 구현 완료 내역
 
-브릿지 관련 코드가 전혀 없다. `human:` 접두사를 가진 참여자 개념도 구현되어 있지 않다.
+#### 5-a. 단일봇 모델 (Single-Bot Architecture)
 
-USER.md 템플릿에도 "human: 접두사 메시지는 유저 직접 입력이므로 최우선 반응" 같은 지시가 없다:
+플랫폼당 하나의 봇이 모든 에이전트를 대표하는 구조로 구현:
 
-```markdown
-<!-- src/prompts/templates/USER.md (전체 내용) -->
-# USER.md
-## Flock System
-You are part of a Flock managed by a human operator.
-- **Flock version:** {{FLOCK_VERSION}}
-- **Orchestrator node:** {{ORCHESTRATOR_NODE}}
-## Human Operator
-The human operator owns and operates this Flock.
-- **Timezone:** {{USER_TIMEZONE}}
-```
+- **Discord**: 웹훅(Webhook)을 사용하여 메시지마다 다른 `username`(에이전트 ID)으로 표시. 웹훅이 없으면 `**[agentId]**` 접두사 fallback.
+- **Slack**: `**[agentId]**` 접두사로 에이전트 식별 (Slack API는 메시지별 display name 변경 미지원).
 
-### 필요한 작업
+#### 5-b. Discord 웹훅 자동 생성
 
-1. **USER.md에 human: 메시지 우선 처리 지시 추가** (즉시 가능)
-2. **Slack Bridge Bot 구현** — Slack API 연동, 채널 매핑, 양방향 메시지
-3. **Discord Bridge Bot 구현** — Discord API 연동, 동일 구조
-4. **human: 참여자 시스템** — 채널 멤버에 human:username 허용, 알림 대상에서 제외
+`flock_bridge create` 실행 시 Discord 플랫폼이면 자동으로 웹훅을 생성하고 URL을 `BridgeMapping.webhookUrl`에 저장:
 
-### 의존성
+- `src/bridge/discord-webhook.ts` — `createChannelWebhook()`, `sendViaWebhook()`
+- 봇 토큰은 OpenClaw 설정(`api.runtime.config.loadConfig().channels.discord.token`) 또는 `DISCORD_BOT_TOKEN` 환경변수에서 자동 해석
 
-- 채널 모델 (#1) 필수
-- 별도 패키지(봇) 또는 외부 서비스로 구현 가능
+#### 5-c. 양방향 릴레이
+
+- **Inbound** (외부 → Flock): OpenClaw `message_received` 훅으로 수신, `human:{username}` ID로 채널에 append, 자동 멤버 추가
+- **Outbound** (Flock → 외부): OpenClaw `after_tool_call` 훅으로 `flock_channel_post` 감지, 브릿지 매핑된 외부 채널로 전달
+- **Echo 방지**: `EchoTracker` (in-memory TTL 30s)로 무한 릴레이 루프 차단
+
+#### 5-d. @mention 감지 및 SLEEP 에이전트 wake
+
+`extractMentionedAgents()`가 인바운드 메시지에서 `@agentId` 패턴을 스캔, 채널 멤버 중 SLEEP 상태인 에이전트를 자동 AWAKE로 전환.
+
+#### 5-e. DB 스키마
+
+`BridgeMapping`에 `webhookUrl: string | null` 필드 추가. `BridgeStore`에 `getByChannel()`, `getByExternal()`, `list()` (필터 지원) 메서드 구현.
+
+### 관련 파일
+
+| 파일 | 역할 |
+|------|------|
+| `src/bridge/index.ts` | BridgeDeps, SendExternalFn, EchoTracker |
+| `src/bridge/inbound.ts` | 인바운드 핸들러, @mention 감지 |
+| `src/bridge/outbound.ts` | 아웃바운드 릴레이 |
+| `src/bridge/discord-webhook.ts` | Discord 웹훅 생성/전송 유틸 |
+| `src/db/interface.ts` | BridgeMapping, BridgeStore 인터페이스 |
+| `src/db/memory.ts`, `src/db/sqlite.ts` | BridgeStore 구현 (메모리/SQLite) |
+| `src/tools/index.ts` | `flock_bridge` 도구, 자동 웹훅 생성 |
+| `src/index.ts` | sendExternal 래퍼, 봇 토큰 해석, 훅 등록 |
+| `tests/bridge/*.test.ts` | 브릿지 테스트 (store, inbound, outbound) |
+
+### 남은 개선 사항 (낮은 우선순위)
+
+- ✅ 채널 아카이브 이벤트의 Slack/Discord 반영 (브릿지 비활성화 + 알림) — 아카이브 프로토콜 (#4)에서 구현
+- USER.md에 `human:` 메시지 우선 처리 지시 추가
 
 ---
 
@@ -519,7 +566,7 @@ lines.push(`Thread ${update.threadId} (${update.newMessages.length} new):`);
 
 ## 7. 메모리 모델
 
-### 심각도: Minor — 기반 존재, 보강 필요
+### 심각도: Minor — ✅ 완료
 
 ### 비전 (VISION.md §2.4)
 
@@ -533,7 +580,7 @@ lines.push(`Thread ${update.threadId} (${update.newMessages.length} new):`);
 - 세션 간 지식 이동은 메모리를 통해 수행
 - 에이전트는 작업하면서 A2A Card를 지속 업데이트
 
-### 현재 구현
+### 구현 완료 내역
 
 **Shared Knowledge**: Workspace 도구가 이미 잘 구현되어 있다:
 - `flock_workspace_list` — 워크스페이스 목록 (src/tools/workspace.ts:204)
@@ -542,23 +589,33 @@ lines.push(`Thread ${update.threadId} (${update.newMessages.length} new):`);
 - `flock_workspace_tree` — 디렉토리 트리 (src/tools/workspace.ts:446)
 - 경로 탐색 방지, 심링크 보호 등 보안 처리 완료
 
-**Agent Memory**: Worker 프롬프트에서 MEMORY.md 사용을 언급:
-```markdown
-<!-- src/prompts/templates/agents/worker.md:72 -->
-Record what you learn in MEMORY.md.
-```
+**Agent Memory**: Worker 프롬프트(`worker.md`)에 메모리 사용 가이드 추가:
 
-### 부족한 부분
+#### 7-a. Cross-Session 참조 가이드
 
-1. **Agent Memory 도구 부재** — 에이전트가 자기 workspace 내 메모리 파일에 접근하는 전용 도구가 없음. 현재는 일반 exec이나 workspace 도구에 의존.
-2. **채널-메모리 연결** — 아카이브 프로토콜에서 "히스토리 리뷰 → 메모리 기록" 흐름을 지원하는 도구가 없음.
-3. **메모리 기반 cross-session 지식 전파** — per-channel 세션 구현 후, 세션 간 메모리 참조 패턴 가이드 필요.
+`worker.md`에 세션 격리 환경에서의 메모리 활용 패턴 추가:
+- MEMORY.md에 기록할 내용: 기술 인사이트, 협업 노트, 도메인 지식, 실수와 수정 사항
+- 과거 작업 참조 방법: `flock_channel_read`로 아카이브 채널 열람
+- MEMORY.md 구성 원칙: 주제별 정리 (채널별 아님)
 
-### 필요한 작업
+#### 7-b. 아카이브→메모리 기록 흐름
 
-1. Worker 프롬프트에 메모리 사용 패턴 가이드 보강
-2. 아카이브 프로토콜 (#4) 구현 시 메모리 기록 단계 포함
-3. Per-channel 세션 (#3) 구현 후 메모리 참조 가이드 작성
+`worker.md`에 아카이브 프로토콜 참여 체크리스트 추가:
+1. 채널 히스토리 리뷰
+2. 핵심 학습 사항을 MEMORY.md에 기록 (구체적 기술 인사이트 강조)
+3. A2A Card 업데이트 (`flock_update_card`)
+4. `flock_archive_ready` 호출
+
+### 관련 파일
+
+| 파일 | 역할 |
+|------|------|
+| `src/prompts/templates/agents/worker.md` | cross-session 가이드 + 아카이브 체크리스트 |
+| `src/tools/workspace.ts` | Shared Knowledge 도구 (기존) |
+
+### 남은 개선 사항 (낮은 우선순위)
+
+- Agent Memory 전용 도구 (현재는 workspace 도구로 충분)
 
 ---
 
@@ -593,55 +650,203 @@ evolve, update your card.
 
 ## 구현 우선순위 제안
 
-### Phase 1: 기반 구조 (채널 + 역할 분리)
+### Phase 1: 기반 구조 (채널 + 역할 분리) — ✅ 완료
 
 ```
-1. ChannelStore 인터페이스 및 SQLite 구현
-2. 채널 CRUD 도구 (create, archive, assign_members, post, read)
-3. Orchestrator 프롬프트 재작성 + Card 분리
-4. Executor의 isSysadmin 로직 분리
-5. flock_discover 역할 필터 수정
+✅ 1. ChannelStore 인터페이스 및 SQLite 구현
+✅ 2. 채널 CRUD 도구 (create, archive, assign_members, post, read)
+✅ 3. Orchestrator 프롬프트 재작성 + Card 분리
+✅ 4. Executor의 isSysadmin 로직 분리
+✅ 5. flock_discover 역할 필터 수정
 ```
 
-이 단계에서 가장 파급력이 큰 2개의 Critical 갭 (#1, #2)을 해결한다.
+Critical 갭 #1, #2 해결 완료.
 
-### Phase 2: 세션 격리 + 알림 개선
-
-```
-1. OpenClaw multi-session 지원 확인
-2. SessionSendFn / GatewaySend 채널 라우팅
-3. Delta 알림에 채널 컨텍스트 주입
-4. 틱 메시지에 채널 정보 포함
-```
-
-Critical 갭 #3과 Minor 갭 #6을 해결한다.
-
-### Phase 3: 프로토콜 + 사람 참여
+### Phase 2: 세션 격리 + 알림 개선 — ✅ 완료
 
 ```
-1. 아카이브 프로토콜 (flock_archive_ready, 상태 관리)
-2. USER.md human: 메시지 처리 지시 추가
-3. Slack Bridge Bot 프로토타입
-4. 메모리 사용 가이드 보강
+✅ 1. OpenClaw multi-session 지원 확인 — 네이티브 지원
+✅ 2. SessionSendFn / GatewaySend 채널 라우팅 — X-OpenClaw-Session-Key 헤더
+✅ 3. Delta 알림에 채널 컨텍스트 주입 — buildChannelNotification
+✅ 4. 틱 메시지에 채널 정보 포함
+✅ 5. Delta 상한 50개, stale 체크 수정
 ```
 
-Major 갭 (#4, #5)과 Minor 갭 (#7)을 해결한다.
+Critical 갭 #3, Minor 갭 #6 해결 완료.
+
+### Phase 3: 브릿지 + 사람 참여 — ✅ 완료
+
+```
+✅ 1. 단일봇 브릿지 아키텍처 (Discord 웹훅, Slack 접두사)
+✅ 2. 양방향 릴레이 (inbound/outbound) + Echo 방지
+✅ 3. @mention 감지 및 SLEEP 에이전트 wake
+✅ 4. BridgeStore (DB 스키마, 메모리/SQLite)
+✅ 5. 아카이브 프로토콜 (flock_archive_ready, 3상태 머신, 자동 전환)
+⬜ 6. USER.md human: 메시지 처리 지시 추가
+✅ 7. 메모리 사용 가이드 보강
+```
+
+Major 갭 #4, #5, #7 모두 해결 완료.
+
+### Phase 4: 독립 실행형 CLI + E2E 검증 — ✅ 완료
+
+```
+✅ 1. 독립 실행형 CLI 재작성 — flock init/start/stop/add/remove/list/status/update
+✅ 2. ~/.flock/ 디렉토리 구조 — OpenClaw 번들, 설정, 데이터, 워크스페이스
+✅ 3. 샌드박스 도구 정책 — flock add가 flock_* 포함 allowlist 자동 설정
+✅ 4. Dockerfile + docker-compose — Docker 소켓 마운트, 샌드박스 이미지 빌드
+✅ 5. E2E 테스트 하네스 — 41/41 통과, 4개 샌드박스 컨테이너 검증
+```
+
+### Phase 5: 샌드박스 강화 + Nix 공유 스토어 — ✅ 완료
+
+```
+✅ 1. flock init — orchestrator에 sandbox 도구 정책 + sandbox mode 자동 설정
+✅ 2. flock init — chatCompletions 엔드포인트 기본 활성화
+✅ 3. flock init — 글로벌 tools.sandbox.tools.allow 설정
+✅ 4. flock add — sysadmin 역할은 sandbox 제외
+✅ 5. Nix 공유 스토어 — nix-daemon 컨테이너, Docker 볼륨, 에이전트별 프로필
+✅ 6. sysadmin 프롬프트 — Nix 패키지 관리 가이드 추가
+✅ 7. worker 프롬프트 — 인프라 상호작용 Nix 언급 추가
+```
+
+### 남은 작업
+
+```
+⬜ 1. USER.md human: 메시지 우선 처리 프롬프트
+```
+
+---
+
+## 9. 독립 실행형 CLI
+
+### 심각도: Critical — ✅ 완료
+
+### 비전
+
+Flock을 별도의 OpenClaw 설치 없이 하나의 CLI로 사용할 수 있어야 한다:
+
+```bash
+flock init    # OpenClaw 포크를 ~/.flock/openclaw/에 클론/빌드
+flock start   # 격리된 게이트웨이 시작
+flock stop    # 게이트웨이 중지
+flock add     # 에이전트 추가 (샌드박스 도구 정책 자동 설정)
+flock update  # 번들 OpenClaw 업데이트
+```
+
+### 구현 완료 내역
+
+#### 9-a. 디렉토리 구조
+
+`~/.openclaw/`과 완전 독립된 `~/.flock/` 디렉토리:
+
+```
+~/.flock/
+├── openclaw/                    git clone (mconcat/openclaw fork)
+├── config.json                  OpenClaw 형식 설정 (OPENCLAW_CONFIG_PATH)
+├── extensions/flock → dist/     플러그인 심링크
+├── data/flock.db                SQLite 데이터베이스
+└── workspaces/                  에이전트별 워크스페이스
+```
+
+`OPENCLAW_CONFIG_PATH`와 `OPENCLAW_STATE_DIR` 환경변수로 기존 `~/.openclaw/` 설치와 충돌 없이 격리 실행.
+
+#### 9-b. CLI 명령어
+
+| 명령어 | 설명 |
+|--------|------|
+| `flock init` | OpenClaw 포크 클론/빌드, 설정 파일 생성, 플러그인 심링크 |
+| `flock start` | 번들 OpenClaw 게이트웨이 시작 (`node openclaw.mjs gateway run`) |
+| `flock stop` | PID 파일 기반 게이트웨이 중지 |
+| `flock add <id>` | 에이전트 추가 — `tools.sandbox.tools.allow`에 `flock_*` 자동 포함 |
+| `flock remove <id>` | 에이전트 제거 |
+| `flock list` | 설정된 에이전트 목록 |
+| `flock status` | OpenClaw 버전, 게이트웨이 상태, 에이전트 수 표시 |
+| `flock update` | `git pull && npm install && npm run build` |
+
+#### 9-c. 샌드박스 도구 정책
+
+OpenClaw 샌드박스는 `DEFAULT_TOOL_ALLOW` (built-in 도구만)를 기본으로 사용. 플러그인 도구는 명시적 허용 필요.
+
+`flock init`과 `flock add` 시 자동 설정:
+```json
+{
+  "tools": {
+    "alsoAllow": ["group:plugins"],
+    "sandbox": {
+      "tools": {
+        "allow": ["exec", "process", "read", "write", "edit", "apply_patch",
+                  "image", "sessions_*", "flock_*"]
+      }
+    }
+  },
+  "sandbox": { "mode": "all", "scope": "agent" }
+}
+```
+
+- `flock init`의 orchestrator도 동일 정책 자동 설정
+- 글로벌 `tools.sandbox.tools.allow` fallback도 자동 설정
+- `chatCompletions` 엔드포인트 기본 활성화
+- sysadmin 역할은 sandbox 제외 (unsandboxed)
+
+#### 9-e. Nix 공유 스토어
+
+샌드박스 컨테이너 간 패키지 공유를 위한 Nix content-addressed store:
+
+- **nix-daemon 컨테이너**: `flock-nix-daemon` — Docker 볼륨 `flock-nix`에 `/nix` 저장
+- **읽기 전용 마운트**: 모든 샌드박스 컨테이너에 `flock-nix:/nix:ro` 바인드
+- **에이전트별 프로필**: `/nix/var/nix/profiles/per-agent/<agentId>/` — symlink 체인으로 독립적 패키지 뷰
+- **PATH 자동 설정**: `flock add` 시 에이전트의 `sandbox.docker.env.PATH`에 Nix 프로필 bin 디렉토리 추가
+- **Sysadmin이 유일한 설치자**: `docker exec flock-nix-daemon nix profile install ...`
+- **중복 제거**: 동일 패키지 = 동일 store path = 한 벌만 저장
+
+#### 9-d. E2E 검증
+
+Docker 안에서 전체 라이프사이클을 검증하는 독립 실행형 E2E 테스트:
+
+- **Docker-in-Docker**: 소켓 마운트(`/var/run/docker.sock`)로 호스트 Docker 데몬에서 샌드박스 컨테이너 실행
+- **공유 바인드 마운트**: `/tmp/flock-e2e` — 호스트와 E2E 컨테이너에서 동일 경로로 마운트하여 샌드박스 볼륨 경로 정합성 보장
+- **커스텀 샌드박스 이미지**: `debian:bookworm-slim` + Python3 (기본 이미지에 Python 없음)
+- **테스트 결과**: 41/41 통과, 4개 샌드박스 컨테이너 생성 확인
+
+### 관련 파일
+
+| 파일 | 역할 |
+|------|------|
+| `src/cli/index.ts` | 독립 실행형 CLI (전면 재작성) |
+| `standalone/Dockerfile` | E2E 테스트 Docker 이미지 |
+| `standalone/entrypoint.sh` | 인증 + 샌드박스 이미지 빌드 |
+| `standalone/test-harness.mjs` | 전체 라이프사이클 테스트 하네스 |
+| `docker-compose.standalone.yml` | E2E 테스트 Docker Compose |
+| `package.json` | `test:standalone` 스크립트 추가 |
 
 ---
 
 ## 부록: 파일별 변경 요약
 
-| 파일 | 변경 영역 | 갭 # |
-|------|----------|------|
-| `src/db/interface.ts` | ChannelRecord, ChannelStore 추가 | #1 |
-| `src/db/sqlite.ts` | channels 테이블 및 store 구현 | #1 |
-| `src/tools/index.ts` | 채널 도구, thread→channel 리네이밍, discover 필터 | #1, #2 |
-| `src/prompts/templates/agents/orchestrator.md` | 전면 재작성 | #2 |
-| `src/transport/agent-card.ts` | createOrchestratorCard() 추가 | #2 |
-| `src/transport/executor.ts` | isSysadmin에서 orchestrator 분리 | #2 |
-| `src/tools/agent-lifecycle.ts` | orchestrator card, restart 권한 | #2 |
-| `src/index.ts` | gateway 등록 시 card 분리 | #2 |
-| `src/transport/gateway-send.ts` | channelId 라우팅 | #3 |
-| `src/loop/scheduler.ts` | 채널 세션 라우팅, tick 채널 컨텍스트 | #3, #6 |
-| `src/prompts/templates/USER.md` | human: 메시지 처리 지시 | #5 |
-| `src/prompts/templates/agents/worker.md` | 메모리 가이드 보강 | #7 |
+| 파일 | 변경 영역 | 갭 # | 상태 |
+|------|----------|------|------|
+| `src/db/interface.ts` | ChannelRecord, ChannelStore, BridgeMapping, BridgeStore | #1, #5 | ✅ |
+| `src/db/sqlite.ts` | channels, bridge_mappings 테이블 및 store 구현 | #1, #5 | ✅ |
+| `src/db/memory.ts` | 메모리 ChannelStore, BridgeStore 구현 | #1, #5 | ✅ |
+| `src/tools/index.ts` | 채널 도구, flock_bridge, discover 필터, delta 개선, flock_archive_ready | #1, #2, #4, #5, #6 | ✅ |
+| `src/prompts/templates/agents/orchestrator.md` | 전면 재작성 | #2 | ✅ |
+| `src/transport/agent-card.ts` | createOrchestratorCard() 추가 | #2 | ✅ |
+| `src/transport/executor.ts` | isSysadmin에서 orchestrator 분리 | #2 | ✅ |
+| `src/tools/agent-lifecycle.ts` | orchestrator card, restart 권한 | #2 | ✅ |
+| `src/index.ts` | gateway card 분리, sendExternal, 봇 토큰, 훅 등록 | #2, #3, #5 | ✅ |
+| `src/transport/gateway-send.ts` | channelId 라우팅 (X-OpenClaw-Session-Key) | #3 | ✅ |
+| `src/loop/scheduler.ts` | 채널 세션 라우팅, tick 채널 컨텍스트 | #3, #6 | ✅ |
+| `src/bridge/index.ts` | BridgeDeps, SendExternalFn, EchoTracker | #5 | ✅ |
+| `src/bridge/inbound.ts` | 인바운드 핸들러, @mention 감지/wake | #5 | ✅ |
+| `src/bridge/outbound.ts` | 아웃바운드 릴레이 | #5 | ✅ |
+| `src/bridge/discord-webhook.ts` | Discord 웹훅 생성/전송 | #5 | ✅ |
+| `src/prompts/templates/USER.md` | human: 메시지 처리 지시 | #5 | ⬜ |
+| `src/prompts/templates/agents/worker.md` | 메모리 가이드 + 아카이브 프로토콜 가이드 보강 | #4, #7 | ✅ |
+| `tests/tools/archive-protocol.test.ts` | 아카이브 프로토콜 11개 테스트 | #4 | ✅ |
+| `src/cli/index.ts` | 독립 실행형 CLI 전면 재작성 | #9 | ✅ |
+| `standalone/Dockerfile` | E2E 테스트 Docker 이미지 | #9 | ✅ |
+| `standalone/entrypoint.sh` | 인증 + 샌드박스 이미지 빌드 | #9 | ✅ |
+| `standalone/test-harness.mjs` | 전체 라이프사이클 테스트 하네스 | #9 | ✅ |
+| `docker-compose.standalone.yml` | E2E 테스트 Docker Compose | #9 | ✅ |
+| `package.json` | `test:standalone` 스크립트, bin 설정 | #9 | ✅ |

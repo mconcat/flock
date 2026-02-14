@@ -297,6 +297,18 @@ describe("flock_create_agent", () => {
     expect(result.content[0].text).toContain("invalid");
   });
 
+  it("rejects human: prefix in agent ID", async () => {
+    const result = await tool.execute("test-call", {
+      agentId: "orchestrator",
+      newAgentId: "human:alice",
+      role: "worker",
+    });
+
+    expect(result.details?.ok).toBe(false);
+    expect(result.content[0].text).toContain("human:");
+    expect(result.content[0].text).toContain("reserved");
+  });
+
   it("uses system prompt when provided", async () => {
     const result = await tool.execute("test-call", {
       agentId: "orchestrator",

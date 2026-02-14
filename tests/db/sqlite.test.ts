@@ -116,6 +116,8 @@ describe("SQLite Backend", () => {
         createdBy: "pm-alpha",
         members: ["pm-alpha", "dev-code", "qa-tester"],
         archived: false,
+        archiveReadyMembers: [],
+        archivingStartedAt: null,
         createdAt: 1000,
         updatedAt: 1000,
       });
@@ -136,6 +138,8 @@ describe("SQLite Backend", () => {
         createdBy: "a",
         members: ["a", "b"],
         archived: false,
+        archiveReadyMembers: [],
+        archivingStartedAt: null,
         createdAt: 1000,
         updatedAt: 1000,
       });
@@ -155,9 +159,9 @@ describe("SQLite Backend", () => {
     });
 
     it("lists with filters", () => {
-      db.channels.insert({ channelId: "ch-1", name: "ch-1", topic: "t1", createdBy: "a", members: ["a", "b"], archived: false, createdAt: 1, updatedAt: 1 });
-      db.channels.insert({ channelId: "ch-2", name: "ch-2", topic: "t2", createdBy: "b", members: ["b", "c"], archived: false, createdAt: 2, updatedAt: 2 });
-      db.channels.insert({ channelId: "ch-3", name: "ch-3", topic: "t3", createdBy: "a", members: ["a"], archived: true, createdAt: 3, updatedAt: 3 });
+      db.channels.insert({ channelId: "ch-1", name: "ch-1", topic: "t1", createdBy: "a", members: ["a", "b"], archived: false, archiveReadyMembers: [], archivingStartedAt: null, createdAt: 1, updatedAt: 1 });
+      db.channels.insert({ channelId: "ch-2", name: "ch-2", topic: "t2", createdBy: "b", members: ["b", "c"], archived: false, archiveReadyMembers: [], archivingStartedAt: null, createdAt: 2, updatedAt: 2 });
+      db.channels.insert({ channelId: "ch-3", name: "ch-3", topic: "t3", createdBy: "a", members: ["a"], archived: true, archiveReadyMembers: [], archivingStartedAt: null, createdAt: 3, updatedAt: 3 });
 
       expect(db.channels.list()).toHaveLength(3);
       expect(db.channels.list({ createdBy: "a" })).toHaveLength(2);
@@ -170,7 +174,7 @@ describe("SQLite Backend", () => {
     });
 
     it("deletes a channel", () => {
-      db.channels.insert({ channelId: "ch-1", name: "ch-1", topic: "t", createdBy: "a", members: ["a"], archived: false, createdAt: 1, updatedAt: 1 });
+      db.channels.insert({ channelId: "ch-1", name: "ch-1", topic: "t", createdBy: "a", members: ["a"], archived: false, archiveReadyMembers: [], archivingStartedAt: null, createdAt: 1, updatedAt: 1 });
       db.channels.delete("ch-1");
       expect(db.channels.get("ch-1")).toBeNull();
     });
@@ -243,6 +247,78 @@ describe("SQLite Backend", () => {
       expect(db2.audit.count()).toBe(1);
 
       db2.close();
+    });
+  });
+
+  describe("AgentLoopStore", () => {
+    it("initializes agent with AWAKE state", () => {
+      db.agentLoop.init("agent-1", "AWAKE");
+      const record = db.agentLoop.get("agent-1");
+      expect(record).not.toBeNull();
+      expect(record!.state).toBe("AWAKE");
+      expect(record!.sleptAt).toBeNull();
+    });
+
+    it("initializes agent with REACTIVE state", () => {
+      db.agentLoop.init("sysadmin", "REACTIVE");
+      const record = db.agentLoop.get("sysadmin");
+      expect(record).not.toBeNull();
+      expect(record!.state).toBe("REACTIVE");
+    });
+
+    it("setState to REACTIVE sets sleptAt and preserves awakenedAt", () => {
+      db.agentLoop.init("agent-1", "AWAKE");
+      const before = db.agentLoop.get("agent-1")!;
+      const originalAwakenedAt = before.awakenedAt;
+
+      db.agentLoop.setState("agent-1", "REACTIVE", "sysadmin mode");
+      const after = db.agentLoop.get("agent-1")!;
+      expect(after.state).toBe("REACTIVE");
+      expect(after.sleptAt).not.toBeNull();
+      expect(after.sleepReason).toBe("sysadmin mode");
+      expect(after.awakenedAt).toBe(originalAwakenedAt);
+    });
+
+    it("setState from REACTIVE to AWAKE clears sleptAt", () => {
+      db.agentLoop.init("agent-1", "REACTIVE");
+      db.agentLoop.setState("agent-1", "AWAKE");
+      const record = db.agentLoop.get("agent-1")!;
+      expect(record.state).toBe("AWAKE");
+      expect(record.sleptAt).toBeNull();
+      expect(record.sleepReason).toBeNull();
+    });
+
+    it("listByState returns only agents in requested state", () => {
+      db.agentLoop.init("worker-1", "AWAKE");
+      db.agentLoop.init("worker-2", "AWAKE");
+      db.agentLoop.init("sysadmin", "REACTIVE");
+      db.agentLoop.setState("worker-2", "SLEEP");
+
+      const awake = db.agentLoop.listByState("AWAKE");
+      expect(awake.map(r => r.agentId)).toEqual(["worker-1"]);
+
+      const sleeping = db.agentLoop.listByState("SLEEP");
+      expect(sleeping.map(r => r.agentId)).toEqual(["worker-2"]);
+
+      const reactive = db.agentLoop.listByState("REACTIVE");
+      expect(reactive.map(r => r.agentId)).toEqual(["sysadmin"]);
+    });
+
+    it("REACTIVE agents are excluded from AWAKE and SLEEP lists", () => {
+      db.agentLoop.init("sysadmin", "REACTIVE");
+
+      expect(db.agentLoop.listByState("AWAKE")).toHaveLength(0);
+      expect(db.agentLoop.listByState("SLEEP")).toHaveLength(0);
+      expect(db.agentLoop.listByState("REACTIVE")).toHaveLength(1);
+    });
+
+    it("listAll includes all states", () => {
+      db.agentLoop.init("worker", "AWAKE");
+      db.agentLoop.init("sysadmin", "REACTIVE");
+
+      const all = db.agentLoop.listAll();
+      expect(all).toHaveLength(2);
+      expect(all.map(r => r.state).sort()).toEqual(["AWAKE", "REACTIVE"]);
     });
   });
 });

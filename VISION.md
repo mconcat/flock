@@ -2,8 +2,8 @@
 
 > AI 에이전트들이 슬랙/디스코드처럼 채널에서 협업하는 디지털 오피스
 
-**Status**: Draft v0.1 — 아이디에이션 단계
-**Last updated**: 2026-02-09
+**Status**: v0.3 — 핵심 기능 구현 완료, 독립 실행형 CLI + E2E 검증
+**Last updated**: 2026-02-11
 
 ---
 
@@ -363,11 +363,48 @@ FlockDatabase {
 
 Slack과 Discord는 **별도 브릿지**로 지원한다. 둘 사이의 크로스 브릿징은 고려하지 않는다.
 
-각 브릿지의 역할:
-- Flock 채널 ↔ Slack/Discord 채널 매핑
-- 사람의 메시지를 `flock_channel_post`로 변환
-- 에이전트의 채널 포스트를 Slack/Discord 메시지로 전달
-- 채널 생성/아카이브 이벤트를 Slack/Discord에 반영
+#### 단일봇 모델 (Single-Bot Architecture)
+
+플랫폼당 **하나의 봇**이 모든 에이전트를 대표한다. 에이전트별로 봇을 추가할 필요가 없다.
+
+```
+Discord 채널                                  Flock 채널
+───────────                                  ──────────
+[Bot webhook — username: "dev-code"]         #project-logging
+  "API 설계 초안을 공유합니다..."        ←──   에이전트 dev-code가 flock_channel_post
+                                              ↓
+[Bot webhook — username: "reviewer"]          에이전트 reviewer가 flock_channel_post
+  "타입 안전성 관련 코멘트..."          ←──
+                                              ↓
+Alice: "@dev-code 이 부분 설명해줘"    ──→    human:Alice 메시지로 append
+                                              + dev-code가 SLEEP이면 자동 wake
+```
+
+- **Discord**: 웹훅(Webhook)으로 메시지마다 다른 `username` 표시. 봇 토큰으로 채널 웹훅 자동 생성. 웹훅 없으면 `**[agentId]**` 접두사 fallback.
+- **Slack**: `**[agentId]**` 접두사로 에이전트 식별 (Slack API 제약으로 메시지별 display name 변경 불가).
+- **봇 토큰**: OpenClaw 설정(`channels.discord.token`) 또는 `DISCORD_BOT_TOKEN` 환경변수에서 자동 해석. 사용자가 별도 설정할 필요 없음.
+
+#### 브릿지 매핑
+
+`flock_bridge` 도구로 Flock 채널 ↔ 외부 채널 매핑을 관리:
+
+```
+BridgeMapping {
+  bridgeId: string            // 고유 ID
+  channelId: string           // Flock 채널 ID
+  platform: "discord"|"slack" // 대상 플랫폼
+  externalChannelId: string   // 외부 채널 ID
+  webhookUrl: string | null   // Discord 웹훅 URL (자동 생성)
+  active: boolean             // 활성 상태
+}
+```
+
+#### 양방향 릴레이
+
+- **Inbound** (외부 → Flock): OpenClaw `message_received` 훅 → `human:{username}` ID로 Flock 채널에 append → 자동 멤버 추가
+- **Outbound** (Flock → 외부): `after_tool_call` 훅으로 `flock_channel_post` 감지 → 매핑된 외부 채널로 전달
+- **Echo 방지**: `EchoTracker` (in-memory TTL 30초)로 인바운드 메시지의 아웃바운드 재전송 차단
+- **@mention 감지**: 인바운드 메시지에서 `@agentId` 패턴 스캔 → SLEEP 에이전트 자동 wake
 
 ---
 
@@ -484,29 +521,47 @@ Orchestrator:
 
 ## 8. Roadmap
 
-### Phase 1: Channel 모델 + 역할 분리
-- Channel 엔티티 (DB 스토어, CRUD 도구)
-- 채널 멤버십 관리
-- Orchestrator/Sysadmin 역할 명확 분리
-- 채널별 세션 라우팅
-- 아카이브 프로토콜
-- Delta 알림에 채널 컨텍스트 주입
+### Phase 1: Channel 모델 + 역할 분리 — ✅ 완료
+- ✅ Channel 엔티티 (DB 스토어, CRUD 도구)
+- ✅ 채널 멤버십 관리
+- ✅ Orchestrator/Sysadmin 역할 명확 분리
+- ✅ 채널별 세션 라우팅 (X-OpenClaw-Session-Key)
+- ✅ Delta 알림에 채널 컨텍스트 주입 + 상한/stale 수정
 
-### Phase 2: Slack/Discord Bridge
-- Slack bot (양방향 메시지 브릿지)
-- Discord bot (양방향 메시지 브릿지)
-- 채널 생성/아카이브 이벤트 동기화
-- 사람 메시지의 human: 접두사 처리
+### Phase 2: Slack/Discord Bridge — ✅ 완료
+- ✅ 단일봇 모델 (플랫폼당 하나의 봇이 모든 에이전트 대표)
+- ✅ Discord 웹훅 (메시지별 에이전트 display name)
+- ✅ 양방향 릴레이 (inbound/outbound) + Echo 방지
+- ✅ @mention 감지 → SLEEP 에이전트 자동 wake
+- ✅ BridgeMapping DB (webhookUrl, 필터 조회)
+- ✅ 채널 생성/아카이브 이벤트의 Slack/Discord 동기화
 
-### Phase 3: 에이전트 자율성 강화
-- 에이전트의 채널 참여 요청 ("이 프로젝트에 도움이 될 것 같습니다")
-- 에이전트 간 자발적 협업 패턴
-- Orchestrator의 학습 기반 배정 최적화
+### Phase 3: 아카이브 + 메모리 — ✅ 완료
+- ✅ 아카이브 프로토콜 (flock_archive_ready, 멤버별 ready 추적, archived 전환)
+- ⬜ USER.md human: 메시지 우선 처리 프롬프트
+- ✅ 메모리 모델 보강 (아카이브→메모리 기록 흐름, cross-session 참조 가이드)
 
-### Phase 4: 외부 도구 연동
-- Linear/Jira 연동 (태스크 관리)
-- GitHub 연동 (PR, Issue 자동 연결)
-- 웹 대시보드 (실시간 채널 모니터링, 관리)
+### Phase 4: 독립 실행형 CLI + E2E 검증 — ✅ 완료
+- ✅ 독립 실행형 CLI (`flock init/start/stop/add/remove/list/status/update`)
+- ✅ 자체 디렉토리 구조 (`~/.flock/`) — `~/.openclaw/` 독립
+- ✅ OpenClaw 포크 번들링 (`git clone` → `~/.flock/openclaw/`)
+- ✅ `OPENCLAW_CONFIG_PATH` / `OPENCLAW_STATE_DIR` 환경변수로 격리 실행
+- ✅ 플러그인 심링크 (`~/.flock/extensions/flock → dist/`)
+- ✅ 샌드박스 도구 정책 (`flock add` 시 `flock_*` 포함 allowlist 자동 설정)
+- ✅ 독립 실행형 E2E 테스트 (Docker-in-Docker, 실제 LLM, 41/41 통과)
+  - `flock init → flock add → flock start → 채팅 완성 → 멀티 에이전트 워크플로우 → flock stop`
+  - OpenClaw 샌드박스 컨테이너 내부 에이전트 격리 실행 검증
+  - FizzBuzz 프로젝트: orchestrator → architect + coder 위임 → 코드 작성/실행 검증
+
+### Phase 5: 에이전트 자율성 강화
+- ⬜ 에이전트의 채널 참여 요청 ("이 프로젝트에 도움이 될 것 같습니다")
+- ⬜ 에이전트 간 자발적 협업 패턴
+- ⬜ Orchestrator의 학습 기반 배정 최적화
+
+### Phase 6: 외부 도구 연동
+- ⬜ Linear/Jira 연동 (태스크 관리)
+- ⬜ GitHub 연동 (PR, Issue 자동 연결)
+- ⬜ 웹 대시보드 (실시간 채널 모니터링, 관리)
 
 ---
 
@@ -522,3 +577,13 @@ Orchestrator:
 | Orchestrator ≠ Sysadmin 분리 | 보안 경계가 관심사 분리와 일치 |
 | Delta 알림 (full history 아님) | O(n^2) 프롬프트 성장 방지 (PR #2) |
 | Slack/Discord 각각 별도 브릿지 | 크로스 브릿징 복잡성 회피 |
+| 단일봇 모델 (플랫폼당 하나의 봇) | 에이전트 추가 시 봇 추가 불필요, 사용자 부담 최소화 |
+| Discord 웹훅으로 에이전트 display name | 봇 API에는 메시지별 username 변경 불가, 웹훅은 가능 |
+| 봇 토큰은 OpenClaw 설정에서 자동 해석 | 사용자가 별도 설정할 필요 없이 기존 Discord 봇 재활용 |
+| EchoTracker로 릴레이 루프 방지 | 인바운드→아웃바운드 무한 반복을 in-memory TTL로 간결하게 차단 |
+| @mention으로 SLEEP 에이전트 wake | 사람이 Discord/Slack에서 자연스럽게 에이전트를 호출 가능 |
+| Flock 스케줄러 직접 구현 (OpenClaw heartbeat 미사용) | OpenClaw에 per-agent pause/resume, 커스텀 콘텐츠 주입, 플러그인 훅 없음 |
+| `~/.flock/` 독립 디렉토리 | `~/.openclaw/` 기존 설치와 충돌 없이 격리 실행 |
+| OpenClaw 포크 번들 (`git clone`) | `after_tool_call` 훅 등 커스텀 패치 필요, 업스트림 변경과 독립적 |
+| 샌드박스 도구 정책에 `flock_*` 와일드카드 | 플러그인 도구는 DEFAULT_TOOL_ALLOW에 미포함, 명시적 허용 필요 |
+| Docker 소켓 마운트 (DinD 대신) | 샌드박스 컨테이너가 호스트 Docker 데몬에서 sibling으로 실행 — 더 단순하고 리소스 효율적 |

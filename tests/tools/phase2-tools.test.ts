@@ -770,7 +770,10 @@ describe("registerFlockTools", () => {
     expect(tools.has("flock_tasks")).toBe(true);
     expect(tools.has("flock_task_respond")).toBe(true);
     expect(tools.has("flock_update_card")).toBe(true);
+    expect(tools.has("flock_bridge")).toBe(true);
 
-    expect(tools.size).toBe(23); // 19 + flock_create_agent + flock_decommission_agent + flock_restart_gateway + flock_sleep (no flock_wake — replaced by @mention + slow-tick)
+    expect(tools.has("flock_archive_ready")).toBe(true);
+
+    expect(tools.size).toBe(25); // 24 + flock_archive_ready (archive protocol readiness)
   });
 });
