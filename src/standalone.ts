@@ -34,7 +34,9 @@ import { NodeRegistry } from "./nodes/registry.js";
 import { SessionManager } from "./session/manager.js";
 import { startFlockHttpServer, stopFlockHttpServer, readJsonBody } from "./server.js";
 import { assembleAgentsMd } from "./prompts/assembler.js";
-import type { ToolDeps } from "./tools/index.js";
+import { createFlockTools, type ToolDeps } from "./tools/index.js";
+import { createWorkspaceTools } from "./tools/workspace.js";
+import { createNodesTool } from "./nodes/tools.js";
 import type { PluginLogger } from "./types.js";
 import { EchoTracker, type BridgeDeps } from "./bridge/index.js";
 import { handleInbound } from "./bridge/inbound.js";
@@ -178,13 +180,28 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       // Assemble system prompt from Flock templates
       const systemPrompt = assembleAgentsMd(role);
 
-      // Build tools for this agent (lifecycle + triage)
-      // These already return AgentTool<T> — no adapter needed
-      const tools = [
-        createTriageDecisionTool(),
+      // Build tools for this agent:
+      //   1. Flock standard tools (channels, discovery, tasks, messaging, etc.)
+      //   2. Workspace tools (vault file read/write — when vaultsBasePath configured)
+      //   3. Nodes tool (node discovery)
+      //   4. Lifecycle tools (agent create/decommission/restart)
+      //   5. Triage decision tool
+      const flockTools = createFlockTools(toolDeps);
+      const workspaceTools = toolDeps.vaultsBasePath
+        ? createWorkspaceTools({ ...toolDeps, vaultsBasePath: toolDeps.vaultsBasePath })
+        : [];
+      const nodesTool = createNodesTool({ nodeRegistry, logger });
+      const lifecycleTools = [
         createStandaloneCreateAgentTool(toolDeps, sessionSend),
         createStandaloneDecommissionAgentTool(toolDeps),
         createStandaloneRestartTool(toolDeps),
+      ];
+      const tools = [
+        ...flockTools,
+        ...workspaceTools,
+        nodesTool,
+        ...lifecycleTools,
+        createTriageDecisionTool(),
       ];
 
       // Model: per-agent config → fallback to default
