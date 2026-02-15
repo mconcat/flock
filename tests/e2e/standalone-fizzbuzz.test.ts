@@ -240,7 +240,7 @@ describe("standalone fizzbuzz E2E", { timeout: 300_000 }, () => {
 
     console.log("[e2e:orchestrator] HTTP status:", response.status);
     const text = getResponseText(response.body);
-    console.log("[e2e:orchestrator] response:", text?.slice(0, 500));
+    console.log("[e2e:orchestrator] response:", text);
 
     expect(response.status).toBe(200);
     expect(text).toBeDefined();
@@ -263,7 +263,7 @@ describe("standalone fizzbuzz E2E", { timeout: 300_000 }, () => {
     const messages = instance.toolDeps.channelMessages.list({ channelId: "fizzbuzz" });
     console.log(`[e2e:verify] channel messages after orchestrator: ${messages.length}`);
     for (const msg of messages) {
-      console.log(`  [${msg.agentId}] (seq ${msg.seq}): ${msg.content.slice(0, 300)}`);
+      console.log(`  [${msg.agentId}] (seq ${msg.seq}): ${msg.content}`);
     }
 
     // Orchestrator should have posted at least one message to the channel
@@ -299,7 +299,7 @@ describe("standalone fizzbuzz E2E", { timeout: 300_000 }, () => {
       console.error("[e2e:coder] Channels:", JSON.stringify(channels.map((c) => c.channelId)));
       console.error("[e2e:coder] Messages:", messages.length);
       for (const msg of messages) {
-        console.error(`  [${msg.agentId}] (seq ${msg.seq}): ${msg.content.slice(0, 200)}`);
+        console.error(`  [${msg.agentId}] (seq ${msg.seq}): ${msg.content}`);
       }
     }
 

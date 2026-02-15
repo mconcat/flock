@@ -251,7 +251,7 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
 
     expect(response.status).toBe(200);
     const text = getResponseText(response.body);
-    console.log("[e2e:phase1] orchestrator response:", text?.slice(0, 300));
+    console.log("[e2e:phase1] orchestrator response:", text);
 
     // Verify channel created with correct members
     const channels = instance.toolDeps.channelStore.list();
@@ -318,7 +318,7 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     const reviewerMsgs = instance.toolDeps.channelMessages
       .list({ channelId: "stack" })
       .filter((m) => m.agentId === "reviewer" && m.seq > coderLastSeq);
-    console.log(`[e2e:phase1] reviewer review: ${reviewerMsgs[0].content.slice(0, 300)}`);
+    console.log(`[e2e:phase1] reviewer review: ${reviewerMsgs[0].content}`);
 
     // stack.py should be executable
     const stackPath = join(vaultsDir, "stack-project", "stack.py");
@@ -369,7 +369,7 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
 
     expect(response.status).toBe(200);
     const text = getResponseText(response.body);
-    console.log("[e2e:phase2] orchestrator response:", text?.slice(0, 300));
+    console.log("[e2e:phase2] orchestrator response:", text);
 
     // Verify orchestrator posted to channel
     const newMessages = instance.toolDeps.channelMessages
@@ -442,7 +442,7 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     const reviewerMsgs = instance.toolDeps.channelMessages
       .list({ channelId: "stack" })
       .filter((m) => m.agentId === "reviewer" && m.seq > coderUpdateSeq);
-    console.log(`[e2e:phase2] reviewer second review: ${reviewerMsgs[0].content.slice(0, 300)}`);
+    console.log(`[e2e:phase2] reviewer second review: ${reviewerMsgs[0].content}`);
   });
 
   it("phase 2: updated stack.py executes correctly", async () => {
@@ -482,7 +482,7 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     console.log(`[e2e:raw] Total messages: ${messages.length}`);
     for (const msg of messages) {
       console.log(`[e2e:raw] [${msg.agentId}] (seq ${msg.seq}):`);
-      console.log(`[e2e:raw]   ${msg.content.slice(0, 200)}`);
+      console.log(`[e2e:raw]   ${msg.content}`);
       console.log("[e2e:raw] ──────────────────────────────────");
     }
     console.log("[e2e:raw] ══════════════════════════════════\n");

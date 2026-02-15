@@ -241,7 +241,7 @@ describe("3-agent collaboration E2E", { timeout: 600_000 }, () => {
 
     console.log("[e2e:orchestrator] HTTP status:", response.status);
     const text = getResponseText(response.body);
-    console.log("[e2e:orchestrator] response:", text?.slice(0, 500));
+    console.log("[e2e:orchestrator] response:", text);
 
     expect(response.status).toBe(200);
     expect(text).toBeDefined();
@@ -304,7 +304,7 @@ describe("3-agent collaboration E2E", { timeout: 600_000 }, () => {
     const coderMsgs = messages.filter((m) => m.agentId === "coder");
     console.log(`[e2e:verify] coder messages: ${coderMsgs.length}`);
     for (const m of coderMsgs) {
-      console.log(`  [coder] (seq ${m.seq}): ${m.content.slice(0, 200)}`);
+      console.log(`  [coder] (seq ${m.seq}): ${m.content}`);
     }
   });
 
@@ -345,7 +345,7 @@ describe("3-agent collaboration E2E", { timeout: 600_000 }, () => {
       console.error("[e2e:phase3] TIMEOUT — reviewer did not post after coder");
       console.error("[e2e:phase3] Channel messages:", messages.length);
       for (const m of messages) {
-        console.error(`  [${m.agentId}] (seq ${m.seq}): ${m.content.slice(0, 200)}`);
+        console.error(`  [${m.agentId}] (seq ${m.seq}): ${m.content}`);
       }
     }
 
@@ -355,7 +355,7 @@ describe("3-agent collaboration E2E", { timeout: 600_000 }, () => {
     const reviewerMsgs = messages.filter((m) => m.agentId === "reviewer" && m.seq > coderLastSeq);
     console.log(`[e2e:verify] reviewer review messages (after coder): ${reviewerMsgs.length}`);
     for (const m of reviewerMsgs) {
-      console.log(`  [reviewer] (seq ${m.seq}): ${m.content.slice(0, 300)}`);
+      console.log(`  [reviewer] (seq ${m.seq}): ${m.content}`);
     }
   });
 
