@@ -35,14 +35,14 @@ describe("public API exports", () => {
     expect(typeof mod.resolveFlockConfig).toBe("function");
   });
 
-  it("exports toAgentTool", async () => {
+  it("exports createApiKeyResolver", async () => {
     const mod = await import("../src/index.js");
-    expect(typeof mod.toAgentTool).toBe("function");
+    expect(typeof mod.createApiKeyResolver).toBe("function");
   });
 
-  it("exports toAgentTools", async () => {
+  it("exports loadAuthStore", async () => {
     const mod = await import("../src/index.js");
-    expect(typeof mod.toAgentTools).toBe("function");
+    expect(typeof mod.loadAuthStore).toBe("function");
   });
 
   it("exports startFlockHttpServer", async () => {
