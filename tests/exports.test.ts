@@ -55,8 +55,13 @@ describe("public API exports", () => {
     expect(typeof mod.stopFlockHttpServer).toBe("function");
   });
 
-  it("still exports register (OpenClaw plugin compat)", async () => {
+  it("exports createFlockTools", async () => {
     const mod = await import("../src/index.js");
-    expect(typeof mod.register).toBe("function");
+    expect(typeof mod.createFlockTools).toBe("function");
+  });
+
+  it("exports toResult", async () => {
+    const mod = await import("../src/index.js");
+    expect(typeof mod.toResult).toBe("function");
   });
 });

@@ -13,7 +13,7 @@
     ]
   },
   "scripts": {
-    "build": "tsc && cp -r src/prompts/templates dist/prompts/ && cp openclaw.plugin.json dist/ && chmod +x dist/cli/index.js",
+    "build": "tsc && cp -r src/prompts/templates dist/prompts/ && chmod +x dist/cli/index.js",
     "postinstall": "echo '\\n🐦 Run \"flock init\" to configure Flock in your OpenClaw setup.\\n'",
     "lint": "eslint src/",
     "test": "vitest run --project unit && npm run test:integration && npm run test:e2e",

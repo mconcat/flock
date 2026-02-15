@@ -15,7 +15,7 @@ import { Type, type Static } from "@mariozechner/pi-ai";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import { toResult } from "./result.js";
 
-import type { PluginApi, ToolDefinition, ToolResultOC, AuditLevel, PluginLogger } from "../types.js";
+import type { AuditLevel, PluginLogger } from "../types.js";
 import { isAuditLevel } from "../types.js";
 import type { FlockConfig } from "../config.js";
 import type { HomeManager } from "../homes/manager.js";
@@ -35,7 +35,7 @@ import type { MigrationEngine } from "../migration/engine.js";
 import type { MigrationOrchestrator } from "../migration/orchestrator.js";
 import type { MigrationReason } from "../migration/types.js";
 import type { AgentSkill } from "../transport/types.js";
-import { createCreateAgentTool, createDecommissionAgentTool, createRestartGatewayTool } from "./agent-lifecycle.js";
+// agent-lifecycle.ts (OpenClaw plugin mode) removed — use agent-lifecycle-standalone.ts
 import { createWorkspaceTools } from "./workspace.js";
 import type { AgentLoopStore } from "../db/index.js";
 import type { WorkLoopScheduler } from "../loop/scheduler.js";
@@ -277,65 +277,16 @@ const FlockBridgeParams = Type.Object({
 });
 
 // ============================================================================
-// Adapter: AgentTool → ToolDefinition for OpenClaw plugin registration
+// Public: create all Flock tools as AgentTool[] for standalone use
 // ============================================================================
 
 /**
- * Adapt an AgentTool to the legacy ToolDefinition interface expected by
- * OpenClaw's `api.registerTool()`. The execute signature is compatible since
- * AgentToolResult's content type is structurally assignable to ToolResultOC's
- * widened content type.
+ * Create all standard Flock tools (excluding lifecycle and workspace tools).
+ * Returns AgentTool[] ready for Agent.setTools().
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- heterogeneous tool array element
-function agentToolToDefinition(tool: AgentTool<any>): ToolDefinition {
-  return {
-    name: tool.name,
-    label: tool.label,
-    description: tool.description,
-    parameters: tool.parameters,
-    execute(toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: (data: unknown) => void): Promise<ToolResultOC> {
-      return tool.execute(toolCallId, params, signal, onUpdate);
-    },
-  };
-}
-
-/**
- * Wrap a tool definition so that the caller's agentId (from OpenClaw context)
- * is injected into every tool call's params as `agentId`. This way tools don't
- * need to rely on the LLM passing agentId — it comes from the session identity.
- */
-function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined): ToolDefinition {
-  const resolvedId = agentId ?? "unknown";
-  return {
-    ...tool,
-    async execute(toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      // Inject _callerAgentId from session context — uses underscore prefix
-      // to avoid collisions with user-facing params like agentId (used as filter in flock_history).
-      // Tools should read _callerAgentId first, then fall back to params.agentId.
-      params._callerAgentId = resolvedId;
-      return tool.execute(toolCallId, params);
-    },
-  };
-}
-
-/**
- * Resolve the effective agent ID from OpenClaw context.
- * Falls back to parsing the session key if agentId is "main".
- */
-function resolveCtxAgentId(ctx: { agentId?: string; sessionKey?: string }): string {
-  if (ctx.agentId && ctx.agentId !== "main") return ctx.agentId;
-  // Parse session key: "agent:{id}:{rest}"
-  if (ctx.sessionKey) {
-    const parts = ctx.sessionKey.split(":");
-    if (parts[0] === "agent" && parts[1] && parts[1] !== "main") return parts[1];
-  }
-  return ctx.agentId ?? "unknown";
-}
-
-export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
-  // All tools are registered as factories so OpenClaw provides per-request
-  // ctx.agentId — injected into tool params for caller identification.
-  const agentTools = [
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi-agent-core uses AgentTool<any>[] for heterogeneous tool arrays
+export function createFlockTools(deps: ToolDeps): AgentTool<any>[] {
+  return [
     createStatusTool(deps),
     createLeaseTool(deps),
     createAuditTool(deps),
@@ -359,34 +310,6 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     createSleepTool(deps),
     createBridgeTool(deps),
   ];
-
-  for (const tool of agentTools) {
-    const def = agentToolToDefinition(tool);
-    api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-      console.log(`[FLOCK-FACTORY] tool="${def.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
-      return wrapToolWithAgentId(def, resolveCtxAgentId(ctx));
-    });
-  }
-
-  // Lifecycle tools need the full ctx for authorization checks
-  api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => createCreateAgentTool(deps, ctx.agentId, ctx.sessionKey));
-  api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => createDecommissionAgentTool(deps, ctx.agentId, ctx.sessionKey));
-  api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => createRestartGatewayTool(deps, ctx.agentId, ctx.sessionKey));
-
-  // Workspace tools — shared vault access for agents (enabled when vaultsBasePath is configured)
-  if (deps.vaultsBasePath) {
-    const workspaceTools = createWorkspaceTools({
-      ...deps,
-      vaultsBasePath: deps.vaultsBasePath,
-    });
-    for (const tool of workspaceTools) {
-      const def = agentToolToDefinition(tool);
-      api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-        console.log(`[FLOCK-FACTORY] tool="${def.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
-        return wrapToolWithAgentId(def, resolveCtxAgentId(ctx));
-      });
-    }
-  }
 }
 
 // ============================================================================

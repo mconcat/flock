@@ -20,9 +20,10 @@ import type { SessionSendFn } from "../../src/transport/executor.js";
 import { createMemoryDatabase } from "../../src/db/memory.js";
 import { createAuditLog } from "../../src/audit/log.js";
 import { resolveFlockConfig } from "../../src/config.js";
-import { registerFlockTools } from "../../src/tools/index.js";
+import { createFlockTools } from "../../src/tools/index.js";
 import type { ToolDeps } from "../../src/tools/index.js";
-import type { PluginLogger, ToolDefinition, PluginApi } from "../../src/types.js";
+import type { AgentTool } from "@mariozechner/pi-agent-core";
+import type { PluginLogger } from "../../src/types.js";
 import type { TaskStore } from "../../src/db/interface.js";
 import type { FlockDatabase } from "../../src/db/interface.js";
 import type { HomeManager } from "../../src/homes/manager.js";
@@ -39,33 +40,13 @@ function makeLogger(): PluginLogger {
   };
 }
 
-/** Collects tools registered via registerFlockTools. */
-function createCapturingPluginApi(): PluginApi & { tools: Map<string, ToolDefinition> } {
-  const tools = new Map<string, ToolDefinition>();
-  return {
-    id: "test-flock",
-    name: "test-flock",
-    version: "0.0.0",
-    description: "test",
-    source: "test",
-    config: {},
-    pluginConfig: {},
-    logger: makeLogger(),
-    tools,
-    registerTool(tool: ToolDefinition | ((ctx: Record<string, unknown>) => ToolDefinition | ToolDefinition[] | null | undefined)) {
-      if (typeof tool === "function") {
-        const resolved = tool({ agentId: "test-agent" });
-        if (resolved) {
-          const list = Array.isArray(resolved) ? resolved : [resolved];
-          for (const t of list) tools.set(t.name, t);
-        }
-      } else {
-        tools.set(tool.name, tool);
-      }
-    },
-    registerGatewayMethod() { /* no-op */ },
-    registerHttpRoute() { /* no-op */ },
-  };
+/** Build tools map from createFlockTools. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function buildToolsMap(deps: ToolDeps): Map<string, AgentTool<any>> {
+  const toolArray = createFlockTools(deps);
+  const tools = new Map<string, AgentTool<any>>();
+  for (const t of toolArray) tools.set(t.name, t);
+  return tools;
 }
 
 /** Minimal HomeManager stub — tools under test don't touch homes. */
@@ -140,7 +121,8 @@ interface TestContext {
   a2aClient: A2AClient;
   db: FlockDatabase;
   taskStore: TaskStore;
-  tools: Map<string, ToolDefinition>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  tools: Map<string, AgentTool<any>>;
 }
 
 function setupTestEnv(sessionSendB: SessionSendFn): TestContext {
@@ -184,8 +166,6 @@ function setupTestEnv(sessionSendB: SessionSendFn): TestContext {
   const audit = createAuditLog({ db, logger });
   const config = resolveFlockConfig({ nodeId: "test-node", dbBackend: "memory" });
 
-  // Register all flock tools via the real registration mechanism
-  const api = createCapturingPluginApi();
   const deps: ToolDeps = {
     config,
     homes: stubHomeManager(),
@@ -195,14 +175,14 @@ function setupTestEnv(sessionSendB: SessionSendFn): TestContext {
     a2aServer,
     taskStore,
   };
-  registerFlockTools(api, deps);
+  const tools = buildToolsMap(deps);
 
   return {
     a2aServer,
     a2aClient,
     db,
     taskStore,
-    tools: api.tools,
+    tools,
   };
 }
 
