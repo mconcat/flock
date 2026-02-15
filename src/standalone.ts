@@ -14,8 +14,9 @@
  */
 
 import type { Server } from "node:http";
-import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, unlinkSync, readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import os from "node:os";
 import { loadFlockConfig, resolveFlockConfig, type FlockConfig } from "./config.js";
 import { createFlockLogger, type FlockLoggerOptions } from "./logger.js";
 import { createDatabase } from "./db/index.js";
@@ -36,7 +37,7 @@ import { WorkLoopScheduler } from "./loop/scheduler.js";
 import { NodeRegistry } from "./nodes/registry.js";
 import { SessionManager } from "./session/manager.js";
 import { startFlockHttpServer, stopFlockHttpServer, readJsonBody } from "./server.js";
-import { assembleAgentsMd, loadSoulTemplate } from "./prompts/assembler.js";
+import { assembleAgentsMd, loadSoulTemplate, loadTemplate } from "./prompts/assembler.js";
 import { createFlockTools, type ToolDeps } from "./tools/index.js";
 import { createWorkspaceTools } from "./tools/workspace.js";
 import { createNodesTool } from "./nodes/tools.js";
@@ -95,6 +96,116 @@ export interface StartFlockOptions {
   noHttp?: boolean;
   /** Discord bot token for standalone bridge. If set, enables Discord bridge. */
   discordBotToken?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent workspace management
+// ---------------------------------------------------------------------------
+
+/** Workspace files: immutable (always overwritten) vs mutable (seed once). */
+const IMMUTABLE_FILES = ["AGENTS.md", "TOOLS.md"] as const;
+const MUTABLE_FILES = ["SOUL.md", "IDENTITY.md", "MEMORY.md", "USER.md", "HEARTBEAT.md"] as const;
+
+interface AgentWorkspaceOpts {
+  agentId: string;
+  role: FlockAgentRole;
+  archetype?: string;
+  nodeId: string;
+  dataDir: string;
+}
+
+/**
+ * Resolve the workspace directory for an agent.
+ */
+function agentWorkspaceDir(dataDir: string, agentId: string): string {
+  return join(dataDir, "agents", agentId);
+}
+
+/**
+ * Seed an agent's workspace with template files.
+ *
+ * - Immutable files (AGENTS.md, TOOLS.md) are always overwritten from templates.
+ * - Mutable files (SOUL.md, IDENTITY.md, MEMORY.md, USER.md, HEARTBEAT.md)
+ *   are only written if they don't already exist — agents own these files.
+ */
+function seedAgentWorkspace(opts: AgentWorkspaceOpts, logger: PluginLogger): string {
+  const wsDir = agentWorkspaceDir(opts.dataDir, opts.agentId);
+  mkdirSync(wsDir, { recursive: true });
+  mkdirSync(join(wsDir, "memory"), { recursive: true });
+
+  // --- Immutable: AGENTS.md ---
+  const agentsMd = assembleAgentsMd(opts.role);
+  writeFileSync(join(wsDir, "AGENTS.md"), agentsMd, "utf-8");
+
+  // --- Immutable: TOOLS.md ---
+  const toolsTemplate = loadTemplate("TOOLS") ?? "";
+  const toolsMd = toolsTemplate
+    .replace(/\{\{NODE_ID\}\}/g, opts.nodeId)
+    .replace(/\{\{NODE_SPECS\}\}/g, `${os.cpus().length} CPU, ${Math.round(os.totalmem() / 1e9)}GB RAM`);
+  writeFileSync(join(wsDir, "TOOLS.md"), toolsMd, "utf-8");
+
+  // --- Mutable: SOUL.md (from archetype template) ---
+  seedIfMissing(wsDir, "SOUL.md", () => {
+    return opts.archetype ? loadSoulTemplate(opts.archetype) ?? "" : "";
+  });
+
+  // --- Mutable: IDENTITY.md ---
+  seedIfMissing(wsDir, "IDENTITY.md", () => {
+    const tpl = loadTemplate("IDENTITY") ?? "";
+    return tpl
+      .replace(/\{\{AGENT_ID\}\}/g, opts.agentId)
+      .replace(/\{\{AGENT_NAME\}\}/g, opts.agentId)
+      .replace(/\{\{ARCHETYPE\}\}/g, opts.archetype ?? "(none)")
+      .replace(/\{\{NODE_ID\}\}/g, opts.nodeId)
+      .replace(/\{\{CREATED_AT\}\}/g, new Date().toISOString());
+  });
+
+  // --- Mutable: MEMORY.md ---
+  seedIfMissing(wsDir, "MEMORY.md", () => loadTemplate("MEMORY") ?? "# MEMORY.md\n");
+
+  // --- Mutable: USER.md ---
+  seedIfMissing(wsDir, "USER.md", () => {
+    const tpl = loadTemplate("USER") ?? "";
+    return tpl
+      .replace(/\{\{FLOCK_VERSION\}\}/g, "0.3.0")
+      .replace(/\{\{ORCHESTRATOR_NODE\}\}/g, opts.nodeId)
+      .replace(/\{\{USER_TIMEZONE\}\}/g, Intl.DateTimeFormat().resolvedOptions().timeZone);
+  });
+
+  // --- Mutable: HEARTBEAT.md ---
+  seedIfMissing(wsDir, "HEARTBEAT.md", () => loadTemplate("HEARTBEAT") ?? "");
+
+  logger.debug?.(`[flock:workspace] seeded workspace for "${opts.agentId}" at ${wsDir}`);
+  return wsDir;
+}
+
+function seedIfMissing(dir: string, filename: string, content: () => string): void {
+  const filePath = join(dir, filename);
+  if (!existsSync(filePath)) {
+    writeFileSync(filePath, content(), "utf-8");
+  }
+}
+
+/**
+ * Read all workspace files and assemble the full system prompt.
+ *
+ * Order follows OpenClaw convention:
+ *   AGENTS.md → SOUL.md → IDENTITY.md → USER.md → TOOLS.md → MEMORY.md → HEARTBEAT.md
+ */
+function assembleSystemPrompt(wsDir: string): string {
+  const sections: string[] = [];
+
+  for (const name of ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "MEMORY.md", "HEARTBEAT.md"]) {
+    const filePath = join(wsDir, name);
+    if (existsSync(filePath)) {
+      const content = readFileSync(filePath, "utf-8").trim();
+      if (content) {
+        sections.push(`# ${name}\n\n${content}`);
+      }
+    }
+  }
+
+  return sections.join("\n\n---\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -217,20 +328,33 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     // invoked when an agent message arrives, not during boot).
     let sessionSend: SessionSendFn;
 
+    // Seed per-agent workspaces (creates dirs + initial files)
+    const agentWorkspaces = new Map<string, string>();
+    for (const agent of config.gatewayAgents) {
+      let role: FlockAgentRole = agent.role ?? "worker";
+      if (config.orchestratorIds.includes(agent.id)) role = "orchestrator";
+      const wsDir = seedAgentWorkspace({
+        agentId: agent.id,
+        role,
+        archetype: agent.archetype,
+        nodeId,
+        dataDir: config.dataDir,
+      }, logger);
+      agentWorkspaces.set(agent.id, wsDir);
+    }
+
     const resolveAgentConfig = (agentId: string) => {
       const agentDef = config.gatewayAgents.find((a) => a.id === agentId);
       let role: FlockAgentRole = agentDef?.role ?? "worker";
       if (config.orchestratorIds.includes(agentId)) role = "orchestrator";
 
-      // Assemble system prompt from Flock templates:
-      //   AGENTS.md = base protocol + role-specific guidance
-      //   SOUL.md   = archetype personality/dispositions (optional)
-      const agentsMd = assembleAgentsMd(role);
-      const archetype = agentDef?.archetype;
-      const soulMd = archetype ? loadSoulTemplate(archetype) : null;
-      const systemPrompt = soulMd
-        ? `${agentsMd}\n\n---\n\n# SOUL.md\n\n${soulMd}`
-        : agentsMd;
+      // Assemble system prompt from per-agent workspace files.
+      // Immutable files (AGENTS.md, TOOLS.md) are regenerated each boot.
+      // Mutable files (SOUL.md, MEMORY.md, etc.) are read from disk — agents own them.
+      const wsDir = agentWorkspaces.get(agentId);
+      const systemPrompt = wsDir
+        ? assembleSystemPrompt(wsDir)
+        : assembleAgentsMd(role); // fallback for dynamically created agents
 
       // Build tools for this agent:
       //   1. Flock standard tools (channels, discovery, tasks, messaging, etc.)
