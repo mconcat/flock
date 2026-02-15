@@ -35,6 +35,10 @@ export interface PluginApi {
  * Return format must include `content` array for the LLM:
  *   { content: [{ type: "text", text: "..." }] }
  */
+/**
+ * @deprecated Use AgentTool from pi-agent-core instead.
+ * Kept for backward compatibility with plugin mode (register(api)).
+ */
 export interface ToolDefinition {
   name: string;
   label?: string;
@@ -48,9 +52,16 @@ export interface ToolDefinition {
   ): Promise<ToolResultOC>;
 }
 
-/** OpenClaw-compatible tool result. Must have `content` array. */
+/**
+ * OpenClaw-compatible tool result. Must have `content` array.
+ *
+ * @deprecated Use AgentToolResult from pi-agent-core instead.
+ * Kept for backward compatibility with plugin mode (register(api)).
+ * The content type is widened to accept pi-ai's TextContent | ImageContent
+ * so that AgentToolResult is structurally assignable to ToolResultOC.
+ */
 export interface ToolResultOC {
-  content: Array<{ type: "text"; text: string }>;
+  content: Array<{ type: "text"; text: string; textSignature?: string } | { type: "image"; data: string; mimeType: string }>;
   details?: Record<string, unknown>;
 }
 

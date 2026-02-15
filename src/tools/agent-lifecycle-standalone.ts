@@ -6,15 +6,16 @@
  *   - Config persisted to ~/.flock/flock.json (not ~/.openclaw/openclaw.json)
  *   - Workspaces at ~/.flock/agents/{id}/ (not ~/.openclaw/workspace-{id}/)
  *   - Uses createDirectSend() instead of createGatewaySessionSend()
- *   - Restart sends SIGUSR2 to Flock process (not SIGUSR1 to OpenClaw gateway)
+ *   - Restart sends SIGTERM to Flock process (not SIGUSR1 to OpenClaw gateway)
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import type { ToolDefinition, ToolResultOC } from "../types.js";
-import { toOCResult } from "../types.js";
+import { Type, type Static } from "@mariozechner/pi-ai";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { toResult } from "./result.js";
 import { createFlockLogger } from "../logger.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
@@ -54,6 +55,27 @@ function isCallerPrivileged(
   return false;
 }
 
+// --- TypeBox Schemas ---
+
+const StandaloneCreateAgentParams = Type.Object({
+  newAgentId: Type.String({ description: "Unique agent ID for the new agent" }),
+  role: Type.Union([
+    Type.Literal("worker"),
+    Type.Literal("sysadmin"),
+    Type.Literal("system"),
+    Type.Literal("orchestrator"),
+  ], { description: "Agent role" }),
+  archetype: Type.Optional(Type.String({ description: "Soul archetype name" })),
+  model: Type.Optional(Type.String({ description: "LLM model (e.g. 'anthropic/claude-sonnet-4-20250514')" })),
+});
+
+const StandaloneDecommissionAgentParams = Type.Object({
+  targetAgentId: Type.String({ description: "Agent ID to decommission" }),
+  reason: Type.String({ description: "Reason for decommissioning" }),
+});
+
+const StandaloneRestartParams = Type.Object({});
+
 // ---------------------------------------------------------------------------
 // flock_create_agent (standalone)
 // ---------------------------------------------------------------------------
@@ -61,52 +83,38 @@ function isCallerPrivileged(
 export function createStandaloneCreateAgentTool(
   deps: ToolDeps,
   sessionSend: SessionSendFn,
-): ToolDefinition {
+): AgentTool<typeof StandaloneCreateAgentParams, Record<string, unknown>> {
   return {
     name: "flock_create_agent",
+    label: "Create Agent (Standalone)",
     description:
       "Create a new agent on the current node. Only orchestrator role agents can use this tool.",
-    parameters: {
-      type: "object",
-      required: ["newAgentId", "role"],
-      properties: {
-        newAgentId: {
-          type: "string",
-          description: "Unique agent ID for the new agent",
-        },
-        role: {
-          type: "string",
-          enum: ["worker", "sysadmin", "system", "orchestrator"],
-          description: "Agent role",
-        },
-        archetype: { type: "string", description: "Soul archetype name" },
-        model: { type: "string", description: "LLM model (e.g. 'anthropic/claude-sonnet-4-20250514')" },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const callerAgentId = resolveCallerAgentId(undefined, params);
+    parameters: StandaloneCreateAgentParams,
+    async execute(_toolCallId: string, params: Static<typeof StandaloneCreateAgentParams>): Promise<AgentToolResult<Record<string, unknown>>> {
+      const rawParams = params as Record<string, unknown>;
+      const callerAgentId = resolveCallerAgentId(undefined, rawParams);
       const newAgentId = typeof params.newAgentId === "string" ? params.newAgentId.trim() : "";
       const role = typeof params.role === "string" ? params.role.trim() : "";
       const archetype = typeof params.archetype === "string" ? params.archetype.trim() : "";
       const model = typeof params.model === "string" ? params.model.trim() : "";
 
-      if (!newAgentId) return toOCResult({ ok: false, error: "newAgentId is required." });
-      if (newAgentId.startsWith("human:")) return toOCResult({ ok: false, error: "Agent IDs cannot start with 'human:'." });
+      if (!newAgentId) return toResult({ ok: false, error: "newAgentId is required." });
+      if (newAgentId.startsWith("human:")) return toResult({ ok: false, error: "Agent IDs cannot start with 'human:'." });
 
       const validRoles = ["worker", "sysadmin", "system", "orchestrator"];
       if (!validRoles.includes(role)) {
-        return toOCResult({ ok: false, error: `role must be one of: ${validRoles.join(", ")}` });
+        return toResult({ ok: false, error: `role must be one of: ${validRoles.join(", ")}` });
       }
 
       try { validateId(newAgentId, "newAgentId"); }
-      catch (err) { return toOCResult({ ok: false, error: String(err) }); }
+      catch (err) { return toResult({ ok: false, error: String(err) }); }
 
-      if (!deps.a2aServer) return toOCResult({ ok: false, error: "A2A server not initialized." });
+      if (!deps.a2aServer) return toResult({ ok: false, error: "A2A server not initialized." });
       if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["orchestrator"])) {
-        return toOCResult({ ok: false, error: `Permission denied: only orchestrator agents can create agents.` });
+        return toResult({ ok: false, error: `Permission denied: only orchestrator agents can create agents.` });
       }
       if (deps.a2aServer.hasAgent(newAgentId)) {
-        return toOCResult({ ok: false, error: `Agent '${newAgentId}' already exists.` });
+        return toResult({ ok: false, error: `Agent '${newAgentId}' already exists.` });
       }
 
       // Create agent card
@@ -178,7 +186,7 @@ export function createStandaloneCreateAgentTool(
       if (model) lines.push(`Model: ${model}`);
       if (configWarning) lines.push("", `⚠️ ${configWarning}`);
 
-      return toOCResult({ ok: true, output: lines.join("\n") });
+      return toResult({ ok: true, output: lines.join("\n") });
     },
   };
 }
@@ -187,35 +195,30 @@ export function createStandaloneCreateAgentTool(
 // flock_decommission_agent (standalone)
 // ---------------------------------------------------------------------------
 
-export function createStandaloneDecommissionAgentTool(deps: ToolDeps): ToolDefinition {
+export function createStandaloneDecommissionAgentTool(deps: ToolDeps): AgentTool<typeof StandaloneDecommissionAgentParams, Record<string, unknown>> {
   return {
     name: "flock_decommission_agent",
+    label: "Decommission Agent (Standalone)",
     description: "Decommission an agent from the current node. Orchestrator only.",
-    parameters: {
-      type: "object",
-      required: ["targetAgentId", "reason"],
-      properties: {
-        targetAgentId: { type: "string", description: "Agent ID to decommission" },
-        reason: { type: "string", description: "Reason for decommissioning" },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const callerAgentId = resolveCallerAgentId(undefined, params);
+    parameters: StandaloneDecommissionAgentParams,
+    async execute(_toolCallId: string, params: Static<typeof StandaloneDecommissionAgentParams>): Promise<AgentToolResult<Record<string, unknown>>> {
+      const rawParams = params as Record<string, unknown>;
+      const callerAgentId = resolveCallerAgentId(undefined, rawParams);
       const targetAgentId = typeof params.targetAgentId === "string" ? params.targetAgentId.trim() : "";
       const reason = typeof params.reason === "string" ? params.reason.trim() : "";
 
-      if (!targetAgentId) return toOCResult({ ok: false, error: "targetAgentId is required." });
-      if (!reason) return toOCResult({ ok: false, error: "reason is required." });
-      if (!deps.a2aServer) return toOCResult({ ok: false, error: "A2A server not initialized." });
+      if (!targetAgentId) return toResult({ ok: false, error: "targetAgentId is required." });
+      if (!reason) return toResult({ ok: false, error: "reason is required." });
+      if (!deps.a2aServer) return toResult({ ok: false, error: "A2A server not initialized." });
 
       if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["orchestrator"])) {
-        return toOCResult({ ok: false, error: "Permission denied: only orchestrator agents can decommission agents." });
+        return toResult({ ok: false, error: "Permission denied: only orchestrator agents can decommission agents." });
       }
       if (!deps.a2aServer.hasAgent(targetAgentId)) {
-        return toOCResult({ ok: false, error: `Agent '${targetAgentId}' not found.` });
+        return toResult({ ok: false, error: `Agent '${targetAgentId}' not found.` });
       }
       if (targetAgentId === callerAgentId) {
-        return toOCResult({ ok: false, error: "Cannot decommission yourself." });
+        return toResult({ ok: false, error: "Cannot decommission yourself." });
       }
 
       deps.a2aServer.unregisterAgent(targetAgentId);
@@ -253,7 +256,7 @@ export function createStandaloneDecommissionAgentTool(deps: ToolDeps): ToolDefin
         result: "success",
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `## Agent Decommissioned: ${targetAgentId}\nReason: ${reason}`,
       });
@@ -265,17 +268,19 @@ export function createStandaloneDecommissionAgentTool(deps: ToolDeps): ToolDefin
 // flock_restart (standalone — restarts Flock process)
 // ---------------------------------------------------------------------------
 
-export function createStandaloneRestartTool(deps: ToolDeps): ToolDefinition {
+export function createStandaloneRestartTool(deps: ToolDeps): AgentTool<typeof StandaloneRestartParams, Record<string, unknown>> {
   return {
     name: "flock_restart",
+    label: "Restart Flock (Standalone)",
     description: "Restart the Flock process. Sysadmin only.",
-    parameters: { type: "object", properties: {} },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const callerAgentId = resolveCallerAgentId(undefined, params);
+    parameters: StandaloneRestartParams,
+    async execute(_toolCallId: string, params: Static<typeof StandaloneRestartParams>): Promise<AgentToolResult<Record<string, unknown>>> {
+      const rawParams = params as Record<string, unknown>;
+      const callerAgentId = resolveCallerAgentId(undefined, rawParams);
 
-      if (!deps.a2aServer) return toOCResult({ ok: false, error: "A2A server not initialized." });
+      if (!deps.a2aServer) return toResult({ ok: false, error: "A2A server not initialized." });
       if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["sysadmin"])) {
-        return toOCResult({ ok: false, error: "Permission denied: only sysadmin agents can restart." });
+        return toResult({ ok: false, error: "Permission denied: only sysadmin agents can restart." });
       }
 
       deps.audit.append({
@@ -291,7 +296,7 @@ export function createStandaloneRestartTool(deps: ToolDeps): ToolDefinition {
       // Schedule graceful shutdown via SIGTERM (lets the CLI's handler run instance.stop())
       setTimeout(() => { process.kill(process.pid, "SIGTERM"); }, 500);
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: "Flock restart initiated. Process will exit and should be restarted by the process manager.",
       });

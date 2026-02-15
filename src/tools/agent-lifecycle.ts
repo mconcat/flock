@@ -18,8 +18,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import type { ToolDefinition, ToolResultOC } from "../types.js";
-import { toOCResult } from "../types.js";
+import { Type, type Static } from "@mariozechner/pi-ai";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { toResult } from "./result.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
 import { createGatewaySessionSend } from "../transport/gateway-send.js";
@@ -49,16 +50,6 @@ function resolveCallerAgentId(callerFromCtx: string | undefined, params: Record<
 }
 
 /**
- * Check if a caller has orchestrator privileges.
- * First checks the A2A server agent registry. If the caller resolves to "main"
- * (common when OpenClaw doesn't propagate agent identity headers), falls back
- * to checking if ANY registered orchestrator agent exists AND the tool is
- * only available to orchestrator sessions via config (tools.alsoAllow).
- *
- * This handles the case where OpenClaw's X-Clawdbot-Agent-Id header isn't
- * propagated to the session key, causing ctx.agentId to be "main".
- */
-/**
  * Check if a caller has the required privileged role.
  * @param allowedRoles - roles that grant access (e.g. ["orchestrator"] or ["orchestrator", "sysadmin"])
  */
@@ -75,8 +66,6 @@ function isCallerPrivileged(
 
   // Fallback: if caller is "main" (OpenClaw default identity when agent header
   // isn't propagated), check if there's a registered agent with an allowed role.
-  // This is safe because lifecycle tools are non-optional and only available
-  // to sessions configured with tools.alsoAllow: ["group:plugins"].
   if (callerAgentId === "main") {
     const cards = a2aServer.listAgentCards?.() ?? [];
     const hasPrivileged = cards.some((entry) => {
@@ -89,49 +78,55 @@ function isCallerPrivileged(
   return false;
 }
 
+// --- TypeBox Schemas ---
+
+const CreateAgentParams = Type.Object({
+  newAgentId: Type.String({
+    description: "Unique agent ID for the new agent (alphanumeric, dash, underscore only)",
+  }),
+  role: Type.Union([
+    Type.Literal("worker"),
+    Type.Literal("sysadmin"),
+    Type.Literal("system"),
+    Type.Literal("orchestrator"),
+  ], { description: "Agent role: worker, sysadmin, system, or orchestrator" }),
+  mutableLayer: Type.Optional(Type.String({
+    description: "Layer 3 content (SOUL.md, IDENTITY.md, etc.) for prompt assembly",
+  })),
+  archetype: Type.Optional(Type.String({
+    description: "Archetype name to use as Layer 3 base (e.g. 'researcher', 'coder')",
+  })),
+  model: Type.Optional(Type.String({
+    description: "Primary model for this agent (e.g. 'anthropic/claude-opus-4-5', 'openai-codex/gpt-5.2'). If omitted, the node default model is used.",
+  })),
+  systemPrompt: Type.Optional(Type.String({
+    description: "Full system prompt (overrides layer assembly if provided)",
+  })),
+});
+
+const DecommissionAgentParams = Type.Object({
+  targetAgentId: Type.String({ description: "Agent ID to decommission" }),
+  reason: Type.String({ description: "Reason for decommissioning the agent" }),
+});
+
+const RestartGatewayParams = Type.Object({});
+
 // ---------------------------------------------------------------------------
 // flock_create_agent
 // ---------------------------------------------------------------------------
 
-export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: string, sessionKeyFromCtx?: string): ToolDefinition {
+export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: string, sessionKeyFromCtx?: string): AgentTool<typeof CreateAgentParams, Record<string, unknown>> {
   return {
     name: "flock_create_agent",
+    label: "Create Agent",
     description:
       "Create a new agent on the current node. Only orchestrator role agents can use this tool. " +
       "The agent will be registered in the A2A server, provisioned on disk, and persisted to config.",
-    parameters: {
-      type: "object",
-      required: ["newAgentId", "role"],
-      properties: {
-        newAgentId: {
-          type: "string",
-          description: "Unique agent ID for the new agent (alphanumeric, dash, underscore only)",
-        },
-        role: {
-          type: "string",
-          enum: ["worker", "sysadmin", "system", "orchestrator"],
-          description: "Agent role: worker, sysadmin, system, or orchestrator",
-        },
-        mutableLayer: {
-          type: "string",
-          description: "Layer 3 content (SOUL.md, IDENTITY.md, etc.) for prompt assembly",
-        },
-        archetype: {
-          type: "string",
-          description: "Archetype name to use as Layer 3 base (e.g. 'researcher', 'coder')",
-        },
-        model: {
-          type: "string",
-          description: "Primary model for this agent (e.g. 'anthropic/claude-opus-4-5', 'openai-codex/gpt-5.2', 'google-gemini-cli/gemini-3-flash-preview'). If omitted, the node default model is used.",
-        },
-        systemPrompt: {
-          type: "string",
-          description: "Full system prompt (overrides layer assembly if provided)",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, params, sessionKeyFromCtx);
+    parameters: CreateAgentParams,
+    async execute(_toolCallId: string, params: Static<typeof CreateAgentParams>): Promise<AgentToolResult<Record<string, unknown>>> {
+      // Widen params to allow runtime-injected fields (agentId, sessionKey, _callerAgentId)
+      const rawParams = params as Record<string, unknown>;
+      const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, rawParams, sessionKeyFromCtx);
       const newAgentId = typeof params.newAgentId === "string" ? params.newAgentId.trim() : "";
       const role = typeof params.role === "string" ? params.role.trim() : "";
       const archetype = typeof params.archetype === "string" ? params.archetype.trim() : "";
@@ -140,31 +135,31 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
 
       // Validate required params
       if (!newAgentId) {
-        return toOCResult({ ok: false, error: "newAgentId is required — the ID for the new agent to create." });
+        return toResult({ ok: false, error: "newAgentId is required — the ID for the new agent to create." });
       }
       if (newAgentId.startsWith("human:")) {
-        return toOCResult({ ok: false, error: "Agent IDs cannot start with 'human:' — this prefix is reserved for human participants." });
+        return toResult({ ok: false, error: "Agent IDs cannot start with 'human:' — this prefix is reserved for human participants." });
       }
       const validRoles = ["worker", "sysadmin", "system", "orchestrator"];
       if (!validRoles.includes(role)) {
-        return toOCResult({ ok: false, error: `role must be one of: ${validRoles.join(", ")}. Got: '${role}'` });
+        return toResult({ ok: false, error: `role must be one of: ${validRoles.join(", ")}. Got: '${role}'` });
       }
 
       // Validate ID format (path traversal protection)
       try {
         validateId(newAgentId, "newAgentId");
       } catch (err) {
-        return toOCResult({ ok: false, error: String(err) });
+        return toResult({ ok: false, error: String(err) });
       }
 
       // Authorization: only orchestrator agents can create agents
       if (!deps.a2aServer) {
-        return toOCResult({ ok: false, error: "A2A server not initialized." });
+        return toResult({ ok: false, error: "A2A server not initialized." });
       }
 
       if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["orchestrator"])) {
         const callerMeta = deps.a2aServer.getAgentMeta(callerAgentId);
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Permission denied: only orchestrator agents can create agents. Caller '${callerAgentId}' has role: ${callerMeta?.role ?? "unknown"}`,
         });
@@ -172,21 +167,18 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
 
       // Check agent doesn't already exist
       if (deps.a2aServer.hasAgent(newAgentId)) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Agent '${newAgentId}' already exists on this node. Use flock_discover to check existing agents.`,
         });
       }
 
-      // System prompts are now managed by OpenClaw natively via workspace files
-      // (AGENTS.md, SOUL.md, etc.). No need to inject them here.
-
       // Create gateway session send function
       if (!deps.config.gateway.token) {
-        return toOCResult({ ok: false, error: "Gateway token not configured. Cannot create agent session." });
+        return toResult({ ok: false, error: "Gateway token not configured. Cannot create agent session." });
       }
       if (!deps.logger) {
-        return toOCResult({ ok: false, error: "Logger not available. Cannot create gateway session send." });
+        return toResult({ ok: false, error: "Logger not available. Cannot create gateway session send." });
       }
 
       const sessionSend = createGatewaySessionSend({
@@ -232,10 +224,10 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
       // Gather co-resident agents for USER.md context
       const coResidentAgents = deps.a2aServer
         ? (deps.a2aServer.listAgentCards?.() ?? []).map((entry) => {
-            const meta = deps.a2aServer!.getAgentMeta(entry.agentId);
+            const entryMeta = deps.a2aServer!.getAgentMeta(entry.agentId);
             return {
               id: entry.agentId,
-              role: (meta?.role ?? "worker") as import("../transport/types.js").FlockAgentRole,
+              role: (entryMeta?.role ?? "worker") as import("../transport/types.js").FlockAgentRole,
               archetype: undefined as string | undefined,
             };
           })
@@ -273,8 +265,7 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
             if (systemPromptParam) entry.systemPrompt = systemPromptParam;
             flockConfig.gatewayAgents.push(entry);
 
-            // 2. Add to OpenClaw agents.list so the agent gets a proper session,
-            //    sandbox, and tool configuration as a first-class OpenClaw agent.
+            // 2. Add to OpenClaw agents.list
             if (!raw.agents) raw.agents = {};
             if (!Array.isArray(raw.agents.list)) raw.agents.list = [];
             const existsInAgentsList = raw.agents.list.some(
@@ -283,11 +274,6 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
             if (!existsInAgentsList) {
               const agentEntry: Record<string, unknown> = {
                 id: newAgentId,
-                // Explicit workspace path — OpenClaw resolves the default agent
-                // (agents.list[0]) to ~/.openclaw/workspace/ instead of
-                // ~/.openclaw/workspace-{id}/. Setting this explicitly ensures
-                // flock-provisioned workspace files (AGENTS.md, SOUL.md, etc.)
-                // are loaded into the system prompt correctly.
                 workspace: `~/.openclaw/workspace-${newAgentId}`,
                 tools: {
                   alsoAllow: ["group:plugins"],
@@ -306,9 +292,6 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
               if (model) {
                 agentEntry.model = { primary: model };
               }
-              // NOTE: docker.binds removed — OpenClaw config schema doesn't support
-              // a top-level "docker" key in agents.list entries. Bind mounts for
-              // sandbox mode should be configured via OpenClaw's native sandbox config.
               raw.agents.list.push(agentEntry);
             }
 
@@ -351,7 +334,7 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
         outputLines.push("", "### Warnings", ...warnings.map(w => `- ⚠️ ${w}`));
       }
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: outputLines.join("\n"),
         data: {
@@ -371,47 +354,36 @@ export function createCreateAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: str
 // flock_decommission_agent
 // ---------------------------------------------------------------------------
 
-export function createDecommissionAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: string, sessionKeyFromCtx?: string): ToolDefinition {
+export function createDecommissionAgentTool(deps: ToolDeps, callerAgentIdFromCtx?: string, sessionKeyFromCtx?: string): AgentTool<typeof DecommissionAgentParams, Record<string, unknown>> {
   return {
     name: "flock_decommission_agent",
+    label: "Decommission Agent",
     description:
       "Decommission (remove) an agent from the current node. Only orchestrator role agents can use this tool. " +
       "The agent will be unregistered from A2A, its home marked RETIRED, and removed from config.",
-    parameters: {
-      type: "object",
-      required: ["targetAgentId", "reason"],
-      properties: {
-        targetAgentId: {
-          type: "string",
-          description: "Agent ID to decommission",
-        },
-        reason: {
-          type: "string",
-          description: "Reason for decommissioning the agent",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, params, sessionKeyFromCtx);
+    parameters: DecommissionAgentParams,
+    async execute(_toolCallId: string, params: Static<typeof DecommissionAgentParams>): Promise<AgentToolResult<Record<string, unknown>>> {
+      const rawParams = params as Record<string, unknown>;
+      const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, rawParams, sessionKeyFromCtx);
       const targetAgentId = typeof params.targetAgentId === "string" ? params.targetAgentId.trim() : "";
       const reason = typeof params.reason === "string" ? params.reason.trim() : "";
 
       // Validate required params
       if (!targetAgentId) {
-        return toOCResult({ ok: false, error: "targetAgentId is required — the agent to decommission." });
+        return toResult({ ok: false, error: "targetAgentId is required — the agent to decommission." });
       }
       if (!reason) {
-        return toOCResult({ ok: false, error: "reason is required — explain why the agent is being decommissioned." });
+        return toResult({ ok: false, error: "reason is required — explain why the agent is being decommissioned." });
       }
 
       // Authorization: only orchestrator agents can decommission agents
       if (!deps.a2aServer) {
-        return toOCResult({ ok: false, error: "A2A server not initialized." });
+        return toResult({ ok: false, error: "A2A server not initialized." });
       }
 
       if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["orchestrator"])) {
         const callerMeta = deps.a2aServer.getAgentMeta(callerAgentId);
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Permission denied: only orchestrator agents can decommission agents. Caller '${callerAgentId}' has role: ${callerMeta?.role ?? "unknown"}`,
         });
@@ -419,7 +391,7 @@ export function createDecommissionAgentTool(deps: ToolDeps, callerAgentIdFromCtx
 
       // Check agent exists
       if (!deps.a2aServer.hasAgent(targetAgentId)) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Agent '${targetAgentId}' not found on this node.`,
         });
@@ -427,7 +399,7 @@ export function createDecommissionAgentTool(deps: ToolDeps, callerAgentIdFromCtx
 
       // Prevent self-decommissioning
       if (targetAgentId === callerAgentId) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: "Cannot decommission yourself. Another sysadmin agent must do this.",
         });
@@ -497,7 +469,7 @@ export function createDecommissionAgentTool(deps: ToolDeps, callerAgentIdFromCtx
         outputLines.push("", `⚠️ ${configWarning}`);
       }
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: outputLines.join("\n"),
         data: {
@@ -516,27 +488,26 @@ export function createDecommissionAgentTool(deps: ToolDeps, callerAgentIdFromCtx
 // flock_restart_gateway
 // ---------------------------------------------------------------------------
 
-export function createRestartGatewayTool(deps: ToolDeps, callerAgentIdFromCtx?: string, sessionKeyFromCtx?: string): ToolDefinition {
+export function createRestartGatewayTool(deps: ToolDeps, callerAgentIdFromCtx?: string, sessionKeyFromCtx?: string): AgentTool<typeof RestartGatewayParams, Record<string, unknown>> {
   return {
     name: "flock_restart_gateway",
+    label: "Restart Gateway",
     description:
       "Restart the gateway process. Only sysadmin role agents can use this tool. " +
       "Sends SIGUSR1 to trigger a graceful gateway restart.",
-    parameters: {
-      type: "object",
-      properties: {},
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, params, sessionKeyFromCtx);
+    parameters: RestartGatewayParams,
+    async execute(_toolCallId: string, params: Static<typeof RestartGatewayParams>): Promise<AgentToolResult<Record<string, unknown>>> {
+      const rawParams = params as Record<string, unknown>;
+      const callerAgentId = resolveCallerAgentId(callerAgentIdFromCtx, rawParams, sessionKeyFromCtx);
 
       // Authorization: sysadmin only (infrastructure operation)
       if (!deps.a2aServer) {
-        return toOCResult({ ok: false, error: "A2A server not initialized." });
+        return toResult({ ok: false, error: "A2A server not initialized." });
       }
 
       if (!isCallerPrivileged(callerAgentId, deps.a2aServer, ["sysadmin"])) {
         const callerMeta = deps.a2aServer.getAgentMeta(callerAgentId);
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Permission denied: only sysadmin agents can restart the gateway. Caller '${callerAgentId}' has role: ${callerMeta?.role ?? "unknown"}`,
         });
@@ -556,7 +527,7 @@ export function createRestartGatewayTool(deps: ToolDeps, callerAgentIdFromCtx?: 
       // Send SIGUSR1 to trigger gateway restart
       process.kill(process.pid, "SIGUSR1");
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Gateway restart signal (SIGUSR1) sent. The gateway will restart shortly.`,
         data: {
