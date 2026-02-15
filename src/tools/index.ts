@@ -92,7 +92,10 @@ function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined):
       // to avoid collisions with user-facing params like agentId (used as filter in flock_history).
       // Tools should read _callerAgentId first, then fall back to params.agentId.
       params._callerAgentId = resolvedId;
-      return tool.execute(toolCallId, params);
+      console.log(`[flock:tool-call] ${resolvedId} → ${tool.name}(${JSON.stringify(params)})`);
+      const result = await tool.execute(toolCallId, params);
+      console.log(`[flock:tool-call] ${resolvedId} ← ${tool.name}: ${JSON.stringify(result.details)}`);
+      return result;
     },
   };
 }
@@ -141,7 +144,6 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
 
   for (const tool of toolFactories) {
     api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-      console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
       return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
     });
   }
@@ -159,7 +161,6 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     });
     for (const tool of workspaceTools) {
       api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-        console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
         return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
       });
     }
@@ -1298,7 +1299,9 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
       }
 
       const now = Date.now();
-      const allMembers = [...new Set([callerAgentId, ...members])].filter(m => m !== "main" && m !== "unknown");
+      // Include the creator only if they're in the explicit members list.
+      // Orchestrators typically create channels without joining them.
+      const allMembers = [...new Set(members)].filter(m => m !== "main" && m !== "unknown");
 
       // Create the channel record
       deps.channelStore.insert({

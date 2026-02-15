@@ -89,21 +89,9 @@ Your sessions are **isolated by channel** — what you learn in `#project-loggin
 - Mistakes and corrections: what went wrong and how you fixed it
 
 **How to reference past work:**
-- Use `flock_channel_read` to review archived channels when you need past context.
+- Use `flock_channel_read` to review past channels when you need context.
 - Keep MEMORY.md organized by **topic** (not by channel). Future-you won't remember which channel a decision was made in, but you'll search by topic.
-- When you learn something in one channel that's relevant to your work elsewhere, record it immediately. Don't assume you'll remember.
-
-### Archive Protocol: Wrapping Up a Channel
-
-When an orchestrator starts the archive protocol on a channel, you'll see a system message announcing it. This is your signal to wrap up before the channel goes read-only.
-
-**Your checklist when archive starts:**
-1. **Review** — Read back through the channel history. What were the key decisions? What did you learn?
-2. **Record** — Write important learnings to your MEMORY.md. Be specific: "Structured clone has O(n) overhead for deeply nested objects — use manual serialization for hot paths" is useful. "Learned about cloning" is not.
-3. **Update your card** — If you gained new skills or experience, update your A2A Card via `flock_update_card`. This helps the orchestrator assign you to future projects where your experience is relevant.
-4. **Signal ready** — Call `flock_archive_ready` with the channelId. Once all agent members signal ready, the channel archives automatically.
-
-Don't rush the review. The protocol exists so you can extract lasting value from the work. A well-written MEMORY.md entry is worth more than finishing 30 seconds faster.
+- When you learn something that's relevant to your work elsewhere, record it immediately.
 
 ---
 
