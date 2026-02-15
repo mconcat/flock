@@ -231,9 +231,9 @@ function wrapToolsWithCallerId(tools: AgentTool<any>[], agentId: string, logger?
   return tools.map((tool) => ({
     ...tool,
     async execute(toolCallId: string, params: Record<string, unknown>) {
-      logger?.debug?.(`[flock:tool-call] ${agentId} → ${tool.name}(${JSON.stringify(params).slice(0, 500)})`);
+      logger?.info(`[flock:tool-call] ${agentId} → ${tool.name}(${JSON.stringify(params).slice(0, 500)})`);
       const result = await tool.execute(toolCallId, { ...params, _callerAgentId: agentId });
-      logger?.debug?.(`[flock:tool-call] ${agentId} ← ${tool.name}: ${JSON.stringify((result as Record<string, unknown>).details).slice(0, 300)}`);
+      logger?.info(`[flock:tool-call] ${agentId} ← ${tool.name}: ${JSON.stringify((result as Record<string, unknown>).details).slice(0, 300)}`);
       return result;
     },
   }));
@@ -369,7 +369,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       //   3. Nodes tool (node discovery)
       //   4. Lifecycle tools (agent create/decommission/restart)
       //   5. Triage decision tool
-      const flockTools = createFlockTools(toolDeps);
+      const flockTools = createFlockTools(toolDeps, role);
       const workspaceTools = toolDeps.vaultsBasePath
         ? createWorkspaceTools({ ...toolDeps, vaultsBasePath: toolDeps.vaultsBasePath })
         : [];

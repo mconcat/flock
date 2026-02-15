@@ -106,7 +106,7 @@ async function sendA2A(
 async function sendA2AWithRetry(
   agentId: string,
   text: string,
-  retryTimeoutMs = 60_000,
+  retryTimeoutMs = 120_000,
 ): Promise<{ status: number; body: Record<string, unknown> | null }> {
   let response: { status: number; body: Record<string, unknown> | null } = { status: 0, body: null };
   const deadline = Date.now() + retryTimeoutMs;

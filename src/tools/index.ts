@@ -302,31 +302,61 @@ const FlockBridgeParams = Type.Object({
  * Returns AgentTool[] ready for Agent.setTools().
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi-agent-core uses AgentTool<any>[] for heterogeneous tool arrays
-export function createFlockTools(deps: ToolDeps): AgentTool<any>[] {
-  return [
+/**
+ * Create Flock tools filtered by agent role.
+ *
+ * - **worker**: channel read/post/list, workspace, discover, message, sleep,
+ *   archive_ready, update_card, tasks, task_respond, history, status
+ * - **orchestrator**: all worker tools + channel_create, assign_members,
+ *   channel_archive, bridge, provision, lease
+ * - **sysadmin**: worker tools + sysadmin_protocol, sysadmin_request,
+ *   provision, audit, lease
+ */
+export function createFlockTools(deps: ToolDeps, role?: string): AgentTool<any>[] {
+  // Common tools available to all roles
+  const common: AgentTool<any>[] = [
     createStatusTool(deps),
-    createLeaseTool(deps),
-    createAuditTool(deps),
-    createProvisionTool(deps),
-    createSysadminProtocolTool(),
-    createSysadminRequestTool(deps),
     createMessageTool(deps),
-    createChannelCreateTool(deps),
     createChannelPostTool(deps),
     createChannelReadTool(deps),
     createChannelListTool(deps),
-    createAssignMembersTool(deps),
-    createChannelArchiveTool(deps),
-    createArchiveReadyTool(deps),
     createDiscoverTool(deps),
     createHistoryTool(deps),
+    createUpdateCardTool(deps),
+    createSleepTool(deps),
+    createArchiveReadyTool(deps),
     createTasksTool(deps),
     createTaskRespondTool(deps),
     createMigrateTool(deps),
-    createUpdateCardTool(deps),
-    createSleepTool(deps),
-    createBridgeTool(deps),
   ];
+
+  // Orchestrator-only: channel lifecycle, team assembly, bridges
+  const orchestratorOnly: AgentTool<any>[] = [
+    createChannelCreateTool(deps),
+    createAssignMembersTool(deps),
+    createChannelArchiveTool(deps),
+    createBridgeTool(deps),
+    createProvisionTool(deps),
+    createLeaseTool(deps),
+  ];
+
+  // Sysadmin-only: system protocol, audit, provisioning
+  const sysadminOnly: AgentTool<any>[] = [
+    createSysadminProtocolTool(),
+    createSysadminRequestTool(deps),
+    createProvisionTool(deps),
+    createAuditTool(deps),
+    createLeaseTool(deps),
+  ];
+
+  switch (role) {
+    case "orchestrator":
+      return [...common, ...orchestratorOnly];
+    case "sysadmin":
+      return [...common, ...sysadminOnly];
+    default: // worker
+      return common;
+  }
 }
 
 // ============================================================================
