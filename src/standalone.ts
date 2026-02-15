@@ -14,6 +14,8 @@
  */
 
 import type { Server } from "node:http";
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { loadFlockConfig, resolveFlockConfig, type FlockConfig } from "./config.js";
 import { createFlockLogger, type FlockLoggerOptions } from "./logger.js";
 import { createDatabase } from "./db/index.js";
@@ -30,13 +32,15 @@ import { createFlockExecutor, type SessionSendFn } from "./transport/executor.js
 import { createDirectSend } from "./transport/direct-send.js";
 import type { FlockAgentRole } from "./transport/types.js";
 import { createTriageDecisionTool } from "./sysadmin/triage-tool.js";
+import { WorkLoopScheduler } from "./loop/scheduler.js";
 import { NodeRegistry } from "./nodes/registry.js";
 import { SessionManager } from "./session/manager.js";
 import { startFlockHttpServer, stopFlockHttpServer, readJsonBody } from "./server.js";
-import { assembleAgentsMd } from "./prompts/assembler.js";
+import { assembleAgentsMd, loadSoulTemplate } from "./prompts/assembler.js";
 import { createFlockTools, type ToolDeps } from "./tools/index.js";
 import { createWorkspaceTools } from "./tools/workspace.js";
 import { createNodesTool } from "./nodes/tools.js";
+import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { PluginLogger } from "./types.js";
 import { EchoTracker, type BridgeDeps } from "./bridge/index.js";
 import { handleInbound } from "./bridge/inbound.js";
@@ -91,6 +95,33 @@ export interface StartFlockOptions {
   noHttp?: boolean;
   /** Discord bot token for standalone bridge. If set, enables Discord bridge. */
   discordBotToken?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Tool caller ID injection
+// ---------------------------------------------------------------------------
+
+/**
+ * Wrap tools to inject `_callerAgentId` into every tool call's params.
+ *
+ * Many Flock tools (channel_create, channel_post, sysadmin_request, etc.)
+ * read `_callerAgentId` from params to identify which agent made the call.
+ * In standalone mode, tools are shared across agents — this wrapper binds
+ * them to a specific caller so attribution and permissions work correctly.
+ *
+ * This is the standalone equivalent of the deleted `wrapToolWithAgentId()`.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- AgentTool<any> for heterogeneous arrays
+function wrapToolsWithCallerId(tools: AgentTool<any>[], agentId: string, logger?: PluginLogger): AgentTool<any>[] {
+  return tools.map((tool) => ({
+    ...tool,
+    async execute(toolCallId: string, params: Record<string, unknown>) {
+      logger?.debug?.(`[flock:tool-call] ${agentId} → ${tool.name}(${JSON.stringify(params).slice(0, 500)})`);
+      const result = await tool.execute(toolCallId, { ...params, _callerAgentId: agentId });
+      logger?.debug?.(`[flock:tool-call] ${agentId} ← ${tool.name}: ${JSON.stringify((result as Record<string, unknown>).details).slice(0, 300)}`);
+      return result;
+    },
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +182,17 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
   const sessionManager = new SessionManager(logger);
 
   // --- Tool deps ---
+  // --- Work Loop Scheduler ---
+  const scheduler = new WorkLoopScheduler({
+    agentLoop: db.agentLoop,
+    a2aClient,
+    channelMessages: db.channelMessages,
+    channelStore: db.channels,
+    audit,
+    logger,
+  });
+
+  // --- Tool deps ---
   const toolDeps: ToolDeps = {
     config,
     homes: homeManager,
@@ -165,6 +207,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     logger,
     vaultsBasePath: config.vaultsBasePath,
     agentLoop: db.agentLoop,
+    workLoopScheduler: scheduler,
   };
 
   // --- Register gateway agents ---
@@ -179,8 +222,15 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       let role: FlockAgentRole = agentDef?.role ?? "worker";
       if (config.orchestratorIds.includes(agentId)) role = "orchestrator";
 
-      // Assemble system prompt from Flock templates
-      const systemPrompt = assembleAgentsMd(role);
+      // Assemble system prompt from Flock templates:
+      //   AGENTS.md = base protocol + role-specific guidance
+      //   SOUL.md   = archetype personality/dispositions (optional)
+      const agentsMd = assembleAgentsMd(role);
+      const archetype = agentDef?.archetype;
+      const soulMd = archetype ? loadSoulTemplate(archetype) : null;
+      const systemPrompt = soulMd
+        ? `${agentsMd}\n\n---\n\n# SOUL.md\n\n${soulMd}`
+        : agentsMd;
 
       // Build tools for this agent:
       //   1. Flock standard tools (channels, discovery, tasks, messaging, etc.)
@@ -198,13 +248,17 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
         createStandaloneDecommissionAgentTool(toolDeps),
         createStandaloneRestartTool(toolDeps),
       ];
-      const tools = [
+      const allTools = [
         ...flockTools,
         ...workspaceTools,
         nodesTool,
         ...lifecycleTools,
         createTriageDecisionTool(),
       ];
+
+      // Inject _callerAgentId into all tool calls so tools know which
+      // agent is invoking them (for channel attribution, permissions, etc.)
+      const tools = wrapToolsWithCallerId(allTools, agentId, logger);
 
       // Model: per-agent config → fallback to default
       const model = agentDef?.model ?? "anthropic/claude-sonnet-4-20250514";
@@ -223,11 +277,17 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       if (config.orchestratorIds.includes(agent.id)) role = "orchestrator";
 
       const endpointUrl = `${baseUrl}/a2a/${agent.id}`;
+      const archetypeContent = agent.archetype ? loadSoulTemplate(agent.archetype) : null;
       const { card, meta } = role === "orchestrator"
         ? createOrchestratorCard(nodeId, endpointUrl, agent.id)
         : role === "sysadmin"
           ? createSysadminCard(nodeId, endpointUrl, agent.id)
-          : createWorkerCard(agent.id, nodeId, endpointUrl);
+          : createWorkerCard(
+              agent.id, nodeId, endpointUrl,
+              [], // skills — extracted from archetype if available
+              agent.archetype,
+              archetypeContent ?? undefined,
+            );
 
       const executor = createFlockExecutor({
         flockMeta: meta,
@@ -245,6 +305,9 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     }
 
     logger.info(`[flock:standalone] registered ${config.gatewayAgents.length} agent(s): ${config.gatewayAgents.map((a) => a.id).join(", ")}`);
+
+    // Start the work loop scheduler — ticks AWAKE agents periodically
+    scheduler.start();
   }
 
   // --- HTTP Server ---
@@ -337,17 +400,40 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     logger.info("[flock:standalone] Discord bridge configured");
   }
 
+  // --- PID file ---
+  const pidPath = opts?.config ? undefined : join(config.dataDir, "flock.pid");
+  if (pidPath) {
+    try {
+      mkdirSync(dirname(pidPath), { recursive: true });
+      writeFileSync(pidPath, String(process.pid), "utf-8");
+    } catch (e) {
+      logger.warn(`[flock:standalone] failed to write PID file: ${e}`);
+    }
+  }
+
   // --- Shutdown ---
+  let shuttingDown = false;
   const stop = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info("[flock:standalone] shutting down...");
+    scheduler.stop();
     echoTracker?.dispose();
     sessionManager.destroyAll();
     if (httpServer) {
       await stopFlockHttpServer(httpServer);
     }
     try { db.close(); } catch (e) { logger.warn(`[flock:standalone] db close error: ${e}`); }
+    if (pidPath) {
+      try { unlinkSync(pidPath); } catch { /* already gone */ }
+    }
     logger.info("[flock:standalone] shutdown complete");
   };
+
+  // --- Signal handling ---
+  const onSignal = () => { void stop().then(() => process.exit(0)); };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
 
   return {
     config,
