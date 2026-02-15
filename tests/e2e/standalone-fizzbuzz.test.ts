@@ -162,7 +162,7 @@ beforeAll(async () => {
     vaultsBasePath: vaultsDir,
     gateway: { port: httpPort - 1, token: "e2e-token" },
     gatewayAgents: [
-      { id: "orchestrator", role: "orchestrator", model: MODEL, archetype: "project-manager" },
+      { id: "orchestrator", role: "orchestrator", model: MODEL },
       { id: "coder", role: "worker", model: MODEL, archetype: "code-first-developer" },
     ],
   });

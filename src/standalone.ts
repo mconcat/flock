@@ -430,7 +430,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       a2aServer.registerAgent(agent.id, card, meta, executor);
 
       // Initialize agent loop state
-      const initialState = role === "sysadmin" ? "REACTIVE" as const : "AWAKE" as const;
+      const initialState = (role === "sysadmin" || role === "orchestrator") ? "REACTIVE" as const : "AWAKE" as const;
       db.agentLoop.init(agent.id, initialState);
     }
 

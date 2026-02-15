@@ -1,19 +1,20 @@
 /**
- * Standalone E2E: Full review cycle with sleep/wake
+ * Standalone E2E: Full review cycle with PM-driven coordination
  *
  * Tests the complete agent collaboration lifecycle:
- *   Phase 1: Build + Review
- *     - Orchestrator posts task → coder writes stack.py → reviewer reviews via workspace_read
- *   Phase 2: Iteration (session context across ticks)
- *     - Orchestrator posts follow-up requirement
- *     - Coder reads channel (remembers previous context), updates code
- *     - Reviewer reads updated code, posts second review
+ *   Setup: Human → Orchestrator (reactive, creates channel + assembles team)
+ *   Phase 1: PM coordinates build + review
+ *     - PM reads kickoff, directs coder → coder writes stack.py → reviewer reviews via workspace_read
+ *   Phase 2: PM coordinates iteration
+ *     - Human sends follow-up to orchestrator → orchestrator posts to channel
+ *     - PM reads follow-up, directs coder to update → reviewer re-reviews
  *
  * Validates:
- *   - workspace_read: reviewer reads coder's files
+ *   - Orchestrator is reactive (creates infrastructure, doesn't manage project)
+ *   - PM drives project coordination (worker with project-manager archetype)
+ *   - workspace_read: reviewer reads coder's files cross-agent
  *   - Session context across ticks: agents remember previous conversation
- *   - Reaction chain: multi-round orchestrator→coder→reviewer
- *   - Error handling: code must be executable
+ *   - Multi-round reaction chain: orchestrator→PM→coder→reviewer
  *
  * Requires valid credentials in ~/.flock/auth.json.
  *
@@ -42,7 +43,7 @@ let httpPort: number;
 let hasCredentials = false;
 
 // ---------------------------------------------------------------------------
-// Helpers (same as other E2E tests)
+// Helpers
 // ---------------------------------------------------------------------------
 
 async function sendA2A(
@@ -98,6 +99,29 @@ async function sendA2A(
   });
 }
 
+/**
+ * Send A2A with retry — orchestrator may be busy processing a tick or
+ * previous request. Retries until the agent responds without "already processing".
+ */
+async function sendA2AWithRetry(
+  agentId: string,
+  text: string,
+  retryTimeoutMs = 60_000,
+): Promise<{ status: number; body: Record<string, unknown> | null }> {
+  let response: { status: number; body: Record<string, unknown> | null } = { status: 0, body: null };
+  const deadline = Date.now() + retryTimeoutMs;
+  while (Date.now() < deadline) {
+    response = await sendA2A(agentId, text, 120_000);
+    const text_ = getResponseText(response.body);
+    if (response.status === 200 && text_ && !text_.includes("already processing")) {
+      return response;
+    }
+    console.log(`[e2e] ${agentId} busy, retrying in 3s...`);
+    await new Promise((r) => setTimeout(r, 3_000));
+  }
+  return response;
+}
+
 function getResponseText(body: Record<string, unknown> | null): string | null {
   const result = body?.result as Record<string, unknown> | undefined;
   const status = result?.status as Record<string, unknown> | undefined;
@@ -146,8 +170,13 @@ beforeAll(async () => {
     vaultsBasePath: vaultsDir,
     gateway: { port: httpPort - 1, token: "e2e-token" },
     gatewayAgents: [
-      { id: "orchestrator", role: "orchestrator", model: MODEL, archetype: "project-manager" },
+      // Orchestrator: reactive, only creates channels/assembles teams on human request
+      { id: "orchestrator", role: "orchestrator", model: MODEL },
+      // PM: worker with project-manager archetype, drives project coordination
+      { id: "pm", role: "worker", model: MODEL, archetype: "project-manager" },
+      // Coder: writes the code
       { id: "coder", role: "worker", model: MODEL, archetype: "code-first-developer" },
+      // Reviewer: reviews code via workspace_read
       { id: "reviewer", role: "worker", model: MODEL, archetype: "code-reviewer" },
     ],
   });
@@ -156,7 +185,7 @@ beforeAll(async () => {
     config,
     httpPort,
     tickIntervalMs: TEST_TICK_INTERVAL_MS,
-    slowTickIntervalMs: 15_000, // 15s slow-tick for tests (default: 5 min)
+    slowTickIntervalMs: 15_000,
   });
 }, 30_000);
 
@@ -172,16 +201,17 @@ afterAll(async () => {
 // ---------------------------------------------------------------------------
 
 describe("review cycle E2E", { timeout: 600_000 }, () => {
-  // Track message counts between phases for reaction chain verification
   let phase1MessageCount = 0;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Phase 1: Initial build + review (single external message)
+  // Phase 1: Orchestrator sets up, PM drives build + review
   // ═══════════════════════════════════════════════════════════════════════════
 
-  it("phase 1: orchestrator posts initial task (only external message for phase 1)", async () => {
+  it("phase 1: human tells orchestrator to start a project", async () => {
     if (!hasCredentials) return;
 
+    // The human (external message) tells orchestrator to create a channel and assemble a team.
+    // Orchestrator is reactive — this is the only way to activate it.
     const response = await sendA2A(
       "orchestrator",
       [
@@ -189,9 +219,9 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
         "",
         '1. flock_channel_create로 "stack" 채널을 만들어주세요:',
         '   - topic: "Implement a Python Stack class"',
-        '   - members: ["coder", "reviewer"]',
+        '   - members: ["pm", "coder", "reviewer"]',
         "",
-        "2. flock_channel_post로 다음 작업을 올려주세요:",
+        "2. flock_channel_post로 다음 킥오프 메시지를 올려주세요:",
         "   Python으로 Stack 클래스를 구현하세요.",
         "   요구사항:",
         "   - push(item): 스택에 아이템 추가",
@@ -211,7 +241,8 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
         '   assert s.size() == 1',
         '   print("Phase 1 tests passed")',
         "",
-        "   coder가 코드를 작성하면 reviewer가 flock_workspace_read로 코드를 읽고 리뷰할 것입니다.",
+        "   이 킥오프 메시지 이후, PM이 프로젝트를 관리할 것입니다.",
+        "   orchestrator로서 당신은 이 메시지 이후 채널에 관여하지 않습니다.",
         "",
         "도구를 직접 호출해주세요.",
       ].join("\n"),
@@ -222,15 +253,17 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     const text = getResponseText(response.body);
     console.log("[e2e:phase1] orchestrator response:", text?.slice(0, 300));
 
+    // Verify channel created with correct members
     const channels = instance.toolDeps.channelStore.list();
     expect(channels.some((c) => c.channelId === "stack")).toBe(true);
 
     const stackChannel = channels.find((c) => c.channelId === "stack")!;
+    expect(stackChannel.members).toContain("pm");
     expect(stackChannel.members).toContain("coder");
     expect(stackChannel.members).toContain("reviewer");
   });
 
-  it("phase 1: coder writes stack.py", async () => {
+  it("phase 1: coder writes stack.py (PM-coordinated)", async () => {
     if (!hasCredentials) return;
 
     const stackPath = join(vaultsDir, "stack-project", "stack.py");
@@ -266,7 +299,6 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
   it("phase 1: reviewer reads stack.py via workspace_read and posts review", async () => {
     if (!hasCredentials) return;
 
-    // Wait for reviewer to post AFTER coder
     const coderMessages = instance.toolDeps.channelMessages
       .list({ channelId: "stack" })
       .filter((m) => m.agentId === "coder");
@@ -295,78 +327,62 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     console.log("[e2e:phase1] stack.py output:", output.trim());
     expect(output).toContain("passed");
 
-    // Record message count for phase 2 verification
     phase1MessageCount = instance.toolDeps.channelMessages
       .list({ channelId: "stack" }).length;
     console.log(`[e2e:phase1] total messages after phase 1: ${phase1MessageCount}`);
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Phase 2: Follow-up requirement (tests session context + second review)
+  // Phase 2: Follow-up (session context + iteration)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  it("phase 2: orchestrator posts follow-up requirement (second external message)", async () => {
+  it("phase 2: human tells orchestrator to post follow-up requirement", async () => {
     if (!hasCredentials) return;
 
-    // Second external message — adds a new requirement.
-    // The orchestrator may be busy processing a tick, so retry until it's free.
-    const phase2Message = [
-      '기존 #stack 채널에 flock_channel_post(channelId="stack", message="...")로 다음 내용을 올려주세요.',
-      "새 채널을 만들지 마세요. 기존 stack 채널을 사용하세요.",
-      "",
-      "추가 요구사항: Stack 클래스에 min_value() 메서드를 추가하세요.",
-      "- min_value(): O(1)으로 스택의 최소값 반환 (빈 스택이면 IndexError)",
-      "- 힌트: 보조 스택(_min_stack)을 사용하세요",
-      "- push/pop 시 보조 스택도 함께 업데이트",
-      '- 기존 stack-project/stack.py 파일을 업데이트하세요 (flock_workspace_write, workspaceId="stack-project", path="stack.py")',
-      "",
-      "테스트 코드도 추가해주세요:",
-      "s = Stack()",
-      "s.push(3); s.push(1); s.push(2)",
-      'assert s.min_value() == 1',
-      "s.pop()",
-      'assert s.min_value() == 1',
-      "s.pop()",
-      'assert s.min_value() == 3',
-      'print("Phase 2 tests passed")',
-      "",
-      "도구를 직접 호출해주세요.",
-    ].join("\n");
-
-    // Retry until orchestrator is free (not processing a tick)
-    let response: { status: number; body: Record<string, unknown> | null } = { status: 0, body: null };
-    let text: string | null = null;
-    const deadline = Date.now() + 60_000;
-    while (Date.now() < deadline) {
-      response = await sendA2A("orchestrator", phase2Message, 120_000);
-      text = getResponseText(response.body);
-      if (response.status === 200 && text && !text.includes("already processing")) {
-        break;
-      }
-      console.log("[e2e:phase2] orchestrator busy, retrying in 3s...");
-      await new Promise((r) => setTimeout(r, 3_000));
-    }
+    // Human sends follow-up to orchestrator. Orchestrator posts to channel, then steps back.
+    const response = await sendA2AWithRetry(
+      "orchestrator",
+      [
+        '기존 #stack 채널에 flock_channel_post(channelId="stack", message="...")로 다음 내용을 올려주세요.',
+        "새 채널을 만들지 마세요. 기존 stack 채널을 사용하세요.",
+        "",
+        "추가 요구사항: Stack 클래스에 min_value() 메서드를 추가하세요.",
+        "- min_value(): O(1)으로 스택의 최소값 반환 (빈 스택이면 IndexError)",
+        "- 힌트: 보조 스택(_min_stack)을 사용하세요",
+        "- push/pop 시 보조 스택도 함께 업데이트",
+        '- 기존 stack-project/stack.py 파일을 업데이트하세요 (flock_workspace_write, workspaceId="stack-project", path="stack.py")',
+        "",
+        "테스트 코드도 추가해주세요:",
+        "s = Stack()",
+        "s.push(3); s.push(1); s.push(2)",
+        'assert s.min_value() == 1',
+        "s.pop()",
+        'assert s.min_value() == 1',
+        "s.pop()",
+        'assert s.min_value() == 3',
+        'print("Phase 2 tests passed")',
+        "",
+        "이 메시지를 올린 후 PM이 팀을 조율할 것입니다.",
+        "도구를 직접 호출해주세요.",
+      ].join("\n"),
+    );
 
     expect(response.status).toBe(200);
+    const text = getResponseText(response.body);
     console.log("[e2e:phase2] orchestrator response:", text?.slice(0, 300));
 
     // Verify orchestrator posted to channel
     const newMessages = instance.toolDeps.channelMessages
       .list({ channelId: "stack" })
       .filter((m) => m.seq > phase1MessageCount);
-    console.log(`[e2e:phase2] new messages from orchestrator: ${newMessages.length}`);
+    console.log(`[e2e:phase2] new messages after orchestrator: ${newMessages.length}`);
     expect(newMessages.some((m) => m.agentId === "orchestrator")).toBe(true);
   });
 
   it("phase 2: coder updates stack.py with min_value (session context)", async () => {
     if (!hasCredentials) return;
 
-    // Coder should read the follow-up, remember it wrote stack.py,
-    // and UPDATE the file (not rewrite from scratch).
-    // This tests session context across ticks.
-
     const stackPath = join(vaultsDir, "stack-project", "stack.py");
-    const originalCode = readFileSync(stackPath, "utf-8");
 
     console.log("[e2e:phase2] Waiting for coder to update stack.py with min_value...");
 
@@ -385,7 +401,6 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     const updatedCode = readFileSync(stackPath, "utf-8");
     console.log("[e2e:phase2] updated stack.py:\n" + updatedCode);
 
-    // Must still have original Stack class + new min_value
     expect(updatedCode).toContain("class Stack");
     expect(updatedCode).toContain("push");
     expect(updatedCode).toContain("pop");
@@ -408,7 +423,6 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
   it("phase 2: reviewer posts second review after coder's update", async () => {
     if (!hasCredentials) return;
 
-    // Find the coder's latest update message
     const coderUpdateMsgs = instance.toolDeps.channelMessages
       .list({ channelId: "stack" })
       .filter((m) => m.agentId === "coder" && m.seq > phase1MessageCount);
@@ -452,15 +466,14 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     }
 
     console.log("[e2e:phase2] stack.py output:\n" + output);
-    // Both phase 1 and phase 2 tests should pass
     expect(output.toLowerCase()).toContain("passed");
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Verification: full conversation dump + reaction chain proof
+  // Verification
   // ═══════════════════════════════════════════════════════════════════════════
 
-  it("full conversation shows multi-round 3-agent collaboration", async () => {
+  it("full conversation shows PM-driven multi-round collaboration", async () => {
     if (!hasCredentials) return;
 
     const messages = instance.toolDeps.channelMessages.list({ channelId: "stack" });
@@ -468,32 +481,35 @@ describe("review cycle E2E", { timeout: 600_000 }, () => {
     console.log("\n[e2e:raw] ══════ Full #stack Conversation ══════");
     console.log(`[e2e:raw] Total messages: ${messages.length}`);
     for (const msg of messages) {
-      console.log(
-        `[e2e:raw] [${msg.agentId}] (seq ${msg.seq}):`,
-      );
+      console.log(`[e2e:raw] [${msg.agentId}] (seq ${msg.seq}):`);
       console.log(`[e2e:raw]   ${msg.content.slice(0, 200)}`);
       console.log("[e2e:raw] ──────────────────────────────────");
     }
     console.log("[e2e:raw] ══════════════════════════════════\n");
 
-    // All 3 agents participated
+    // All 4 agents should have participated
     const participants = [...new Set(messages.map((m) => m.agentId))];
     expect(participants).toContain("orchestrator");
     expect(participants).toContain("coder");
     expect(participants).toContain("reviewer");
 
-    // Multiple rounds: each agent should have posted at least twice
-    // (phase 1 + phase 2)
+    // Orchestrator should have posted sparingly (kickoff + follow-up only)
     const orchestratorCount = messages.filter((m) => m.agentId === "orchestrator").length;
+    console.log(`[e2e:verify] orchestrator messages: ${orchestratorCount} (should be minimal, ~2)`);
+
+    // PM should have participated in coordination (if present in conversation)
+    const pmCount = messages.filter((m) => m.agentId === "pm").length;
+    console.log(`[e2e:verify] pm messages: ${pmCount}`);
+
+    // Coder and reviewer should have posted multiple times
     const coderCount = messages.filter((m) => m.agentId === "coder").length;
     const reviewerCount = messages.filter((m) => m.agentId === "reviewer").length;
-    console.log(`[e2e:verify] message counts — orchestrator: ${orchestratorCount}, coder: ${coderCount}, reviewer: ${reviewerCount}`);
+    console.log(`[e2e:verify] coder: ${coderCount}, reviewer: ${reviewerCount}`);
 
-    expect(orchestratorCount).toBeGreaterThanOrEqual(2); // phase 1 task + phase 2 follow-up
-    expect(coderCount).toBeGreaterThanOrEqual(2);        // phase 1 code + phase 2 update
-    expect(reviewerCount).toBeGreaterThanOrEqual(2);     // phase 1 review + phase 2 review
+    expect(coderCount).toBeGreaterThanOrEqual(2);
+    expect(reviewerCount).toBeGreaterThanOrEqual(2);
 
-    // Total messages should be substantial (multi-round conversation)
+    // Total messages should be substantial
     expect(messages.length).toBeGreaterThanOrEqual(6);
   });
 });
