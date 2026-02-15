@@ -214,7 +214,87 @@ function nixAgentPath(agentId: string): string {
 // Commands
 // ---------------------------------------------------------------------------
 
-async function cmdInit(): Promise<void> {
+async function cmdInit(args: string[]): Promise<void> {
+  if (args.includes("--standalone")) {
+    await cmdInitStandalone();
+    return;
+  }
+  await cmdInitOpenClaw();
+}
+
+/**
+ * Initialize Flock for standalone mode — no OpenClaw dependency.
+ * Generates ~/.flock/flock.json with direct pi-ai config.
+ */
+async function cmdInitStandalone(): Promise<void> {
+  console.log("Flock Standalone Initialization\n");
+
+  // Create directory structure
+  for (const dir of [FLOCK_HOME, DATA_DIR, path.join(FLOCK_HOME, "agents")]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  const standaloneConfigPath = path.join(FLOCK_HOME, "flock.json");
+  const existing = fs.existsSync(standaloneConfigPath)
+    ? JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8")) as Record<string, unknown>
+    : {} as Record<string, unknown>;
+
+  if (existing.gatewayAgents) {
+    const proceed = await promptYN("Config already exists. Reconfigure?", false);
+    if (!proceed) {
+      console.log("\nDone! Config preserved.");
+      return;
+    }
+  }
+
+  // Orchestrator model
+  const defaultModel = "anthropic/claude-sonnet-4-20250514";
+  const modelInput = await prompt(`Default model [${defaultModel}]: `);
+  const model = modelInput || defaultModel;
+
+  // Generate gateway token
+  let token = typeof existing.gateway === "object" && existing.gateway !== null
+    ? (existing.gateway as Record<string, unknown>).token as string | undefined ?? ""
+    : "";
+  if (!token) {
+    token = crypto.randomUUID().replace(/-/g, "");
+    console.log(`Generated token: ${token}`);
+  }
+
+  // Discord bot token (optional)
+  const discordInput = await prompt("Discord bot token (optional, press Enter to skip): ");
+
+  const config: Record<string, unknown> = {
+    ...existing,
+    dataDir: DATA_DIR,
+    dbBackend: "sqlite",
+    nodeId: "local",
+    topology: "peer",
+    gatewayAgents: existing.gatewayAgents ?? [
+      { id: "orchestrator", role: "orchestrator", model },
+      { id: "sysadmin", role: "sysadmin", model },
+    ],
+    gateway: {
+      port: 3779,
+      token,
+    },
+    vaultsBasePath: path.join(DATA_DIR, "vaults"),
+  };
+
+  if (discordInput) {
+    config.discordBotToken = discordInput;
+  }
+
+  fs.writeFileSync(standaloneConfigPath, JSON.stringify(config, null, 2), "utf-8");
+
+  console.log("\nFlock (standalone) initialized!");
+  console.log(`  Config: ${standaloneConfigPath}`);
+  console.log(`  Data:   ${DATA_DIR}`);
+  console.log("\nNext steps:");
+  console.log("  flock start --standalone");
+}
+
+async function cmdInitOpenClaw(): Promise<void> {
   console.log("Flock Initialization\n");
 
   // 1. Create directory structure
@@ -437,7 +517,83 @@ async function cmdInit(): Promise<void> {
   console.log("   3. Or run: flock add <agent-id> --role worker --model <model>");
 }
 
-async function cmdStart(): Promise<void> {
+async function cmdStart(args: string[]): Promise<void> {
+  const isStandalone = args.includes("--standalone");
+
+  if (isStandalone) {
+    await cmdStartStandalone();
+  } else {
+    await cmdStartOpenClaw();
+  }
+}
+
+/**
+ * Start Flock in standalone mode — direct pi-ai LLM calls, no OpenClaw.
+ * Uses ~/.flock/flock.json for config.
+ */
+async function cmdStartStandalone(): Promise<void> {
+  const existingPid = getGatewayPid();
+  if (existingPid) {
+    console.log(`Flock is already running (PID ${existingPid}).`);
+    return;
+  }
+
+  // Config: standalone uses ~/.flock/flock.json directly
+  const standaloneConfigPath = path.join(FLOCK_HOME, "flock.json");
+  if (!fs.existsSync(standaloneConfigPath)) {
+    console.error(`Standalone config not found: ${standaloneConfigPath}`);
+    console.error("Run 'flock init --standalone' or create flock.json manually.");
+    process.exit(1);
+  }
+
+  console.log("Starting Flock (standalone mode)...");
+
+  // Write PID file
+  fs.writeFileSync(PID_FILE, String(process.pid), "utf-8");
+
+  // Dynamic import to avoid loading pi-ai at CLI parse time
+  const { startFlock } = await import("../standalone.js");
+  const { loadFlockConfig } = await import("../config.js");
+
+  // Set env so loadFlockConfig finds the right file
+  process.env.FLOCK_CONFIG = standaloneConfigPath;
+  const config = loadFlockConfig();
+
+  // Extract Discord bot token from config (if present)
+  const rawConfig = JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8"));
+  const discordBotToken = typeof rawConfig.discordBotToken === "string"
+    ? rawConfig.discordBotToken
+    : undefined;
+
+  const instance = await startFlock({
+    config,
+    discordBotToken,
+    loggerOptions: { prefix: "flock", level: "info" },
+  });
+
+  console.log(`Flock running (standalone, PID ${process.pid})`);
+  console.log(`  Agents: ${config.gatewayAgents.map(a => a.id).join(", ") || "none"}`);
+  console.log(`  DB:     ${config.dbBackend}`);
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    console.log("\nShutting down...");
+    await instance.stop();
+    if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+
+  // Keep alive
+  await new Promise<void>(() => {});
+}
+
+/**
+ * Start Flock in OpenClaw plugin mode — legacy mode via bundled OpenClaw.
+ */
+async function cmdStartOpenClaw(): Promise<void> {
   requireInit();
 
   const existingPid = getGatewayPid();
@@ -451,7 +607,7 @@ async function cmdStart(): Promise<void> {
     ensureNixDaemon();
   }
 
-  console.log("Starting Flock gateway...");
+  console.log("Starting Flock gateway (OpenClaw mode)...");
 
   const child: ChildProcess = cpSpawn("node", ["openclaw.mjs", "gateway", "run"], {
     cwd: OPENCLAW_DIR,
@@ -703,26 +859,32 @@ function cmdList(): void {
 function cmdStatus(): void {
   console.log("Flock Status\n");
 
-  if (!isInitialized()) {
-    console.log("Not initialized — run 'flock init'");
+  const standaloneConfigPath = path.join(FLOCK_HOME, "flock.json");
+  const hasStandalone = fs.existsSync(standaloneConfigPath);
+  const hasOpenClaw = isInitialized();
+
+  if (!hasStandalone && !hasOpenClaw) {
+    console.log("Not initialized — run 'flock init' or 'flock init --standalone'");
     return;
   }
 
-  const config = loadConfig();
-  const flockConfig = getFlockConfig(config);
-  const inner = (flockConfig?.config ?? {}) as Record<string, unknown>;
+  // Mode
+  const mode = hasStandalone ? "standalone" : "openclaw-plugin";
+  console.log(`Mode:      ${mode}`);
 
-  // OpenClaw version
-  try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(OPENCLAW_DIR, "package.json"), "utf-8"));
-    console.log(`OpenClaw:  ${pkg.version}`);
-  } catch {
-    console.log("OpenClaw:  unknown");
+  // OpenClaw version (if available)
+  if (hasOpenClaw) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(OPENCLAW_DIR, "package.json"), "utf-8"));
+      console.log(`OpenClaw:  ${pkg.version}`);
+    } catch {
+      console.log("OpenClaw:  unknown");
+    }
   }
 
-  // Gateway status
+  // Process status
   const pid = getGatewayPid();
-  console.log(`Gateway:   ${pid ? `running (PID ${pid})` : "stopped"}`);
+  console.log(`Process:   ${pid ? `running (PID ${pid})` : "stopped"}`);
 
   // Nix daemon status
   if (fs.existsSync(NIX_COMPOSE)) {
@@ -731,28 +893,51 @@ function cmdStatus(): void {
   }
 
   // Config info
-  const agents = inner.gatewayAgents as Array<unknown> | undefined;
-  console.log(`Agents:    ${agents?.length ?? 0}`);
-  console.log(`Data dir:  ${inner.dataDir ?? DATA_DIR}`);
-  console.log(`Config:    ${CONFIG_PATH}`);
+  if (hasStandalone) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8"));
+      const agents = Array.isArray(raw.gatewayAgents) ? raw.gatewayAgents : [];
+      console.log(`Agents:    ${agents.length}`);
+      for (const a of agents) {
+        const id = typeof a === "string" ? a : a.id;
+        const role = typeof a === "object" ? a.role ?? "worker" : "worker";
+        console.log(`  - ${id} (${role})`);
+      }
+      console.log(`DB:        ${raw.dbBackend ?? "memory"}`);
+      console.log(`Config:    ${standaloneConfigPath}`);
+    } catch {
+      console.log(`Config:    ${standaloneConfigPath} (unreadable)`);
+    }
+  } else {
+    const config = loadConfig();
+    const flockConfig = getFlockConfig(config);
+    const inner = (flockConfig?.config ?? {}) as Record<string, unknown>;
+    const agents = inner.gatewayAgents as Array<unknown> | undefined;
+    console.log(`Agents:    ${agents?.length ?? 0}`);
+    console.log(`Data dir:  ${inner.dataDir ?? DATA_DIR}`);
+    console.log(`Config:    ${CONFIG_PATH}`);
+  }
+
   console.log(`Home:      ${FLOCK_HOME}`);
 }
 
 function showHelp(): void {
   console.log(`
-Flock CLI — Standalone multi-agent swarm orchestration
+Flock CLI — Multi-agent swarm orchestration
 
 Usage:
   flock <command> [options]
 
 Commands:
-  init                    Set up Flock (clones OpenClaw, builds, configures)
-  start                   Start the gateway
-  stop                    Stop the gateway
+  init                    Set up Flock (OpenClaw plugin mode)
+  init --standalone       Set up Flock (standalone, no OpenClaw)
+  start                   Start gateway (OpenClaw plugin mode)
+  start --standalone      Start Flock directly (pi-ai, no OpenClaw)
+  stop                    Stop the running process
   update                  Update bundled OpenClaw to latest
   add <id> [options]      Add a new agent
     --role <role>         Agent role (worker, sysadmin, orchestrator)
-    --model <model>       Model to use (e.g., anthropic/claude-opus-4-5)
+    --model <model>       Model to use (e.g., anthropic/claude-sonnet-4-20250514)
     --archetype <name>    Archetype template (e.g., code-reviewer, qa)
   remove <id>             Remove an agent
   list                    List configured agents
@@ -760,12 +945,17 @@ Commands:
   help                    Show this help message
 
 Examples:
+  # Standalone mode (recommended for new setups)
+  flock init --standalone
+  flock start --standalone
+
+  # OpenClaw plugin mode (legacy)
   flock init
   flock start
-  flock add dev-code --model anthropic/claude-sonnet-4-5 --archetype code-first-developer
-  flock add reviewer --archetype code-reviewer
+
+  # Agent management
+  flock add dev-code --model anthropic/claude-sonnet-4-20250514 --role worker
   flock list
-  flock stop
 `);
 }
 
@@ -779,10 +969,10 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "init":
-      await cmdInit();
+      await cmdInit(args.slice(1));
       break;
     case "start":
-      await cmdStart();
+      await cmdStart(args.slice(1));
       break;
     case "stop":
       cmdStop();

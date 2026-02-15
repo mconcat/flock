@@ -1,5 +1,9 @@
 /**
- * Flock — Agent Swarm Orchestration Plugin for Clawdbot
+ * Flock — Agent Swarm Orchestration
+ *
+ * Two operation modes:
+ *   1. Plugin mode:     register(api) — runs as OpenClaw plugin (legacy)
+ *   2. Standalone mode: startFlock(opts) — runs independently with pi-ai/pi-agent-core
  *
  * Provides:
  * - Home state machine (UNASSIGNED → ... → ACTIVE → FROZEN → ...)
@@ -12,6 +16,15 @@
  */
 
 import type { PluginApi } from "./types.js";
+
+// Re-export standalone runtime for direct use
+export { startFlock, type FlockInstance, type StartFlockOptions } from "./standalone.js";
+export { SessionManager, type AgentSessionConfig } from "./session/manager.js";
+export { createDirectSend } from "./transport/direct-send.js";
+export { createFlockLogger, type FlockLoggerOptions } from "./logger.js";
+export { loadFlockConfig, resolveFlockConfig, type FlockConfig } from "./config.js";
+export { toAgentTool, toAgentTools } from "./tool-adapter.js";
+export { startFlockHttpServer, stopFlockHttpServer } from "./server.js";
 import { createDatabase } from "./db/index.js";
 import { createHomeManager } from "./homes/manager.js";
 import { createHomeProvisioner } from "./homes/provisioner.js";
