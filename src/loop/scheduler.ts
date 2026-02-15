@@ -51,6 +51,8 @@ export interface WorkLoopSchedulerDeps {
   channelStore: ChannelStore;
   audit: AuditLog;
   logger: PluginLogger;
+  /** Override the base tick interval (ms). Default: 60_000. */
+  tickIntervalMs?: number;
 }
 
 export class WorkLoopScheduler {
@@ -67,8 +69,12 @@ export class WorkLoopScheduler {
   /** Track last slow-tick time per SLEEP agent (in-memory, not persisted). */
   private lastSlowTickAt = new Map<string, number>();
 
+  /** Effective tick interval (configurable for tests). */
+  private readonly tickIntervalMs: number;
+
   constructor(deps: WorkLoopSchedulerDeps) {
     this.deps = deps;
+    this.tickIntervalMs = deps.tickIntervalMs ?? TICK_INTERVAL_MS;
   }
 
   /**
@@ -79,11 +85,12 @@ export class WorkLoopScheduler {
     this.running = true;
 
     // Check interval: half the base interval for responsive jitter handling
-    const checkInterval = TICK_INTERVAL_MS / 2;
+    const checkInterval = this.tickIntervalMs / 2;
     this.timer = setInterval(() => void this.tick(), checkInterval);
 
+    const jitterMax = Math.min(TICK_JITTER_MS, Math.floor(this.tickIntervalMs / 6));
     this.deps.logger.info(
-      `[flock:loop] Work loop scheduler started (interval: ${TICK_INTERVAL_MS / 1000}s ± ${TICK_JITTER_MS / 1000}s)`,
+      `[flock:loop] Work loop scheduler started (interval: ${this.tickIntervalMs / 1000}s ± ${jitterMax / 1000}s)`,
     );
   }
 
@@ -111,8 +118,14 @@ export class WorkLoopScheduler {
     const awakeAgents = this.deps.agentLoop.listByState("AWAKE");
     const dueAwake: AgentLoopRecord[] = [];
     for (const agent of awakeAgents) {
+      // Skip agents with no tracked channels — they haven't been assigned
+      // to any project yet, so ticking them wastes an LLM call.
+      const trackedChannels = this.agentChannelSeqs.get(agent.agentId);
+      if (!trackedChannels || trackedChannels.size === 0) {
+        continue;
+      }
       const jitter = this.getAgentJitter(agent.agentId);
-      const nextTickAt = agent.lastTickAt + TICK_INTERVAL_MS + jitter;
+      const nextTickAt = agent.lastTickAt + this.tickIntervalMs + jitter;
       if (now >= nextTickAt) {
         dueAwake.push(agent);
       }
@@ -192,15 +205,31 @@ export class WorkLoopScheduler {
 
     for (let attempt = 0; attempt <= TICK_MAX_RETRIES; attempt++) {
       try {
-        await a2aClient.sendA2A(agent.agentId, {
+        const result = await a2aClient.sendA2A(agent.agentId, {
           message: userMessage(tickMessage, [
             dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
           ]),
         });
+
+        // If the agent was busy (executor caught the error), skip gracefully.
+        if (result.state === "failed" && result.response.includes("already processing")) {
+          logger.debug?.(`[flock:loop] Agent "${agent.agentId}" busy — skipping tick`);
+          this.consecutiveFailures.delete(agent.agentId);
+          return;
+        }
+
         delivered = true;
         break;
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
+
+        // If the agent is already processing a prompt, skip gracefully.
+        if (errorMsg.includes("already processing")) {
+          logger.debug?.(`[flock:loop] Agent "${agent.agentId}" busy — skipping tick`);
+          this.consecutiveFailures.delete(agent.agentId);
+          return;
+        }
+
         logger.warn(`[flock:loop] Tick attempt ${attempt + 1}/${TICK_MAX_RETRIES + 1} failed for "${agent.agentId}": ${errorMsg}`);
 
         if (attempt < TICK_MAX_RETRIES) {
@@ -455,8 +484,7 @@ export class WorkLoopScheduler {
       this.agentChannelSeqs.set(agentId, new Map());
     }
     const seqs = this.agentChannelSeqs.get(agentId)!;
-    const existing = seqs.get(channelId) ?? 0;
-    if (currentSeq > existing) {
+    if (!seqs.has(channelId) || currentSeq > seqs.get(channelId)!) {
       seqs.set(channelId, currentSeq);
     }
   }
@@ -485,7 +513,9 @@ export class WorkLoopScheduler {
 
   /**
    * Deterministic per-agent jitter based on agent ID hash.
-   * Returns a value in [-TICK_JITTER_MS, +TICK_JITTER_MS].
+   * Returns a value in [-jitterMax, +jitterMax].
+   * Jitter scales with tickIntervalMs — capped at 1/6 of interval to prevent
+   * jitter exceeding interval length.
    */
   private getAgentJitter(agentId: string): number {
     let hash = 0;
@@ -494,6 +524,8 @@ export class WorkLoopScheduler {
     }
     // Normalize to [-1, 1] range
     const normalized = (hash % 1000) / 1000;
-    return Math.floor(normalized * TICK_JITTER_MS);
+    // Jitter max: TICK_JITTER_MS for default interval, but never more than 1/6 of interval
+    const jitterMax = Math.min(TICK_JITTER_MS, Math.floor(this.tickIntervalMs / 6));
+    return Math.floor(normalized * jitterMax);
   }
 }

@@ -3,9 +3,12 @@
  *
  * Tests the FULL standalone pipeline with real LLM calls through A2A HTTP:
  *   1. Boot Flock standalone with HTTP server (no OpenClaw)
- *   2. Send A2A message to orchestrator → creates project channel + posts task
- *   3. Send A2A tick to coder → reads channel, writes FizzBuzz to workspace
+ *   2. Send ONE A2A message to orchestrator → creates project channel + posts task
+ *   3. WorkLoopScheduler auto-ticks coder → reads channel, writes FizzBuzz to workspace
  *   4. Verify: channel exists, workspace file, correct FizzBuzz output
+ *
+ * Only ONE message is sent externally. Everything else is driven by the
+ * WorkLoopScheduler's automatic tick cycle (tickIntervalMs set to 5s for tests).
  *
  * NO mocks, NO fallbacks, NO hardcoded system prompts.
  * System prompts come from production templates (assembleAgentsMd).
@@ -27,6 +30,15 @@ import { createApiKeyResolver } from "../../src/auth/resolver.js";
 
 const MODEL = "anthropic/claude-sonnet-4-20250514";
 const getApiKey = createApiKeyResolver();
+
+/** Tick interval for tests — fast enough for E2E, slow enough to avoid races. */
+const TEST_TICK_INTERVAL_MS = 5_000;
+
+/** Max time to wait for coder to complete work via auto-tick. */
+const CODER_POLL_TIMEOUT_MS = 120_000;
+
+/** Poll interval when checking for coder's work completion. */
+const POLL_INTERVAL_MS = 2_000;
 
 let instance: FlockInstance;
 let vaultsDir: string;
@@ -109,6 +121,23 @@ function getResponseText(body: Record<string, unknown> | null): string | null {
     .join("") || null;
 }
 
+/**
+ * Poll until a condition is met or timeout.
+ * Returns true if condition was met, false on timeout.
+ */
+async function pollUntil(
+  condition: () => boolean,
+  timeoutMs: number,
+  intervalMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return condition(); // Final check
+}
+
 // ---------------------------------------------------------------------------
 // Setup / Teardown
 // ---------------------------------------------------------------------------
@@ -138,7 +167,11 @@ beforeAll(async () => {
     ],
   });
 
-  instance = await startFlock({ config, httpPort });
+  instance = await startFlock({
+    config,
+    httpPort,
+    tickIntervalMs: TEST_TICK_INTERVAL_MS,
+  });
 }, 30_000);
 
 afterAll(async () => {
@@ -176,12 +209,11 @@ describe("standalone fizzbuzz E2E", { timeout: 300_000 }, () => {
     expect(agentIds).toContain("coder");
   });
 
-  it("orchestrator creates channel and posts the fizzbuzz task", async () => {
+  it("orchestrator creates channel and posts the fizzbuzz task (only external message)", async () => {
     if (!hasCredentials) return;
 
-    // Send A2A message to orchestrator — production system prompt is used
-    // automatically by resolveAgentConfig → assembleAgentsMd("orchestrator").
-    // The orchestrator decides autonomously which tools to call.
+    // This is the ONLY external A2A message sent in the entire test.
+    // After this, the WorkLoopScheduler auto-ticks the coder.
     const response = await sendA2A(
       "orchestrator",
       [
@@ -239,69 +271,66 @@ describe("standalone fizzbuzz E2E", { timeout: 300_000 }, () => {
     expect(messages[0].agentId).toBe("orchestrator");
   });
 
-  it("coder reads channel and writes fizzbuzz.py to workspace", async () => {
+  it("coder auto-ticked by WorkLoopScheduler writes fizzbuzz.py to workspace", async () => {
     if (!hasCredentials) return;
 
-    // Build a tick message that mirrors what WorkLoopScheduler.buildTickMessage()
-    // would produce. Includes any channel messages that exist, plus the channel
-    // topic as context.
+    // NO manual message to coder. The WorkLoopScheduler (running at 5s intervals)
+    // will detect that coder is AWAKE, build a tick message with new channel
+    // activity from #fizzbuzz, and send it via A2A automatically.
     //
-    // NOTE: WorkLoopScheduler is not yet wired into standalone.ts.
-    // This tick is manually sent via A2A HTTP — same transport the
-    // scheduler uses internally via a2aClient.sendA2A.
-    const channelMessages = instance.toolDeps.channelMessages.list({ channelId: "fizzbuzz" });
-    const fizzChannel = instance.toolDeps.channelStore.get("fizzbuzz");
-    const topic = fizzChannel?.topic ?? "FizzBuzz project";
+    // We just poll until the coder has written the file.
 
-    const tickLines: string[] = [
-      "[Work Loop Tick]",
-      "State: AWAKE (0m)",
-      "",
-    ];
+    const fizzbuzzPath = join(vaultsDir, "fizzbuzz-project", "fizzbuzz.py");
 
-    if (channelMessages.length > 0) {
-      tickLines.push("--- New Channel Activity ---");
-      tickLines.push(`#fizzbuzz — ${topic} (${channelMessages.length} new):`);
-      for (const msg of channelMessages) {
-        tickLines.push(`  [${msg.agentId}]: ${msg.content.slice(0, 300)}`);
-      }
-      tickLines.push("--- End Channel Activity ---");
-    } else {
-      // No messages posted yet — include the channel topic as context.
-      // In production, the scheduler would show "No new channel activity"
-      // but the agent can still read channels using flock_channel_read.
-      tickLines.push("--- New Channels ---");
-      tickLines.push(`#fizzbuzz — ${topic} (you are a member)`);
-      tickLines.push("--- End New Channels ---");
-    }
+    console.log("[e2e:coder] Waiting for WorkLoopScheduler to auto-tick coder...");
+    console.log(`[e2e:coder] Tick interval: ${TEST_TICK_INTERVAL_MS / 1000}s, poll timeout: ${CODER_POLL_TIMEOUT_MS / 1000}s`);
 
-    tickLines.push("");
-    tickLines.push(
-      "Continue your work. Read the #fizzbuzz channel using flock_channel_read " +
-      "for your task details, then complete the work.",
+    const fileWritten = await pollUntil(
+      () => existsSync(fizzbuzzPath),
+      CODER_POLL_TIMEOUT_MS,
+      POLL_INTERVAL_MS,
     );
 
-    const response = await sendA2A("coder", tickLines.join("\n"), 120_000);
+    if (!fileWritten) {
+      // Dump diagnostic info before failing
+      const channels = instance.toolDeps.channelStore.list();
+      const messages = instance.toolDeps.channelMessages.list({ channelId: "fizzbuzz" });
+      console.error("[e2e:coder] TIMEOUT — fizzbuzz.py was not written");
+      console.error("[e2e:coder] Channels:", JSON.stringify(channels.map((c) => c.channelId)));
+      console.error("[e2e:coder] Messages:", messages.length);
+      for (const msg of messages) {
+        console.error(`  [${msg.agentId}] (seq ${msg.seq}): ${msg.content.slice(0, 200)}`);
+      }
+    }
 
-    console.log("[e2e:coder] HTTP status:", response.status);
-    const text = getResponseText(response.body);
-    console.log("[e2e:coder] response:", text?.slice(0, 500));
-
-    expect(response.status).toBe(200);
-    expect(text).toBeDefined();
-
-    // Verify file was written to workspace
-    const fizzbuzzPath = join(vaultsDir, "fizzbuzz-project", "fizzbuzz.py");
-    console.log("[e2e:verify] checking workspace path:", fizzbuzzPath);
-    expect(existsSync(fizzbuzzPath)).toBe(true);
+    expect(fileWritten).toBe(true);
 
     const code = readFileSync(fizzbuzzPath, "utf-8");
-    console.log("[e2e:verify] fizzbuzz.py:\n" + code);
+    console.log("[e2e:verify] fizzbuzz.py (written by auto-ticked coder):\n" + code);
 
     expect(code).toContain("Fizz");
     expect(code).toContain("Buzz");
     expect(code).toContain("FizzBuzz");
     expect(code.length).toBeGreaterThan(50);
+
+    // Wait for coder to post completion message to the channel.
+    // The coder might write the file first and then post — poll for the post.
+    console.log("[e2e:coder] Waiting for coder to post to channel...");
+    const coderPosted = await pollUntil(
+      () => instance.toolDeps.channelMessages
+        .list({ channelId: "fizzbuzz" })
+        .some((m) => m.agentId === "coder"),
+      60_000,
+      POLL_INTERVAL_MS,
+    );
+
+    const messages = instance.toolDeps.channelMessages.list({ channelId: "fizzbuzz" });
+    const coderMessages = messages.filter((m) => m.agentId === "coder");
+    console.log(`[e2e:verify] coder channel messages: ${coderMessages.length}`);
+    if (!coderPosted) {
+      console.warn("[e2e:coder] Coder wrote fizzbuzz.py but did not post to channel (may still be processing)");
+    }
+    expect(coderMessages.length).toBeGreaterThanOrEqual(1);
   });
 
   it("fizzbuzz.py produces correct output", async () => {

@@ -1303,6 +1303,14 @@ function createChannelCreateTool(deps: ToolDeps): AgentTool<typeof FlockChannelC
       // SLEEP members are NOT auto-woken — they will discover new channels
       // via slow-tick polling and self-wake if they find the topic relevant.
 
+      // Track channel participation for ALL members (even without initial message).
+      // Members start at seq 0 so any future messages show as new activity.
+      if (deps.workLoopScheduler) {
+        for (const member of allMembers) {
+          deps.workLoopScheduler.trackChannel(member, channelId, 0);
+        }
+      }
+
       let messageCount = 0;
 
       // Post first message if provided
@@ -1315,11 +1323,9 @@ function createChannelCreateTool(deps: ToolDeps): AgentTool<typeof FlockChannelC
         });
         messageCount = 1;
 
-        // Track channel participation for work loop
+        // Update the poster's seq — they've already "seen" their own message.
         if (deps.workLoopScheduler) {
-          for (const member of allMembers) {
-            deps.workLoopScheduler.trackChannel(member, channelId, seq);
-          }
+          deps.workLoopScheduler.trackChannel(callerAgentId, channelId, seq);
         }
       }
 

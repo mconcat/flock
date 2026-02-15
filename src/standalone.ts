@@ -96,6 +96,8 @@ export interface StartFlockOptions {
   noHttp?: boolean;
   /** Discord bot token for standalone bridge. If set, enables Discord bridge. */
   discordBotToken?: string;
+  /** Override work loop tick interval (ms). Default: 60_000. Useful for tests. */
+  tickIntervalMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +303,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     channelStore: db.channels,
     audit,
     logger,
+    tickIntervalMs: opts?.tickIntervalMs,
   });
 
   // --- Tool deps ---
