@@ -98,6 +98,8 @@ export interface StartFlockOptions {
   discordBotToken?: string;
   /** Override work loop tick interval (ms). Default: 60_000. Useful for tests. */
   tickIntervalMs?: number;
+  /** Override slow-tick interval for SLEEP agents (ms). Default: 300_000. Useful for tests. */
+  slowTickIntervalMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +306,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     audit,
     logger,
     tickIntervalMs: opts?.tickIntervalMs,
+    slowTickIntervalMs: opts?.slowTickIntervalMs,
   });
 
   // --- Tool deps ---

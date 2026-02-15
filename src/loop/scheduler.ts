@@ -53,6 +53,8 @@ export interface WorkLoopSchedulerDeps {
   logger: PluginLogger;
   /** Override the base tick interval (ms). Default: 60_000. */
   tickIntervalMs?: number;
+  /** Override the slow-tick interval for SLEEP agents (ms). Default: 300_000. */
+  slowTickIntervalMs?: number;
 }
 
 export class WorkLoopScheduler {
@@ -72,9 +74,13 @@ export class WorkLoopScheduler {
   /** Effective tick interval (configurable for tests). */
   private readonly tickIntervalMs: number;
 
+  /** Effective slow-tick interval for SLEEP agents (configurable for tests). */
+  private readonly slowTickIntervalMs: number;
+
   constructor(deps: WorkLoopSchedulerDeps) {
     this.deps = deps;
     this.tickIntervalMs = deps.tickIntervalMs ?? TICK_INTERVAL_MS;
+    this.slowTickIntervalMs = deps.slowTickIntervalMs ?? SLOW_TICK_INTERVAL_MS;
   }
 
   /**
@@ -138,7 +144,7 @@ export class WorkLoopScheduler {
       const lastSlow = this.lastSlowTickAt.get(agent.agentId) ?? 0;
       const jitter = this.getAgentJitter(agent.agentId);
       const slowJitter = Math.floor((jitter / TICK_JITTER_MS) * SLOW_TICK_JITTER_MS);
-      const nextSlowTickAt = lastSlow + SLOW_TICK_INTERVAL_MS + slowJitter;
+      const nextSlowTickAt = lastSlow + this.slowTickIntervalMs + slowJitter;
       if (now >= nextSlowTickAt) {
         dueSleep.push(agent);
       }
