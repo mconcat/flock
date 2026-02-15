@@ -34,7 +34,6 @@ import { NodeRegistry } from "./nodes/registry.js";
 import { SessionManager } from "./session/manager.js";
 import { startFlockHttpServer, stopFlockHttpServer, readJsonBody } from "./server.js";
 import { assembleAgentsMd } from "./prompts/assembler.js";
-import { toAgentTool } from "./tool-adapter.js";
 import type { ToolDeps } from "./tools/index.js";
 import type { PluginLogger } from "./types.js";
 import { EchoTracker, type BridgeDeps } from "./bridge/index.js";
@@ -180,12 +179,13 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       const systemPrompt = assembleAgentsMd(role);
 
       // Build tools for this agent (lifecycle + triage)
+      // These already return AgentTool<T> — no adapter needed
       const tools = [
         createTriageDecisionTool(),
         createStandaloneCreateAgentTool(toolDeps, sessionSend),
         createStandaloneDecommissionAgentTool(toolDeps),
         createStandaloneRestartTool(toolDeps),
-      ].map(toAgentTool);
+      ];
 
       // Model: per-agent config → fallback to default
       const model = agentDef?.model ?? "anthropic/claude-sonnet-4-20250514";

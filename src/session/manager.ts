@@ -36,7 +36,8 @@ export interface AgentSessionConfig {
   /** System prompt assembled by Flock's prompt assembler. */
   systemPrompt: string;
   /** Tools available to this agent. */
-  tools: AgentTool[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi-agent-core uses AgentTool<any>[] for heterogeneous tool arrays (see AgentContext.tools)
+  tools: AgentTool<any>[];
   /** Thinking/reasoning level. Default: "off". */
   thinkingLevel?: ThinkingLevel;
   /** API key resolver. If not set, uses environment variables. */
