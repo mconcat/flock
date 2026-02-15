@@ -71,6 +71,17 @@ export function createApiKeyResolver(
       const cred = store.credentials[oauthId];
       if (!cred) continue;
 
+      // Static token: has access but no refresh capability
+      // (e.g., API keys stored as OAuthCredentials with empty refresh)
+      const hasRefresh = typeof cred.refresh === "string" && cred.refresh.length > 0;
+      const hasAccess = typeof cred.access === "string" && cred.access.length > 0;
+
+      if (!hasRefresh && hasAccess) {
+        // No refresh token — treat access as a static API key
+        return cred.access;
+      }
+
+      // OAuth flow: refresh expired tokens via pi-ai
       try {
         const result = await getOAuthApiKey(oauthId, { [oauthId]: cred });
         if (result) {
@@ -86,7 +97,8 @@ export function createApiKeyResolver(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger?.warn(`[flock:auth] OAuth key resolution failed for ${oauthId}: ${message}`);
-        // Fall through to next candidate or env var
+        // If OAuth refresh failed but we have an access token, try it directly
+        if (hasAccess) return cred.access;
       }
     }
 

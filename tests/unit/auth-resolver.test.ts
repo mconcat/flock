@@ -110,10 +110,33 @@ describe("Auth Resolver", () => {
     expect(mockGetOAuthApiKey).not.toHaveBeenCalled();
   });
 
-  it("falls back to env var when OAuth fails", async () => {
+  it("uses access token directly when OAuth refresh fails", async () => {
     writeFileSync(storePath, JSON.stringify({
       version: 1,
       credentials: { anthropic: sampleCred },
+    }));
+
+    mockGetOAuthApiKey.mockRejectedValueOnce(new Error("Token refresh failed"));
+
+    const resolve = createApiKeyResolver({ storePath, logger: mockLogger });
+    const key = await resolve("anthropic");
+
+    // When OAuth refresh fails but access token exists, use it directly
+    expect(key).toBe(sampleCred.access);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Token refresh failed"),
+    );
+  });
+
+  it("falls back to env var when no access token and OAuth fails", async () => {
+    const noAccessCred: OAuthCredentials = {
+      refresh: "rt_test",
+      access: "",
+      expires: Date.now() + 3600_000,
+    };
+    writeFileSync(storePath, JSON.stringify({
+      version: 1,
+      credentials: { anthropic: noAccessCred },
     }));
 
     mockGetOAuthApiKey.mockRejectedValueOnce(new Error("Token refresh failed"));
@@ -123,9 +146,6 @@ describe("Auth Resolver", () => {
     const key = await resolve("anthropic");
 
     expect(key).toBe("env-fallback-key");
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("Token refresh failed"),
-    );
   });
 
   it("returns undefined when no credentials and no env var", async () => {
