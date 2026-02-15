@@ -74,6 +74,8 @@ export interface FlockInstance {
   bridgeDeps?: BridgeDeps;
   /** Logger instance. */
   logger: PluginLogger;
+  /** Tool dependencies (for building tools outside the boot path). */
+  toolDeps: ToolDeps;
   /** Graceful shutdown. */
   stop: () => Promise<void>;
 }
@@ -354,6 +356,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     a2aServer,
     bridgeDeps,
     logger,
+    toolDeps,
     stop,
   };
 }
