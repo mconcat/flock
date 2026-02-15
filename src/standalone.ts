@@ -155,17 +155,15 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       // Assemble system prompt from Flock templates
       const systemPrompt = assembleAgentsMd(role);
 
-      // Build tools for this agent
-      // TODO: In the future, different roles may get different tool subsets
+      // Build tools for this agent (triage tool for sysadmin, extendable per role)
       const tools = [
         createTriageDecisionTool(),
       ].map(toAgentTool);
 
-      return {
-        model: "anthropic/claude-sonnet-4-20250514", // TODO: per-agent model config
-        systemPrompt,
-        tools,
-      };
+      // Model: per-agent config → fallback to default
+      const model = agentDef?.model ?? "anthropic/claude-sonnet-4-20250514";
+
+      return { model, systemPrompt, tools };
     };
 
     const sessionSend = createDirectSend({

@@ -51,6 +51,8 @@ export interface FlockConfig {
     systemPrompt?: string;
     role?: "worker" | "sysadmin" | "system" | "orchestrator";
     archetype?: string;
+    /** LLM model for standalone mode, e.g. "anthropic/claude-sonnet-4-20250514". */
+    model?: string;
   }>;
   /**
    * Agent IDs that should be promoted to orchestrator role regardless of
@@ -145,6 +147,7 @@ export function resolveFlockConfig(raw?: Record<string, unknown> | null): FlockC
             systemPrompt?: string;
             role?: "worker" | "sysadmin" | "system" | "orchestrator";
             archetype?: string;
+            model?: string;
           } | null => {
             // Accept both string shorthand and { id, systemPrompt? } objects
             if (typeof a === "string") return { id: a };
@@ -160,6 +163,7 @@ export function resolveFlockConfig(raw?: Record<string, unknown> | null): FlockC
                 systemPrompt: typeof obj.systemPrompt === "string" ? obj.systemPrompt : undefined,
                 role,
                 archetype: typeof obj.archetype === "string" ? obj.archetype : undefined,
+                model: typeof obj.model === "string" ? obj.model : undefined,
               };
             }
             return null;
@@ -169,6 +173,7 @@ export function resolveFlockConfig(raw?: Record<string, unknown> | null): FlockC
             systemPrompt?: string;
             role?: "worker" | "sysadmin" | "system" | "orchestrator";
             archetype?: string;
+            model?: string;
           } => a !== null)
       : [],
     orchestratorIds: Array.isArray(r.orchestratorIds)

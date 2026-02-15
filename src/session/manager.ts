@@ -14,11 +14,14 @@
 import { Agent, type AgentOptions } from "@mariozechner/pi-agent-core";
 import {
   getModel,
+  getProviders,
+  getModels,
   type Model,
   type Message,
   type TextContent,
   type ThinkingContent,
   type ToolCall,
+  type KnownProvider,
 } from "@mariozechner/pi-ai";
 import type { AgentMessage, AgentTool, AgentEvent, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { PluginLogger } from "../types.js";
@@ -92,14 +95,37 @@ export class SessionManager {
   /**
    * Parse a model string like "anthropic/claude-opus-4-5" into a pi-ai Model.
    */
-  private resolveModel(modelStr: string): Model<any> {
+  /**
+   * Parse a model string and resolve it to a pi-ai Model.
+   * Validates provider at runtime against known providers.
+   */
+  private resolveModel(modelStr: string): Model<string> {
     const slashIdx = modelStr.indexOf("/");
     if (slashIdx === -1) {
       throw new Error(`Invalid model format "${modelStr}" — expected "provider/model-id"`);
     }
     const provider = modelStr.slice(0, slashIdx);
     const modelId = modelStr.slice(slashIdx + 1);
-    return getModel(provider as any, modelId as any);
+
+    // Validate provider exists at runtime
+    const knownProviders = getProviders();
+    if (!knownProviders.includes(provider as KnownProvider)) {
+      throw new Error(
+        `Unknown provider "${provider}" — known providers: ${knownProviders.join(", ")}`,
+      );
+    }
+
+    // Validate model exists for this provider
+    const models = getModels(provider as KnownProvider);
+    const model = models.find((m) => m.id === modelId);
+    if (!model) {
+      const available = models.map((m) => m.id).join(", ");
+      throw new Error(
+        `Unknown model "${modelId}" for provider "${provider}" — available: ${available}`,
+      );
+    }
+
+    return model;
   }
 
   /**

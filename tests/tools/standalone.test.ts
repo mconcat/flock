@@ -20,9 +20,23 @@ function makeMockDeps(): ToolDeps {
       gateway: { port: 3779, token: "" },
       vaultsBasePath: "/tmp/vaults",
     },
-    homes: {} as any,
-    audit: {} as any,
-    provisioner: {} as any,
+    // These are unused by simpleTool — typed stubs for ToolDeps interface.
+    homes: {
+      create: () => { throw new Error("not implemented"); },
+      get: () => null,
+      list: () => [],
+      transition: () => { throw new Error("not implemented"); },
+      history: () => [],
+    } as ToolDeps["homes"],
+    audit: {
+      append: () => {},
+      query: () => [],
+      recent: () => [],
+    } as ToolDeps["audit"],
+    provisioner: {
+      provision: () => { throw new Error("not implemented"); },
+      syncToOpenClawWorkspace: () => {},
+    } as ToolDeps["provisioner"],
   };
 }
 
@@ -89,11 +103,10 @@ describe("buildStandaloneTools", () => {
       },
     ];
 
-    // Need to cast since the type signature expects single ToolDefinition return
     const tools = buildStandaloneTools(
       makeMockDeps(),
       "agent-1",
-      [multiCreator as any],
+      [multiCreator],
     );
     expect(tools).toHaveLength(2);
     expect(tools[0].name).toBe("multi_a");

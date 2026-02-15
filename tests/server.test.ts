@@ -109,7 +109,7 @@ describe("FlockHttpServer", () => {
 
 describe("readJsonBody", () => {
   it("returns pre-parsed body if present", async () => {
-    const fakeReq = { body: { already: "parsed" } } as any;
+    const fakeReq = { body: { already: "parsed" } } as Parameters<typeof readJsonBody>[0];
     const result = await readJsonBody(fakeReq);
     expect(result).toEqual({ already: "parsed" });
   });
