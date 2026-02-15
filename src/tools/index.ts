@@ -1331,7 +1331,9 @@ function createChannelCreateTool(deps: ToolDeps): AgentTool<typeof FlockChannelC
       }
 
       const now = Date.now();
-      const allMembers = [...new Set([callerAgentId, ...members])].filter(m => m !== "main" && m !== "unknown");
+      // Include the creator only if they're in the explicit members list.
+      // Orchestrators typically create channels without joining them.
+      const allMembers = [...new Set(members)].filter(m => m !== "main" && m !== "unknown");
 
       // Create the channel record
       deps.channelStore.insert({
