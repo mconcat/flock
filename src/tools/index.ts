@@ -45,6 +45,21 @@ import type { SendExternalFn } from "../bridge/index.js";
 /** Maximum number of rows any query tool will return. */
 const QUERY_LIMIT_MAX = 100;
 
+/**
+ * Minimal interface for SessionManager to avoid circular imports.
+ * Provides access to Agent instances for mid-run steering.
+ */
+export interface SessionManagerRef {
+  /** Get the Agent instance for an agent, or undefined. */
+  get(agentId: string): SteerableAgent | undefined;
+}
+
+/** Minimal Agent shape needed for channel-post steering. */
+interface SteerableAgent {
+  steer(m: { role: "user"; content: string; timestamp: number }): void;
+  state: { isStreaming: boolean };
+}
+
 export interface ToolDeps {
   config: FlockConfig;
   homes: HomeManager;
@@ -74,6 +89,8 @@ export interface ToolDeps {
   agentLoop?: AgentLoopStore;
   /** Work loop scheduler for channel tracking. */
   workLoopScheduler?: WorkLoopScheduler;
+  /** Session manager — provides Agent instances for steering mid-run agents. */
+  sessionManager?: SessionManagerRef;
   /** Bridge store for Discord/Slack channel mappings. */
   bridgeStore?: BridgeStore;
   /** Discord bot token — used to auto-create webhooks for bridge channels. */
@@ -1447,6 +1464,24 @@ function createChannelPostTool(deps: ToolDeps): AgentTool<typeof FlockChannelPos
               deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" failed: ${errorMsg}`);
             });
           }
+        }
+      }
+
+      // Steer active agents: if another member is currently mid-generation
+      // (isStreaming), inject this new message via steer() so they see it
+      // immediately rather than working with stale context.
+      if (deps.sessionManager) {
+        for (const member of channel.members) {
+          if (member === callerAgentId) continue;
+          const agent = deps.sessionManager.get(member);
+          if (!agent || !agent.state.isStreaming) continue;
+
+          agent.steer({
+            role: "user",
+            content: `[Channel Update #${channelId}] New message from ${callerAgentId} (seq ${newSeq}):\n${message}`,
+            timestamp: now,
+          });
+          deps.logger?.debug?.(`[flock:channel-post] Steered "${member}" with new message from "${callerAgentId}" in #${channelId}`);
         }
       }
 

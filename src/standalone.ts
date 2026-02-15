@@ -325,6 +325,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     vaultsBasePath: config.vaultsBasePath,
     agentLoop: db.agentLoop,
     workLoopScheduler: scheduler,
+    sessionManager,
   };
 
   // --- Register gateway agents ---
