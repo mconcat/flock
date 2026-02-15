@@ -34,15 +34,13 @@ export function createDirectSend(opts: DirectSendOptions): SessionSendFn {
   const { sessionManager, resolveAgentConfig, logger } = opts;
 
   return async (agentId: string, message: string, _sessionKey?: string): Promise<string | null> => {
-    logger.info(`[flock:direct-send] sending to "${agentId}" (${message.length} chars)`);
-    logger.debug?.(`[flock:direct-send] content: ${message.slice(0, 200)}...`);
+    logger.info(`[flock:direct-send] sending to "${agentId}" (${message.length} chars):\n${message}`);
 
     const config = resolveAgentConfig(agentId);
     const { text } = await sessionManager.send(agentId, message, config);
 
     if (text) {
-      logger.info(`[flock:direct-send] "${agentId}" responded (${text.length} chars)`);
-      logger.debug?.(`[flock:direct-send] response: ${text.slice(0, 200)}...`);
+      logger.info(`[flock:direct-send] "${agentId}" responded (${text.length} chars):\n${text}`);
     } else {
       logger.warn(`[flock:direct-send] "${agentId}" returned empty response`);
     }
