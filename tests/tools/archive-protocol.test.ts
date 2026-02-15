@@ -7,49 +7,37 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createMemoryDatabase } from "../../src/db/memory.js";
-import { registerFlockTools } from "../../src/tools/index.js";
+import { createFlockTools } from "../../src/tools/index.js";
 import type { ToolDeps } from "../../src/tools/index.js";
 import type { FlockConfig } from "../../src/config.js";
 import type { HomeManager } from "../../src/homes/manager.js";
 import type { HomeProvisioner } from "../../src/homes/provisioner.js";
 import type { AuditLog } from "../../src/audit/log.js";
-import type { PluginApi, ToolDefinition } from "../../src/types.js";
+import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { FlockDatabase } from "../../src/db/interface.js";
 
-/**
- * collectTools wraps tools with a specific agentId.
- * wrapToolWithAgentId in the production code overrides _callerAgentId from the
- * session context, so we must create different tool sets per agent.
- */
-function collectTools(deps: ToolDeps, agentId = "test-agent"): Map<string, ToolDefinition> {
-  const tools = new Map<string, ToolDefinition>();
-  const api: PluginApi = {
-    id: "flock",
-    source: "test",
-    config: {},
-    pluginConfig: {},
-    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    registerTool(tool: ToolDefinition | ((ctx: Record<string, unknown>) => ToolDefinition | ToolDefinition[] | null | undefined)) {
-      if (typeof tool === "function") {
-        const resolved = tool({ agentId });
-        if (resolved) {
-          const list = Array.isArray(resolved) ? resolved : [resolved];
-          for (const t of list) tools.set(t.name, t);
-        }
-      } else {
-        tools.set(tool.name, tool);
-      }
-    },
-    registerGatewayMethod: vi.fn(),
-    registerHttpRoute: vi.fn(),
-  };
-  registerFlockTools(api, deps);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function collectTools(deps: ToolDeps): Map<string, AgentTool<any>> {
+  const toolArray = createFlockTools(deps);
+  const tools = new Map<string, AgentTool<any>>();
+  for (const t of toolArray) tools.set(t.name, t);
   return tools;
 }
 
-/** Get a specific tool with a given agentId injected as _callerAgentId. */
-function getToolAs(deps: ToolDeps, toolName: string, agentId: string): ToolDefinition {
-  return collectTools(deps, agentId).get(toolName)!;
+/**
+ * Get a specific tool and wrap execute to inject _callerAgentId.
+ * Simulates what standalone mode does via agentId injection.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getToolAs(deps: ToolDeps, toolName: string, agentId: string): AgentTool<any> {
+  const tool = collectTools(deps).get(toolName)!;
+  return {
+    ...tool,
+    execute: (toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) => {
+      params._callerAgentId = agentId;
+      return tool.execute(toolCallId, params, signal);
+    },
+  };
 }
 
 function makeDeps(db: FlockDatabase, sendExternal?: any): ToolDeps {
