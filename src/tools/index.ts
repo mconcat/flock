@@ -11,14 +11,18 @@
  * - flock_message: Send messages to other agents via A2A
  */
 
-import type { PluginApi, ToolDefinition, ToolResult, ToolResultOC, AuditLevel, PluginLogger } from "../types.js";
-import { isAuditLevel, toOCResult } from "../types.js";
+import { Type, type Static } from "@mariozechner/pi-ai";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { toResult } from "./result.js";
+
+import type { AuditLevel, PluginLogger } from "../types.js";
+import { isAuditLevel } from "../types.js";
 import type { FlockConfig } from "../config.js";
 import type { HomeManager } from "../homes/manager.js";
 import type { HomeProvisioner } from "../homes/provisioner.js";
 import { formatBindMountsForConfig } from "../homes/provisioner.js";
 import type { AuditLog } from "../audit/log.js";
-import type { HomeFilter, AuditFilter, TaskStore, TaskFilter, TaskRecord, ChannelStore, ChannelMessageStore, BridgeStore } from "../db/index.js";
+import type { HomeFilter, AuditFilter, TaskStore, TaskFilter, TaskRecord, ChannelStore, ChannelMessageStore, BridgeStore, BridgePlatform, BridgeFilter } from "../db/index.js";
 import { isTaskState, TASK_STATES } from "../db/index.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
@@ -31,7 +35,7 @@ import type { MigrationEngine } from "../migration/engine.js";
 import type { MigrationOrchestrator } from "../migration/orchestrator.js";
 import type { MigrationReason } from "../migration/types.js";
 import type { AgentSkill } from "../transport/types.js";
-import { createCreateAgentTool, createDecommissionAgentTool, createRestartGatewayTool } from "./agent-lifecycle.js";
+// agent-lifecycle.ts (OpenClaw plugin mode) removed — use agent-lifecycle-standalone.ts
 import { createWorkspaceTools } from "./workspace.js";
 import type { AgentLoopStore } from "../db/index.js";
 import type { WorkLoopScheduler } from "../loop/scheduler.js";
@@ -40,6 +44,21 @@ import type { SendExternalFn } from "../bridge/index.js";
 
 /** Maximum number of rows any query tool will return. */
 const QUERY_LIMIT_MAX = 100;
+
+/**
+ * Minimal interface for SessionManager to avoid circular imports.
+ * Provides access to Agent instances for mid-run steering.
+ */
+export interface SessionManagerRef {
+  /** Get the Agent instance for an agent, or undefined. */
+  get(agentId: string): SteerableAgent | undefined;
+}
+
+/** Minimal Agent shape needed for channel-post steering. */
+interface SteerableAgent {
+  steer(m: { role: "user"; content: string; timestamp: number }): void;
+  state: { isStreaming: boolean };
+}
 
 export interface ToolDeps {
   config: FlockConfig;
@@ -70,6 +89,8 @@ export interface ToolDeps {
   agentLoop?: AgentLoopStore;
   /** Work loop scheduler for channel tracking. */
   workLoopScheduler?: WorkLoopScheduler;
+  /** Session manager — provides Agent instances for steering mid-run agents. */
+  sessionManager?: SessionManagerRef;
   /** Bridge store for Discord/Slack channel mappings. */
   bridgeStore?: BridgeStore;
   /** Discord bot token — used to auto-create webhooks for bridge channels. */
@@ -78,120 +99,281 @@ export interface ToolDeps {
   sendExternal?: SendExternalFn;
 }
 
-/**
- * Wrap a tool definition so that the caller's agentId (from OpenClaw context)
- * is injected into every tool call's params as `agentId`. This way tools don't
- * need to rely on the LLM passing agentId — it comes from the session identity.
- */
-function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined): ToolDefinition {
-  const resolvedId = agentId ?? "unknown";
-  return {
-    ...tool,
-    async execute(toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
-      // Inject _callerAgentId from session context — uses underscore prefix
-      // to avoid collisions with user-facing params like agentId (used as filter in flock_history).
-      // Tools should read _callerAgentId first, then fall back to params.agentId.
-      params._callerAgentId = resolvedId;
-      return tool.execute(toolCallId, params);
-    },
-  };
-}
+// ============================================================================
+// TypeBox Schemas — one per tool
+// ============================================================================
+
+const FlockStatusParams = Type.Object({
+  homeId: Type.Optional(Type.String({ description: "Specific home to query (format: agentId@nodeId)" })),
+  nodeId: Type.Optional(Type.String({ description: "Filter homes by node" })),
+  state: Type.Optional(Type.String({ description: "Filter homes by state (IDLE, LEASED, ACTIVE, FROZEN, etc.)" })),
+});
+
+const FlockLeaseParams = Type.Object({
+  action: Type.Union([
+    Type.Literal("request"),
+    Type.Literal("renew"),
+    Type.Literal("release"),
+    Type.Literal("freeze"),
+  ], { description: "Lease action to perform" }),
+  agentId: Type.Optional(Type.String({ description: "Agent requesting the lease" })),
+  nodeId: Type.Optional(Type.String({ description: "Target node for the home" })),
+  homeId: Type.Optional(Type.String({ description: "Existing home ID (for renew/release/freeze)" })),
+  durationMs: Type.Optional(Type.Number({ description: "Lease duration in milliseconds. Default: 1 hour" })),
+  reason: Type.Optional(Type.String({ description: "Reason for the action" })),
+});
+
+const FlockAuditParams = Type.Object({
+  agentId: Type.Optional(Type.String({ description: "Filter by agent" })),
+  homeId: Type.Optional(Type.String({ description: "Filter by home" })),
+  level: Type.Optional(Type.Union([
+    Type.Literal("GREEN"),
+    Type.Literal("YELLOW"),
+    Type.Literal("RED"),
+  ], { description: "Filter by risk level" })),
+  limit: Type.Optional(Type.Number({ description: "Max entries to return. Default: 20" })),
+});
+
+const FlockProvisionParams = Type.Object({
+  agentId: Type.String({ description: "Agent ID for the new home" }),
+  nodeId: Type.String({ description: "Node ID where the home will be created" }),
+});
+
+const FlockSysadminProtocolParams = Type.Object({
+  section: Type.Optional(Type.Union([
+    Type.Literal("triage"),
+    Type.Literal("knowledge"),
+    Type.Literal("meta"),
+    Type.Literal("all"),
+  ], { description: "Which section to load. Default: all" })),
+});
+
+const FlockSysadminRequestParams = Type.Object({
+  request: Type.String({ description: "Natural language description of what you need (what + why)" }),
+  context: Type.Optional(Type.String({ description: "Additional context (project, environment, etc.)" })),
+  urgency: Type.Optional(Type.Union([
+    Type.Literal("low"),
+    Type.Literal("normal"),
+    Type.Literal("high"),
+  ], { description: "Urgency level. Default: normal" })),
+  project: Type.Optional(Type.String({ description: "Related project identifier" })),
+});
+
+const FlockMessageParams = Type.Object({
+  to: Type.String({ description: "Target agent ID. Use flock_discover to find available agents." }),
+  message: Type.String({ description: "Natural language message to send to the agent." }),
+  contextData: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Optional structured data to attach alongside the message as an A2A DataPart." })),
+});
+
+const FlockChannelCreateParams = Type.Object({
+  channelId: Type.String({ description: "Human-readable channel ID (alphanumeric + dashes, e.g. 'project-logging-lib')." }),
+  topic: Type.String({ description: "Channel purpose description (injected into agent prompts for context)." }),
+  members: Type.Array(Type.String(), { description: "Initial member agent IDs. The caller is automatically included." }),
+  message: Type.Optional(Type.String({ description: "Optional first message to post after channel creation." })),
+});
+
+const FlockChannelPostParams = Type.Object({
+  channelId: Type.String({ description: "Channel ID to post to." }),
+  message: Type.String({ description: "Message to post." }),
+  notify: Type.Optional(Type.Boolean({ description: "If true (default), notify other channel members. Set to false to post silently." })),
+});
+
+const FlockChannelReadParams = Type.Object({
+  channelId: Type.String({ description: "Channel ID to read." }),
+  after: Type.Optional(Type.Number({ description: "Only return messages with seq greater than this value (for delta reading)." })),
+});
+
+const FlockChannelListParams = Type.Object({
+  member: Type.Optional(Type.String({ description: "Filter channels containing this member agent ID." })),
+  archived: Type.Optional(Type.Boolean({ description: "Filter by archive state. Omit for all channels." })),
+});
+
+const FlockAssignMembersParams = Type.Object({
+  channelId: Type.String({ description: "Channel to modify membership of." }),
+  add: Type.Optional(Type.Array(Type.String(), { description: "Agent IDs to add to the channel." })),
+  remove: Type.Optional(Type.Array(Type.String(), { description: "Agent IDs to remove from the channel." })),
+});
+
+const FlockChannelArchiveParams = Type.Object({
+  channelId: Type.String({ description: "Channel ID to archive." }),
+  force: Type.Optional(Type.Boolean({ description: "If true, archive immediately without waiting for members. Default: false." })),
+});
+
+const FlockArchiveReadyParams = Type.Object({
+  channelId: Type.String({ description: "Channel ID to signal readiness for." }),
+});
+
+const FlockDiscoverParams = Type.Object({
+  query: Type.Optional(Type.String({ description: "Free-text search across agent names, descriptions, and skills" })),
+  role: Type.Optional(Type.Union([
+    Type.Literal("worker"),
+    Type.Literal("sysadmin"),
+    Type.Literal("orchestrator"),
+  ], { description: "Filter by agent role" })),
+  skill: Type.Optional(Type.String({ description: "Filter by skill tag (e.g. 'implement', 'review', 'research')" })),
+  limit: Type.Optional(Type.Number({ description: "Max results to return. Default: 20" })),
+});
+
+const FlockHistoryParams = Type.Object({
+  agentId: Type.Optional(Type.String({ description: "Filter by agent (as sender or receiver)" })),
+  messageType: Type.Optional(Type.String({ description: "Filter by message type" })),
+  state: Type.Optional(Type.Union([
+    Type.Literal("submitted"),
+    Type.Literal("working"),
+    Type.Literal("input-required"),
+    Type.Literal("completed"),
+    Type.Literal("failed"),
+    Type.Literal("canceled"),
+  ], { description: "Filter by task state" })),
+  since: Type.Optional(Type.Number({ description: "Only tasks created after this epoch ms timestamp" })),
+  limit: Type.Optional(Type.Number({ description: "Max entries to return. Default: 20" })),
+});
+
+const FlockTasksParams = Type.Object({
+  direction: Type.Optional(Type.Union([
+    Type.Literal("sent"),
+    Type.Literal("received"),
+    Type.Literal("all"),
+  ], { description: "Filter by direction: sent (tasks you created), received (tasks assigned to you), all (both). Default: all" })),
+  state: Type.Optional(Type.Union([
+    Type.Literal("submitted"),
+    Type.Literal("working"),
+    Type.Literal("input-required"),
+    Type.Literal("completed"),
+    Type.Literal("failed"),
+    Type.Literal("canceled"),
+  ], { description: "Filter by task state" })),
+  limit: Type.Optional(Type.Number({ description: "Max tasks to return. Default: 20" })),
+});
+
+const FlockTaskRespondParams = Type.Object({
+  taskId: Type.String({ description: "The task ID to respond to" }),
+  response: Type.String({ description: "Your response to the clarification question" }),
+});
+
+const FlockMigrateParams = Type.Object({
+  targetAgentId: Type.String({ description: "The agent to migrate (format: agentId, not homeId)" }),
+  targetNodeId: Type.String({ description: "The destination node ID" }),
+  reason: Type.Optional(Type.String({ description: "Reason for migration (default: 'orchestrator_rebalance')" })),
+});
+
+const FlockUpdateCardParams = Type.Object({
+  name: Type.Optional(Type.String({ description: "New display name for the agent" })),
+  description: Type.Optional(Type.String({ description: "New description of the agent's capabilities" })),
+  skills: Type.Optional(Type.String({
+    description:
+      "JSON array of AgentSkill objects. Each skill: { id, name, description?, tags?: string[] }. " +
+      "Replaces the entire skill set.",
+  })),
+});
+
+const FlockSleepParams = Type.Object({
+  reason: Type.Optional(Type.String({ description: "Why you're going to sleep (e.g. 'no pending work', 'waiting for external input')" })),
+});
+
+const FlockBridgeParams = Type.Object({
+  action: Type.Union([
+    Type.Literal("create"),
+    Type.Literal("remove"),
+    Type.Literal("list"),
+    Type.Literal("pause"),
+    Type.Literal("resume"),
+  ], { description: "Action to perform." }),
+  channelId: Type.Optional(Type.String({ description: "Flock channel ID (required for create)." })),
+  platform: Type.Optional(Type.Union([
+    Type.Literal("discord"),
+    Type.Literal("slack"),
+  ], { description: "External platform (required for create)." })),
+  externalChannelId: Type.Optional(Type.String({ description: "Discord/Slack channel ID to bridge to (required for create, unless createChannel is true)." })),
+  createChannel: Type.Optional(Type.Boolean({ description: "If true, auto-create a Discord text channel in the specified guild. Requires guildId and platform='discord'." })),
+  guildId: Type.Optional(Type.String({ description: "Discord guild (server) ID. Required when createChannel is true." })),
+  channelName: Type.Optional(Type.String({ description: "Name for the auto-created Discord channel. Defaults to the Flock channelId. Only used with createChannel=true." })),
+  categoryId: Type.Optional(Type.String({ description: "Discord category ID to place the auto-created channel in. Only used with createChannel=true." })),
+  accountId: Type.Optional(Type.String({ description: "Optional: specific bot account ID for sending messages." })),
+  bridgeId: Type.Optional(Type.String({ description: "Bridge ID (required for remove/pause/resume)." })),
+});
+
+// ============================================================================
+// Public: create all Flock tools as AgentTool[] for standalone use
+// ============================================================================
 
 /**
- * Resolve the effective agent ID from OpenClaw context.
- * Falls back to parsing the session key if agentId is "main".
+ * Create all standard Flock tools (excluding lifecycle and workspace tools).
+ * Returns AgentTool[] ready for Agent.setTools().
  */
-function resolveCtxAgentId(ctx: { agentId?: string; sessionKey?: string }): string {
-  if (ctx.agentId && ctx.agentId !== "main") return ctx.agentId;
-  // Parse session key: "agent:{id}:{rest}"
-  if (ctx.sessionKey) {
-    const parts = ctx.sessionKey.split(":");
-    if (parts[0] === "agent" && parts[1] && parts[1] !== "main") return parts[1];
-  }
-  return ctx.agentId ?? "unknown";
-}
-
-export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
-  // All tools are registered as factories so OpenClaw provides per-request
-  // ctx.agentId — injected into tool params for caller identification.
-  const toolFactories = [
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi-agent-core uses AgentTool<any>[] for heterogeneous tool arrays
+/**
+ * Create Flock tools filtered by agent role.
+ *
+ * - **worker**: channel read/post/list, workspace, discover, message, sleep,
+ *   archive_ready, update_card, tasks, task_respond, history, status
+ * - **orchestrator**: all worker tools + channel_create, assign_members,
+ *   channel_archive, bridge, provision, lease
+ * - **sysadmin**: worker tools + sysadmin_protocol, sysadmin_request,
+ *   provision, audit, lease
+ */
+export function createFlockTools(deps: ToolDeps, role?: string): AgentTool<any>[] {
+  // Common tools available to all roles
+  const common: AgentTool<any>[] = [
     createStatusTool(deps),
-    createLeaseTool(deps),
-    createAuditTool(deps),
-    createProvisionTool(deps),
-    createSysadminProtocolTool(),
-    createSysadminRequestTool(deps),
     createMessageTool(deps),
-    createChannelCreateTool(deps),
     createChannelPostTool(deps),
     createChannelReadTool(deps),
     createChannelListTool(deps),
-    createAssignMembersTool(deps),
-    createChannelArchiveTool(deps),
-    createArchiveReadyTool(deps),
     createDiscoverTool(deps),
     createHistoryTool(deps),
+    createUpdateCardTool(deps),
+    createSleepTool(deps),
+    createArchiveReadyTool(deps),
     createTasksTool(deps),
     createTaskRespondTool(deps),
     createMigrateTool(deps),
-    createUpdateCardTool(deps),
-    createSleepTool(deps),
-    createBridgeTool(deps),
   ];
 
-  for (const tool of toolFactories) {
-    api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-      console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
-      return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
-    });
-  }
+  // Orchestrator-only: channel lifecycle, team assembly, bridges
+  const orchestratorOnly: AgentTool<any>[] = [
+    createChannelCreateTool(deps),
+    createAssignMembersTool(deps),
+    createChannelArchiveTool(deps),
+    createBridgeTool(deps),
+    createProvisionTool(deps),
+    createLeaseTool(deps),
+  ];
 
-  // Lifecycle tools need the full ctx for authorization checks
-  api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => createCreateAgentTool(deps, ctx.agentId, ctx.sessionKey));
-  api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => createDecommissionAgentTool(deps, ctx.agentId, ctx.sessionKey));
-  api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => createRestartGatewayTool(deps, ctx.agentId, ctx.sessionKey));
+  // Sysadmin-only: system protocol, audit, provisioning
+  const sysadminOnly: AgentTool<any>[] = [
+    createSysadminProtocolTool(),
+    createSysadminRequestTool(deps),
+    createProvisionTool(deps),
+    createAuditTool(deps),
+    createLeaseTool(deps),
+  ];
 
-  // Workspace tools — shared vault access for agents (enabled when vaultsBasePath is configured)
-  if (deps.vaultsBasePath) {
-    const workspaceTools = createWorkspaceTools({
-      ...deps,
-      vaultsBasePath: deps.vaultsBasePath,
-    });
-    for (const tool of workspaceTools) {
-      api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-        console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
-        return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
-      });
-    }
+  switch (role) {
+    case "orchestrator":
+      return [...common, ...orchestratorOnly];
+    case "sysadmin":
+      return [...common, ...sysadminOnly];
+    default: // worker
+      return common;
   }
 }
 
+// ============================================================================
+// Tool implementations
+// ============================================================================
+
 // --- flock_status ---
 
-function createStatusTool(deps: ToolDeps): ToolDefinition {
+function createStatusTool(deps: ToolDeps): AgentTool<typeof FlockStatusParams, Record<string, unknown>> {
   return {
     name: "flock_status",
+    label: "Flock Status",
     description:
       "Query the swarm status. Returns home states, active leases, and overview. " +
       "Use without arguments for a full overview, or filter by homeId/nodeId/state.",
-    parameters: {
-      type: "object",
-      properties: {
-        homeId: {
-          type: "string",
-          description: "Specific home to query (format: agentId@nodeId)",
-        },
-        nodeId: {
-          type: "string",
-          description: "Filter homes by node",
-        },
-        state: {
-          type: "string",
-          description: "Filter homes by state (IDLE, LEASED, ACTIVE, FROZEN, etc.)",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockStatusParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockStatusParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const homeId = typeof params.homeId === "string" ? params.homeId.trim() : "";
       const nodeId = typeof params.nodeId === "string" ? params.nodeId.trim() : "";
       const state = typeof params.state === "string" ? params.state.trim().toUpperCase() : "";
@@ -199,9 +381,9 @@ function createStatusTool(deps: ToolDeps): ToolDefinition {
       if (homeId) {
         const home = deps.homes.get(homeId);
         if (!home) {
-          return toOCResult({ ok: false, error: `home not found: ${homeId}` });
+          return toResult({ ok: false, error: `home not found: ${homeId}` });
         }
-        return toOCResult({
+        return toResult({
           ok: true,
           output: formatHome(home),
           data: { home },
@@ -212,7 +394,7 @@ function createStatusTool(deps: ToolDeps): ToolDefinition {
       if (nodeId) filter.nodeId = nodeId;
       if (state) {
         if (!isValidHomeState(state)) {
-          return toOCResult({ ok: false, error: `Invalid state: ${state}. Valid: ${VALID_HOME_STATES.join(", ")}` });
+          return toResult({ ok: false, error: `Invalid state: ${state}. Valid: ${VALID_HOME_STATES.join(", ")}` });
         }
         filter.state = state;
       }
@@ -225,7 +407,7 @@ function createStatusTool(deps: ToolDeps): ToolDefinition {
         ...homes.map(formatHome),
       ];
 
-      return toOCResult({ ok: true, output: lines.join("\n"), data: { homes } });
+      return toResult({ ok: true, output: lines.join("\n"), data: { homes } });
     },
   };
 }
@@ -239,44 +421,15 @@ function formatHome(home: { homeId: string; state: string; agentId: string; node
 
 // --- flock_lease ---
 
-function createLeaseTool(deps: ToolDeps): ToolDefinition {
+function createLeaseTool(deps: ToolDeps): AgentTool<typeof FlockLeaseParams, Record<string, unknown>> {
   return {
     name: "flock_lease",
+    label: "Flock Lease",
     description:
       "Manage home leases. Actions: request (create/lease a home), renew (extend lease), " +
       "release (give up lease), freeze (emergency freeze).",
-    parameters: {
-      type: "object",
-      required: ["action"],
-      properties: {
-        action: {
-          type: "string",
-          enum: ["request", "renew", "release", "freeze"],
-          description: "Lease action to perform",
-        },
-        agentId: {
-          type: "string",
-          description: "Agent requesting the lease",
-        },
-        nodeId: {
-          type: "string",
-          description: "Target node for the home",
-        },
-        homeId: {
-          type: "string",
-          description: "Existing home ID (for renew/release/freeze)",
-        },
-        durationMs: {
-          type: "number",
-          description: "Lease duration in milliseconds. Default: 1 hour",
-        },
-        reason: {
-          type: "string",
-          description: "Reason for the action",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockLeaseParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockLeaseParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const action = typeof params.action === "string" ? params.action.trim() : "";
 
       // Since context is not available in OpenClaw interface, we use agentId from params
@@ -297,17 +450,17 @@ function createLeaseTool(deps: ToolDeps): ToolDefinition {
        * Verify that the caller owns the given homeId.
        * homeId format is "agentId@nodeId" — the agentId portion must match.
        */
-      function assertOwnership(hid: string): ToolResultOC | null {
+      function assertOwnership(hid: string): AgentToolResult<Record<string, unknown>> | null {
         const ownerPart = hid.split("@")[0];
         if (ownerPart !== callerAgentId) {
-          return toOCResult({ ok: false, error: `permission denied: home ${hid} belongs to ${ownerPart}, not ${callerAgentId}` });
+          return toResult({ ok: false, error: `permission denied: home ${hid} belongs to ${ownerPart}, not ${callerAgentId}` });
         }
         return null;
       }
 
       switch (action) {
         case "request": {
-          if (!nodeId) return toOCResult({ ok: false, error: "nodeId required for lease request" });
+          if (!nodeId) return toResult({ ok: false, error: "nodeId required for lease request" });
 
           let home = deps.homes.get(`${agentId}@${nodeId}`);
           if (!home) {
@@ -323,7 +476,7 @@ function createLeaseTool(deps: ToolDeps): ToolDefinition {
           // Re-read from DB to return the authoritative record
           const updated = deps.homes.get(home.homeId)!;
 
-          return toOCResult({
+          return toResult({
             ok: true,
             output: `Home ${updated.homeId} leased until ${new Date(expiresAt).toISOString()}`,
             data: { home: updated },
@@ -331,14 +484,14 @@ function createLeaseTool(deps: ToolDeps): ToolDefinition {
         }
 
         case "renew": {
-          if (!homeId) return toOCResult({ ok: false, error: "homeId required for renewal" });
+          if (!homeId) return toResult({ ok: false, error: "homeId required for renewal" });
           const denied = assertOwnership(homeId);
           if (denied) return denied;
 
           const home = deps.homes.get(homeId);
-          if (!home) return toOCResult({ ok: false, error: `home not found: ${homeId}` });
+          if (!home) return toResult({ ok: false, error: `home not found: ${homeId}` });
           if (home.state !== "LEASED" && home.state !== "ACTIVE") {
-            return toOCResult({ ok: false, error: `cannot renew: home is ${home.state}` });
+            return toResult({ ok: false, error: `cannot renew: home is ${home.state}` });
           }
 
           // Persist lease expiry to DB
@@ -346,7 +499,7 @@ function createLeaseTool(deps: ToolDeps): ToolDefinition {
           deps.homes.setLeaseExpiry(homeId, expiresAt);
           const updated = deps.homes.get(homeId)!;
 
-          return toOCResult({
+          return toResult({
             ok: true,
             output: `Lease renewed: ${homeId} until ${new Date(expiresAt).toISOString()}`,
             data: { home: updated },
@@ -354,25 +507,25 @@ function createLeaseTool(deps: ToolDeps): ToolDefinition {
         }
 
         case "release": {
-          if (!homeId) return toOCResult({ ok: false, error: "homeId required for release" });
+          if (!homeId) return toResult({ ok: false, error: "homeId required for release" });
           const denied = assertOwnership(homeId);
           if (denied) return denied;
 
           deps.homes.transition(homeId, "IDLE", reason, agentId);
-          return toOCResult({ ok: true, output: `Home ${homeId} released to IDLE` });
+          return toResult({ ok: true, output: `Home ${homeId} released to IDLE` });
         }
 
         case "freeze": {
-          if (!homeId) return toOCResult({ ok: false, error: "homeId required for freeze" });
+          if (!homeId) return toResult({ ok: false, error: "homeId required for freeze" });
           const denied = assertOwnership(homeId);
           if (denied) return denied;
 
           deps.homes.transition(homeId, "FROZEN", reason, agentId);
-          return toOCResult({ ok: true, output: `Home ${homeId} frozen: ${reason}` });
+          return toResult({ ok: true, output: `Home ${homeId} frozen: ${reason}` });
         }
 
         default:
-          return toOCResult({ ok: false, error: `unknown action: ${action}` });
+          return toResult({ ok: false, error: `unknown action: ${action}` });
       }
     },
   };
@@ -380,27 +533,20 @@ function createLeaseTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_audit ---
 
-function createAuditTool(deps: ToolDeps): ToolDefinition {
+function createAuditTool(deps: ToolDeps): AgentTool<typeof FlockAuditParams, Record<string, unknown>> {
   return {
     name: "flock_audit",
+    label: "Flock Audit",
     description: "Query the Flock audit log. Returns recent actions, filterable by agent/home/level.",
-    parameters: {
-      type: "object",
-      properties: {
-        agentId: { type: "string", description: "Filter by agent" },
-        homeId: { type: "string", description: "Filter by home" },
-        level: { type: "string", enum: ["GREEN", "YELLOW", "RED"], description: "Filter by risk level" },
-        limit: { type: "number", description: "Max entries to return. Default: 20" },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockAuditParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockAuditParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const filter: AuditFilter = {};
       if (typeof params.agentId === "string") filter.agentId = params.agentId.trim();
       if (typeof params.homeId === "string") filter.homeId = params.homeId.trim();
       if (typeof params.level === "string") {
         const level = params.level.trim().toUpperCase();
         if (!isAuditLevel(level)) {
-          return toOCResult({ ok: false, error: `Invalid level: ${level}. Valid: GREEN, YELLOW, RED` });
+          return toResult({ ok: false, error: `Invalid level: ${level}. Valid: GREEN, YELLOW, RED` });
         }
         filter.level = level;
       }
@@ -412,7 +558,7 @@ function createAuditTool(deps: ToolDeps): ToolDefinition {
         (e) => `[${new Date(e.timestamp).toISOString()}] ${e.level} ${e.action} (${e.agentId}) — ${e.detail}`,
       );
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: lines.length > 0 ? lines.join("\n") : "No audit entries found.",
         data: { entries, total: deps.audit.count() },
@@ -423,43 +569,28 @@ function createAuditTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_provision ---
 
-function createProvisionTool(deps: ToolDeps): ToolDefinition {
+function createProvisionTool(deps: ToolDeps): AgentTool<typeof FlockProvisionParams, Record<string, unknown>> {
   return {
     name: "flock_provision",
+    label: "Flock Provision",
     description:
       "Provision a new home directory on disk. Creates the workspace directory tree, " +
       "deploys workspace files (AGENTS.md, SOUL.md, etc.), and returns bind mount config for Clawdbot sandbox.",
-    parameters: {
-      type: "object",
-      required: ["agentId", "nodeId"],
-      properties: {
-        agentId: {
-          type: "string",
-          description: "Agent ID for the new home",
-        },
-        nodeId: {
-          type: "string",
-          description: "Node ID where the home will be created",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockProvisionParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockProvisionParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const agentId = typeof params.agentId === "string" ? params.agentId.trim() : "";
       const nodeId = typeof params.nodeId === "string" ? params.nodeId.trim() : "";
 
       if (!agentId || !nodeId) {
-        return toOCResult({ ok: false, error: "agentId and nodeId are required" });
+        return toResult({ ok: false, error: "agentId and nodeId are required" });
       }
-
-      // Authorization: Since context is not available in OpenClaw interface,
-      // authorization is expected to be handled at a higher level
 
       // Path traversal defense — validate IDs before they reach the filesystem
       try {
         validateId(agentId, "agentId");
         validateId(nodeId, "nodeId");
       } catch (err) {
-        return toOCResult({ ok: false, error: String(err) });
+        return toResult({ ok: false, error: String(err) });
       }
 
       try {
@@ -485,13 +616,13 @@ function createProvisionTool(deps: ToolDeps): ToolDefinition {
         deps.homes.transition(home.homeId, "PROVISIONING", "disk provisioned", "system");
         deps.homes.transition(home.homeId, "IDLE", "provisioning complete", "system");
 
-        return toOCResult({
+        return toResult({
           ok: true,
           output: lines.join("\n"),
           data: { ...result, binds },
         });
       } catch (err) {
-        return toOCResult({ ok: false, error: String(err) });
+        return toResult({ ok: false, error: String(err) });
       }
     },
   };
@@ -499,29 +630,21 @@ function createProvisionTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_sysadmin_protocol ---
 
-function createSysadminProtocolTool(): ToolDefinition {
+function createSysadminProtocolTool(): AgentTool<typeof FlockSysadminProtocolParams, Record<string, unknown>> {
   return {
     name: "flock_sysadmin_protocol",
+    label: "Sysadmin Protocol",
     description:
       "Load the sysadmin protocol documents. Returns the triage classification guide, " +
       "agent knowledge management rules, and meta-governance framework. " +
       "Use 'section' to load a specific document, or omit for the full combined prompt.",
-    parameters: {
-      type: "object",
-      properties: {
-        section: {
-          type: "string",
-          enum: ["triage", "knowledge", "meta", "all"],
-          description: "Which section to load. Default: all",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockSysadminProtocolParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockSysadminProtocolParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const section = typeof params.section === "string" ? params.section.trim() : "all";
 
       try {
         if (section === "all") {
-          return toOCResult({
+          return toResult({
             ok: true,
             output: getSysadminPrompt(),
             data: { version: loadSysadminProtocol().version, section: "all" },
@@ -538,16 +661,16 @@ function createSysadminProtocolTool(): ToolDefinition {
 
         const doc = sectionMap[section];
         if (!doc) {
-          return toOCResult({ ok: false, error: `Unknown section: ${section}. Use: triage, knowledge, meta, all` });
+          return toResult({ ok: false, error: `Unknown section: ${section}. Use: triage, knowledge, meta, all` });
         }
 
-        return toOCResult({
+        return toResult({
           ok: true,
           output: doc.content,
           data: { version: protocol.version, section },
         });
       } catch (err) {
-        return toOCResult({ ok: false, error: String(err) });
+        return toResult({ ok: false, error: String(err) });
       }
     },
   };
@@ -555,46 +678,25 @@ function createSysadminProtocolTool(): ToolDefinition {
 
 // --- flock_sysadmin_request ---
 
-function createSysadminRequestTool(deps: ToolDeps): ToolDefinition {
+function createSysadminRequestTool(deps: ToolDeps): AgentTool<typeof FlockSysadminRequestParams, Record<string, unknown>> {
   return {
     name: "flock_sysadmin_request",
+    label: "Sysadmin Request",
     description:
       "[DEPRECATED — prefer @sysadmin mention in a channel instead] " +
       "Send a system-level request to the sysadmin agent via A2A protocol. " +
       "The sysadmin will triage the request as GREEN (auto-execute), " +
       "YELLOW (needs clarification), or RED (requires human approval). " +
       "Describe what you need and why.",
-    parameters: {
-      type: "object",
-      required: ["request"],
-      properties: {
-        request: {
-          type: "string",
-          description: "Natural language description of what you need (what + why)",
-        },
-        context: {
-          type: "string",
-          description: "Additional context (project, environment, etc.)",
-        },
-        urgency: {
-          type: "string",
-          enum: ["low", "normal", "high"],
-          description: "Urgency level. Default: normal",
-        },
-        project: {
-          type: "string",
-          description: "Related project identifier",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockSysadminRequestParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockSysadminRequestParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const request = typeof params.request === "string" ? params.request.trim() : "";
       if (!request) {
-        return toOCResult({ ok: false, error: "request is required — describe what you need and why" });
+        return toResult({ ok: false, error: "request is required — describe what you need and why" });
       }
 
       if (!deps.a2aClient) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: "A2A transport not initialized. Sysadmin request requires the A2A transport layer.",
         });
@@ -602,13 +704,15 @@ function createSysadminRequestTool(deps: ToolDeps): ToolDefinition {
 
       const sysadminId = deps.sysadminAgentId;
       if (!sysadminId) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: "No sysadmin agent registered on this node.",
         });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
+      // Read injected caller from _callerAgentId (set by wrapToolWithAgentId)
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown");
       const urgency = parseUrgency(params.urgency);
       const project = typeof params.project === "string" ? params.project.trim() : undefined;
       const extraContext = typeof params.context === "string" ? params.context.trim() : undefined;
@@ -645,7 +749,7 @@ function createSysadminRequestTool(deps: ToolDeps): ToolDefinition {
           duration,
         });
 
-        return toOCResult({
+        return toResult({
           ok: true,
           output: formatSysadminResult(result.response, triageData),
           data: {
@@ -672,7 +776,7 @@ function createSysadminRequestTool(deps: ToolDeps): ToolDefinition {
           duration,
         });
 
-        return toOCResult({ ok: false, error: `Sysadmin request failed: ${errorMsg}` });
+        return toResult({ ok: false, error: `Sysadmin request failed: ${errorMsg}` });
       }
     },
   };
@@ -710,45 +814,29 @@ function extractTriageFromArtifacts(
 
 // --- flock_migrate ---
 
-function createMigrateTool(deps: ToolDeps): ToolDefinition {
+function createMigrateTool(deps: ToolDeps): AgentTool<typeof FlockMigrateParams, Record<string, unknown>> {
   return {
     name: "flock_migrate",
+    label: "Flock Migrate",
     description:
       "Trigger a migration of an agent to a different node. " +
       "Only sysadmin role agents can use this tool. Initiates the full migration lifecycle " +
       "through the A2A protocol and automatically updates assignment routing.",
-    parameters: {
-      type: "object",
-      required: ["targetAgentId", "targetNodeId"],
-      properties: {
-        targetAgentId: {
-          type: "string",
-          description: "The agent to migrate (format: agentId, not homeId)",
-        },
-        targetNodeId: {
-          type: "string",
-          description: "The destination node ID",
-        },
-        reason: {
-          type: "string",
-          description: "Reason for migration (default: 'orchestrator_rebalance')",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockMigrateParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockMigrateParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       // Check if migration orchestrator is available (preferred), else fall back to engine
       if (!deps.migrationOrchestrator && !deps.migrationEngine) {
-        return toOCResult({ ok: false, error: "Migration orchestrator not initialized." });
+        return toResult({ ok: false, error: "Migration orchestrator not initialized." });
       }
 
-      // params.agentId is injected by OpenClaw as the CALLER's agent ID.
-      // params.targetAgentId is the user-specified agent to migrate.
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
+      // Read injected caller from _callerAgentId (set by wrapToolWithAgentId)
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown");
 
       // Role-based authorization: only sysadmin or orchestrator agents can trigger migrations
       const callerMeta = deps.a2aServer?.getAgentMeta(callerAgentId);
       if (callerMeta?.role !== "sysadmin" && callerMeta?.role !== "orchestrator") {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Permission denied: only sysadmin or orchestrator agents can trigger migrations. Caller '${callerAgentId}' has role: ${callerMeta?.role ?? "unknown"}`,
         });
@@ -759,16 +847,16 @@ function createMigrateTool(deps: ToolDeps): ToolDefinition {
       const reason = typeof params.reason === "string" ? params.reason.trim() : "orchestrator_rebalance";
 
       if (!agentId) {
-        return toOCResult({ ok: false, error: "targetAgentId is required." });
+        return toResult({ ok: false, error: "targetAgentId is required." });
       }
       if (!targetNodeId) {
-        return toOCResult({ ok: false, error: "targetNodeId is required." });
+        return toResult({ ok: false, error: "targetNodeId is required." });
       }
 
       // Validate reason is a valid MigrationReason
       const validReasons: MigrationReason[] = ["agent_request", "orchestrator_rebalance", "node_retiring", "lease_migration", "security_relocation", "resource_need"];
       if (!validReasons.includes(reason as MigrationReason)) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Invalid reason: ${reason}. Valid: ${validReasons.join(", ")}`,
         });
@@ -799,7 +887,7 @@ function createMigrateTool(deps: ToolDeps): ToolDefinition {
               duration,
             });
 
-            return toOCResult({
+            return toResult({
               ok: true,
               output: `Migration completed: ${result.migrationId}\nAgent: ${agentId}\nTarget: ${targetNodeId}\nPhase: ${result.finalPhase}`,
               data: {
@@ -820,7 +908,7 @@ function createMigrateTool(deps: ToolDeps): ToolDefinition {
               duration,
             });
 
-            return toOCResult({
+            return toResult({
               ok: false,
               error: `Migration failed: ${result.error}\nFinal phase: ${result.finalPhase}`,
               data: {
@@ -845,12 +933,12 @@ function createMigrateTool(deps: ToolDeps): ToolDefinition {
             duration,
           });
 
-          return toOCResult({ ok: false, error: `Migration error: ${errorMsg}` });
+          return toResult({ ok: false, error: `Migration error: ${errorMsg}` });
         }
       }
 
       // No orchestrator available — cannot run migration lifecycle
-      return toOCResult({
+      return toResult({
         ok: false,
         error: "Migration orchestrator not available. Cannot execute migration without orchestrator.",
       });
@@ -860,39 +948,24 @@ function createMigrateTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_update_card ---
 
-function createUpdateCardTool(deps: ToolDeps): ToolDefinition {
+function createUpdateCardTool(deps: ToolDeps): AgentTool<typeof FlockUpdateCardParams, Record<string, unknown>> {
   return {
     name: "flock_update_card",
+    label: "Update Card",
     description:
       "Update your own Agent Card. You can change your name, description, and/or skills. " +
       "You can only update your own card — not other agents' cards.",
-    parameters: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description: "New display name for the agent",
-        },
-        description: {
-          type: "string",
-          description: "New description of the agent's capabilities",
-        },
-        skills: {
-          type: "string",
-          description:
-            "JSON array of AgentSkill objects. Each skill: { id, name, description?, tags?: string[] }. " +
-            "Replaces the entire skill set.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockUpdateCardParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockUpdateCardParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.a2aServer) {
-        return toOCResult({ ok: false, error: "A2A transport not initialized." });
+        return toResult({ ok: false, error: "A2A transport not initialized." });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "");
+      // Read injected caller from _callerAgentId (set by wrapToolWithAgentId)
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "");
       if (!callerAgentId) {
-        return toOCResult({ ok: false, error: "agentId is required — cannot determine which card to update." });
+        return toResult({ ok: false, error: "agentId is required — cannot determine which card to update." });
       }
 
       const registry = deps.a2aServer.cardRegistry;
@@ -915,32 +988,32 @@ function createUpdateCardTool(deps: ToolDeps): ToolDefinition {
         try {
           const parsed: unknown = JSON.parse(params.skills.trim());
           if (!Array.isArray(parsed)) {
-            return toOCResult({ ok: false, error: "skills must be a JSON array of AgentSkill objects." });
+            return toResult({ ok: false, error: "skills must be a JSON array of AgentSkill objects." });
           }
           // Validate each skill has at least id and name
           for (const s of parsed) {
             if (typeof s !== "object" || s === null || typeof (s as Record<string, unknown>).id !== "string" || typeof (s as Record<string, unknown>).name !== "string") {
-              return toOCResult({ ok: false, error: "Each skill must have at least 'id' (string) and 'name' (string)." });
+              return toResult({ ok: false, error: "Each skill must have at least 'id' (string) and 'name' (string)." });
             }
           }
           updates.skills = parsed as AgentSkill[];
           hasUpdate = true;
         } catch {
-          return toOCResult({ ok: false, error: "skills is not valid JSON." });
+          return toResult({ ok: false, error: "skills is not valid JSON." });
         }
       }
 
       if (!hasUpdate) {
-        return toOCResult({ ok: false, error: "No updates provided. Specify at least one of: name, description, skills." });
+        return toResult({ ok: false, error: "No updates provided. Specify at least one of: name, description, skills." });
       }
 
       const ok = registry.updateCard(callerAgentId, updates);
       if (!ok) {
-        return toOCResult({ ok: false, error: `Agent card not found for '${callerAgentId}'. Cannot update a card that doesn't exist.` });
+        return toResult({ ok: false, error: `Agent card not found for '${callerAgentId}'. Cannot update a card that doesn't exist.` });
       }
 
       const updatedCard = registry.get(callerAgentId);
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Agent card updated for ${callerAgentId}.`,
         data: {
@@ -956,40 +1029,34 @@ function createUpdateCardTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_sleep ---
 
-function createSleepTool(deps: ToolDeps): ToolDefinition {
+function createSleepTool(deps: ToolDeps): AgentTool<typeof FlockSleepParams, Record<string, unknown>> {
   return {
     name: "flock_sleep",
+    label: "Flock Sleep",
     description:
       "Enter SLEEP state. You stop receiving fast work loop ticks and channel notifications. " +
       "You will still receive slow-tick polls (~5 min) with a channel activity summary, " +
       "so you can self-wake by posting if you see something relevant. " +
       "Other agents can also wake you via @mention in a channel or direct message (flock_message). " +
       "Only call this when you have no pending work. Use sparingly — if you might have work soon, stay AWAKE.",
-    parameters: {
-      type: "object",
-      properties: {
-        reason: {
-          type: "string",
-          description: "Why you're going to sleep (e.g. 'no pending work', 'waiting for external input')",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockSleepParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockSleepParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const agentLoop = deps.agentLoop;
       if (!agentLoop) {
-        return toOCResult({ ok: false, error: "Agent loop store not available." });
+        return toResult({ ok: false, error: "Agent loop store not available." });
       }
 
-      const callerAgentId = typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown";
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown";
       const reason = typeof params.reason === "string" ? params.reason.trim() : "no reason given";
 
       const current = agentLoop.get(callerAgentId);
       if (!current) {
-        return toOCResult({ ok: false, error: `Agent "${callerAgentId}" not found in loop state.` });
+        return toResult({ ok: false, error: `Agent "${callerAgentId}" not found in loop state.` });
       }
 
       if (current.state === "SLEEP") {
-        return toOCResult({ ok: true, output: `Already in SLEEP state.` });
+        return toResult({ ok: true, output: `Already in SLEEP state.` });
       }
 
       agentLoop.setState(callerAgentId, "SLEEP", reason);
@@ -1004,7 +1071,7 @@ function createSleepTool(deps: ToolDeps): ToolDefinition {
         result: "completed",
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Entering SLEEP state. You will not receive ticks or channel notifications until woken. Reason: ${reason}`,
         data: { state: "SLEEP", reason },
@@ -1046,41 +1113,27 @@ function formatSysadminResult(response: string, triage: TriageResult | null): st
 
 // --- flock_message ---
 
-function createMessageTool(deps: ToolDeps): ToolDefinition {
+function createMessageTool(deps: ToolDeps): AgentTool<typeof FlockMessageParams, Record<string, unknown>> {
   return {
     name: "flock_message",
+    label: "Flock Message",
     description:
       "Send a message to another agent via A2A protocol. " +
       "Use flock_discover to find available agents, then send your message in natural language.",
-    parameters: {
-      type: "object",
-      required: ["to", "message"],
-      properties: {
-        to: {
-          type: "string",
-          description: "Target agent ID. Use flock_discover to find available agents.",
-        },
-        message: {
-          type: "string",
-          description: "Natural language message to send to the agent.",
-        },
-        contextData: {
-          type: "object",
-          description: "Optional structured data to attach alongside the message as an A2A DataPart.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockMessageParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockMessageParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.a2aClient) {
-        return toOCResult({ ok: false, error: "A2A transport not initialized." });
+        return toResult({ ok: false, error: "A2A transport not initialized." });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
+      // Read injected caller from _callerAgentId (set by wrapToolWithAgentId)
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown");
       const to = typeof params.to === "string" ? params.to.trim() : "";
       const message = typeof params.message === "string" ? params.message.trim() : "";
 
-      if (!to) return toOCResult({ ok: false, error: "'to' is required — specify the target agent ID." });
-      if (!message) return toOCResult({ ok: false, error: "'message' is required — describe what you need." });
+      if (!to) return toResult({ ok: false, error: "'to' is required — specify the target agent ID." });
+      if (!message) return toResult({ ok: false, error: "'message' is required — describe what you need." });
 
       const contextData = typeof params.contextData === "object" && params.contextData !== null
         ? params.contextData as Record<string, unknown>
@@ -1179,7 +1232,7 @@ function createMessageTool(deps: ToolDeps): ToolDefinition {
         });
 
         // Return immediately — caller uses flock_tasks to check progress
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `Task ${taskId} submitted to ${to}. Use flock_tasks to check progress.`,
           data: {
@@ -1211,7 +1264,7 @@ function createMessageTool(deps: ToolDeps): ToolDefinition {
           duration: Date.now() - startTime,
         });
 
-        return toOCResult({ ok: false, error: `Message failed: ${errorMsg}` });
+        return toResult({ ok: false, error: `Message failed: ${errorMsg}` });
       }
     },
   };
@@ -1240,42 +1293,22 @@ function extractMentions(message: string, members: string[]): string[] {
 
 // --- flock_channel_create ---
 
-function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
+function createChannelCreateTool(deps: ToolDeps): AgentTool<typeof FlockChannelCreateParams, Record<string, unknown>> {
   return {
     name: "flock_channel_create",
+    label: "Channel Create",
     description:
       "Create a new named channel for group discussion. Channels are persistent conversation " +
       "spaces with a topic, membership list, and message history. Optionally post the first " +
       "message and notify all members. Members are auto-woken if sleeping.",
-    parameters: {
-      type: "object",
-      required: ["channelId", "topic", "members"],
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Human-readable channel ID (alphanumeric + dashes, e.g. 'project-logging-lib').",
-        },
-        topic: {
-          type: "string",
-          description: "Channel purpose description (injected into agent prompts for context).",
-        },
-        members: {
-          type: "array",
-          items: { type: "string" },
-          description: "Initial member agent IDs. The caller is automatically included.",
-        },
-        message: {
-          type: "string",
-          description: "Optional first message to post after channel creation.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockChannelCreateParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockChannelCreateParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore || !deps.channelMessages) {
-        return toOCResult({ ok: false, error: "Channel stores not available." });
+        return toResult({ ok: false, error: "Channel stores not available." });
       }
 
-      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp._callerAgentId === "string") ? rp._callerAgentId as string : "unknown";
       const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const topic = typeof params.topic === "string" ? params.topic.trim() : "";
       const membersRaw = params.members;
@@ -1286,19 +1319,21 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
 
       // Validate channelId format
       if (!channelId || !/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(channelId)) {
-        return toOCResult({ ok: false, error: "'channelId' must be alphanumeric with dashes (e.g. 'project-logging')." });
+        return toResult({ ok: false, error: "'channelId' must be alphanumeric with dashes (e.g. 'project-logging')." });
       }
       if (!topic) {
-        return toOCResult({ ok: false, error: "'topic' is required." });
+        return toResult({ ok: false, error: "'topic' is required." });
       }
 
       // Check channel doesn't already exist
       if (deps.channelStore.get(channelId)) {
-        return toOCResult({ ok: false, error: `Channel '${channelId}' already exists.` });
+        return toResult({ ok: false, error: `Channel '${channelId}' already exists.` });
       }
 
       const now = Date.now();
-      const allMembers = [...new Set([callerAgentId, ...members])].filter(m => m !== "main" && m !== "unknown");
+      // Include the creator only if they're in the explicit members list.
+      // Orchestrators typically create channels without joining them.
+      const allMembers = [...new Set(members)].filter(m => m !== "main" && m !== "unknown");
 
       // Create the channel record
       deps.channelStore.insert({
@@ -1317,6 +1352,14 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
       // SLEEP members are NOT auto-woken — they will discover new channels
       // via slow-tick polling and self-wake if they find the topic relevant.
 
+      // Track channel participation for ALL members (even without initial message).
+      // Members start at seq 0 so any future messages show as new activity.
+      if (deps.workLoopScheduler) {
+        for (const member of allMembers) {
+          deps.workLoopScheduler.trackChannel(member, channelId, 0);
+        }
+      }
+
       let messageCount = 0;
 
       // Post first message if provided
@@ -1329,11 +1372,9 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
         });
         messageCount = 1;
 
-        // Track channel participation for work loop
+        // Update the poster's seq — they've already "seen" their own message.
         if (deps.workLoopScheduler) {
-          for (const member of allMembers) {
-            deps.workLoopScheduler.trackChannel(member, channelId, seq);
-          }
+          deps.workLoopScheduler.trackChannel(callerAgentId, channelId, seq);
         }
       }
 
@@ -1348,7 +1389,7 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
         result: "completed",
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: [
           `Channel #${channelId} created.`,
@@ -1365,47 +1406,32 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_channel_post ---
 
-function createChannelPostTool(deps: ToolDeps): ToolDefinition {
+function createChannelPostTool(deps: ToolDeps): AgentTool<typeof FlockChannelPostParams, Record<string, unknown>> {
   return {
     name: "flock_channel_post",
+    label: "Channel Post",
     description:
       "Post a message to a channel. Your message is appended to the channel history " +
       "and other members see it on their next tick. @mentioned agents get an immediate tick. " +
       "Cannot post to archived channels.",
-    parameters: {
-      type: "object",
-      required: ["channelId", "message"],
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID to post to.",
-        },
-        message: {
-          type: "string",
-          description: "Message to post.",
-        },
-        notify: {
-          type: "boolean",
-          description: "If true (default), notify other channel members. Set to false to post silently.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockChannelPostParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockChannelPostParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore || !deps.channelMessages) {
-        return toOCResult({ ok: false, error: "Channel stores not available." });
+        return toResult({ ok: false, error: "Channel stores not available." });
       }
 
-      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp._callerAgentId === "string") ? rp._callerAgentId as string : "unknown";
       const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const message = typeof params.message === "string" ? params.message.trim() : "";
       const shouldNotify = params.notify !== false;
 
-      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
-      if (!message) return toOCResult({ ok: false, error: "'message' is required." });
+      if (!channelId) return toResult({ ok: false, error: "'channelId' is required." });
+      if (!message) return toResult({ ok: false, error: "'message' is required." });
 
       const channel = deps.channelStore.get(channelId);
-      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
-      if (channel.archived) return toOCResult({ ok: false, error: `Channel '${channelId}' is archived (read-only).` });
+      if (!channel) return toResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (channel.archived) return toResult({ ok: false, error: `Channel '${channelId}' is archived (read-only).` });
 
       const now = Date.now();
       const newSeq = deps.channelMessages.append({ channelId, agentId: callerAgentId, content: message, timestamp: now });
@@ -1473,7 +1499,25 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
         }
       }
 
-      return toOCResult({
+      // Steer active agents: if another member is currently mid-generation
+      // (isStreaming), inject this new message via steer() so they see it
+      // immediately rather than working with stale context.
+      if (deps.sessionManager) {
+        for (const member of channel.members) {
+          if (member === callerAgentId) continue;
+          const agent = deps.sessionManager.get(member);
+          if (!agent || !agent.state.isStreaming) continue;
+
+          agent.steer({
+            role: "user",
+            content: `[Channel Update #${channelId}] New message from ${callerAgentId} (seq ${newSeq}):\n${message}`,
+            timestamp: now,
+          });
+          deps.logger?.debug?.(`[flock:channel-post] Steered "${member}" with new message from "${callerAgentId}" in #${channelId}`);
+        }
+      }
+
+      return toResult({
         ok: true,
         output: `Message posted to #${channelId}. Channel now has ${totalCount} messages.`,
         data: { channelId, messageCount: totalCount, seq: newSeq },
@@ -1484,38 +1528,26 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_channel_read ---
 
-function createChannelReadTool(deps: ToolDeps): ToolDefinition {
+function createChannelReadTool(deps: ToolDeps): AgentTool<typeof FlockChannelReadParams, Record<string, unknown>> {
   return {
     name: "flock_channel_read",
+    label: "Channel Read",
     description:
       "Read the message history of a channel. Returns messages in chronological order " +
       "with channel metadata (name, topic, members). Use 'after' for delta reading.",
-    parameters: {
-      type: "object",
-      required: ["channelId"],
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID to read.",
-        },
-        after: {
-          type: "number",
-          description: "Only return messages with seq greater than this value (for delta reading).",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockChannelReadParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockChannelReadParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore || !deps.channelMessages) {
-        return toOCResult({ ok: false, error: "Channel stores not available." });
+        return toResult({ ok: false, error: "Channel stores not available." });
       }
 
       const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const afterSeq = typeof params.after === "number" ? params.after : 0;
 
-      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+      if (!channelId) return toResult({ ok: false, error: "'channelId' is required." });
 
       const channel = deps.channelStore.get(channelId);
-      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (!channel) return toResult({ ok: false, error: `Channel '${channelId}' not found.` });
 
       const totalCount = deps.channelMessages.count(channelId);
       const messages = afterSeq > 0
@@ -1523,7 +1555,7 @@ function createChannelReadTool(deps: ToolDeps): ToolDefinition {
         : deps.channelMessages.list({ channelId });
 
       if (messages.length === 0) {
-        return toOCResult({
+        return toResult({
           ok: true,
           output: afterSeq > 0
             ? `No new messages in #${channelId} after seq ${afterSeq}.`
@@ -1536,7 +1568,7 @@ function createChannelReadTool(deps: ToolDeps): ToolDefinition {
         `[seq ${m.seq}] ${m.agentId}: ${m.content}`
       ).join("\n\n");
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: [
           `## #${channelId} — ${channel.topic}`,
@@ -1554,27 +1586,16 @@ function createChannelReadTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_channel_list ---
 
-function createChannelListTool(deps: ToolDeps): ToolDefinition {
+function createChannelListTool(deps: ToolDeps): AgentTool<typeof FlockChannelListParams, Record<string, unknown>> {
   return {
     name: "flock_channel_list",
+    label: "Channel List",
     description:
       "List channels. Filter by membership or archive state.",
-    parameters: {
-      type: "object",
-      properties: {
-        member: {
-          type: "string",
-          description: "Filter channels containing this member agent ID.",
-        },
-        archived: {
-          type: "boolean",
-          description: "Filter by archive state. Omit for all channels.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockChannelListParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockChannelListParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore) {
-        return toOCResult({ ok: false, error: "Channel store not available." });
+        return toResult({ ok: false, error: "Channel store not available." });
       }
 
       const member = typeof params.member === "string" ? params.member.trim() || undefined : undefined;
@@ -1583,7 +1604,7 @@ function createChannelListTool(deps: ToolDeps): ToolDefinition {
       const channels = deps.channelStore.list({ member, archived });
 
       if (channels.length === 0) {
-        return toOCResult({ ok: true, output: "No channels found.", data: { channels: [] } });
+        return toResult({ ok: true, output: "No channels found.", data: { channels: [] } });
       }
 
       const lines = channels.map(ch => {
@@ -1592,7 +1613,7 @@ function createChannelListTool(deps: ToolDeps): ToolDefinition {
         return `#${ch.channelId}${status} — ${ch.topic} (${ch.members.length} members, ${msgCount} msgs)`;
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: [`## Channels (${channels.length})`, ``, ...lines].join("\n"),
         data: { channels: channels.map(ch => ({ channelId: ch.channelId, topic: ch.topic, members: ch.members, archived: ch.archived })) },
@@ -1603,37 +1624,20 @@ function createChannelListTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_assign_members ---
 
-function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
+function createAssignMembersTool(deps: ToolDeps): AgentTool<typeof FlockAssignMembersParams, Record<string, unknown>> {
   return {
     name: "flock_assign_members",
+    label: "Assign Members",
     description:
       "Add or remove members from a channel. Newly added members are auto-woken if sleeping.",
-    parameters: {
-      type: "object",
-      required: ["channelId"],
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel to modify membership of.",
-        },
-        add: {
-          type: "array",
-          items: { type: "string" },
-          description: "Agent IDs to add to the channel.",
-        },
-        remove: {
-          type: "array",
-          items: { type: "string" },
-          description: "Agent IDs to remove from the channel.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockAssignMembersParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockAssignMembersParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore) {
-        return toOCResult({ ok: false, error: "Channel store not available." });
+        return toResult({ ok: false, error: "Channel store not available." });
       }
 
-      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp._callerAgentId === "string") ? rp._callerAgentId as string : "unknown";
       const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const addRaw = params.add;
       const removeRaw = params.remove;
@@ -1644,13 +1648,13 @@ function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
           ? removeRaw.filter((m): m is string => typeof m === "string" && m.trim().length > 0).map(s => s.trim()) : []
       );
 
-      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+      if (!channelId) return toResult({ ok: false, error: "'channelId' is required." });
       if (toAdd.length === 0 && toRemove.size === 0) {
-        return toOCResult({ ok: false, error: "Provide 'add' and/or 'remove' arrays." });
+        return toResult({ ok: false, error: "Provide 'add' and/or 'remove' arrays." });
       }
 
       const channel = deps.channelStore.get(channelId);
-      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (!channel) return toResult({ ok: false, error: `Channel '${channelId}' not found.` });
 
       const updatedMembers = [...new Set([...channel.members, ...toAdd])].filter(m => !toRemove.has(m));
       const now = Date.now();
@@ -1697,7 +1701,7 @@ function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
         result: "completed",
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Updated #${channelId} members: ${updatedMembers.join(", ")}`,
         data: { channelId, members: updatedMembers },
@@ -1774,47 +1778,36 @@ function getAgentMembers(members: string[]): string[] {
 
 // --- flock_channel_archive ---
 
-function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
+function createChannelArchiveTool(deps: ToolDeps): AgentTool<typeof FlockChannelArchiveParams, Record<string, unknown>> {
   return {
     name: "flock_channel_archive",
+    label: "Channel Archive",
     description:
       "Start the archive protocol for a channel. By default, initiates a graceful wind-down: " +
       "members review history, record learnings, then call flock_archive_ready. " +
       "Use force=true for immediate archive (admin/emergency).",
-    parameters: {
-      type: "object",
-      required: ["channelId"],
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID to archive.",
-        },
-        force: {
-          type: "boolean",
-          description: "If true, archive immediately without waiting for members. Default: false.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockChannelArchiveParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockChannelArchiveParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore) {
-        return toOCResult({ ok: false, error: "Channel store not available." });
+        return toResult({ ok: false, error: "Channel store not available." });
       }
 
-      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp._callerAgentId === "string") ? rp._callerAgentId as string : "unknown";
       const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
       const force = params.force === true;
 
-      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+      if (!channelId) return toResult({ ok: false, error: "'channelId' is required." });
 
       const channel = deps.channelStore.get(channelId);
-      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
-      if (channel.archived) return toOCResult({ ok: true, output: `Channel #${channelId} is already archived.` });
+      if (!channel) return toResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (channel.archived) return toResult({ ok: true, output: `Channel #${channelId} is already archived.` });
 
       // --- Force archive: immediate ---
       if (force) {
         const { bridgesDeactivated } = await finalizeArchive(deps, channelId, callerAgentId);
         const bridgeNote = bridgesDeactivated > 0 ? ` ${bridgesDeactivated} bridge(s) notified and deactivated.` : "";
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `Channel #${channelId} archived (forced). No new messages can be posted.${bridgeNote}`,
           data: { channelId, archived: true, bridgesDeactivated },
@@ -1827,7 +1820,7 @@ function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
       if (channel.archivingStartedAt !== null) {
         const agentMembers = getAgentMembers(channel.members);
         const ready = channel.archiveReadyMembers;
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `Archive protocol already in progress for #${channelId}. ` +
             `Ready: ${ready.length}/${agentMembers.length} agent members. ` +
@@ -1870,7 +1863,7 @@ function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
         result: "completed",
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Archive protocol started for #${channelId}. ` +
           `${agentMembers.length} agent member(s) need to call flock_archive_ready. ` +
@@ -1884,47 +1877,40 @@ function createChannelArchiveTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_archive_ready ---
 
-function createArchiveReadyTool(deps: ToolDeps): ToolDefinition {
+function createArchiveReadyTool(deps: ToolDeps): AgentTool<typeof FlockArchiveReadyParams, Record<string, unknown>> {
   return {
     name: "flock_archive_ready",
+    label: "Archive Ready",
     description:
       "Signal that you have finished reviewing channel history and recording learnings. " +
       "When all agent members signal ready, the channel is automatically archived.",
-    parameters: {
-      type: "object",
-      required: ["channelId"],
-      properties: {
-        channelId: {
-          type: "string",
-          description: "Channel ID to signal readiness for.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockArchiveReadyParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockArchiveReadyParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.channelStore) {
-        return toOCResult({ ok: false, error: "Channel store not available." });
+        return toResult({ ok: false, error: "Channel store not available." });
       }
 
-      const callerAgentId = (typeof params._callerAgentId === "string") ? params._callerAgentId : "unknown";
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp._callerAgentId === "string") ? rp._callerAgentId as string : "unknown";
       const channelId = typeof params.channelId === "string" ? params.channelId.trim() : "";
 
-      if (!channelId) return toOCResult({ ok: false, error: "'channelId' is required." });
+      if (!channelId) return toResult({ ok: false, error: "'channelId' is required." });
 
       const channel = deps.channelStore.get(channelId);
-      if (!channel) return toOCResult({ ok: false, error: `Channel '${channelId}' not found.` });
-      if (channel.archived) return toOCResult({ ok: true, output: `Channel #${channelId} is already archived.` });
+      if (!channel) return toResult({ ok: false, error: `Channel '${channelId}' not found.` });
+      if (channel.archived) return toResult({ ok: true, output: `Channel #${channelId} is already archived.` });
 
       if (channel.archivingStartedAt === null) {
-        return toOCResult({ ok: false, error: `Channel #${channelId} is not in archive protocol. Call flock_channel_archive first.` });
+        return toResult({ ok: false, error: `Channel #${channelId} is not in archive protocol. Call flock_channel_archive first.` });
       }
 
       if (!channel.members.includes(callerAgentId)) {
-        return toOCResult({ ok: false, error: `You (${callerAgentId}) are not a member of #${channelId}.` });
+        return toResult({ ok: false, error: `You (${callerAgentId}) are not a member of #${channelId}.` });
       }
 
       if (channel.archiveReadyMembers.includes(callerAgentId)) {
         const agentMembers = getAgentMembers(channel.members);
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `You already signaled ready for #${channelId}. (${channel.archiveReadyMembers.length}/${agentMembers.length} ready)`,
         });
@@ -1967,7 +1953,7 @@ function createArchiveReadyTool(deps: ToolDeps): ToolDefinition {
       if (allReady) {
         const { bridgesDeactivated } = await finalizeArchive(deps, channelId, callerAgentId);
         const bridgeNote = bridgesDeactivated > 0 ? ` ${bridgesDeactivated} bridge(s) deactivated.` : "";
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `All ${totalAgents} agent member(s) ready. Channel #${channelId} has been archived.${bridgeNote}`,
           data: { channelId, archived: true, readyCount, totalAgents, bridgesDeactivated },
@@ -1975,7 +1961,7 @@ function createArchiveReadyTool(deps: ToolDeps): ToolDefinition {
       }
 
       const waiting = agentMembers.filter(m => !newReady.includes(m));
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Readiness recorded. ${readyCount}/${totalAgents} agent members ready. Waiting: [${waiting.join(", ")}].`,
         data: { channelId, readyCount, totalAgents, waiting },
@@ -1986,37 +1972,17 @@ function createArchiveReadyTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_discover ---
 
-function createDiscoverTool(deps: ToolDeps): ToolDefinition {
+function createDiscoverTool(deps: ToolDeps): AgentTool<typeof FlockDiscoverParams, Record<string, unknown>> {
   return {
     name: "flock_discover",
+    label: "Flock Discover",
     description:
       "Discover available agents in the swarm. Query by role, skill, or free-text. " +
       "Returns agent profiles with capabilities and recent task completion stats.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Free-text search across agent names, descriptions, and skills",
-        },
-        role: {
-          type: "string",
-          enum: ["worker", "sysadmin", "orchestrator"],
-          description: "Filter by agent role",
-        },
-        skill: {
-          type: "string",
-          description: "Filter by skill tag (e.g. 'implement', 'review', 'research')",
-        },
-        limit: {
-          type: "number",
-          description: "Max results to return. Default: 20",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockDiscoverParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockDiscoverParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.a2aServer) {
-        return toOCResult({ ok: false, error: "A2A transport not initialized." });
+        return toResult({ ok: false, error: "A2A transport not initialized." });
       }
 
       const query = typeof params.query === "string" ? params.query.trim().toLowerCase() : "";
@@ -2057,7 +2023,8 @@ function createDiscoverTool(deps: ToolDeps): ToolDefinition {
 
       // Build output with task stats if TaskStore is available
       const taskStore = deps.taskStore;
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
+      const rp = params as Record<string, unknown>;
+      const _callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown");
 
       const agents = entries.map((e) => {
         const skills = (e.card.skills ?? []).map((s) => ({
@@ -2087,7 +2054,7 @@ function createDiscoverTool(deps: ToolDeps): ToolDefinition {
       });
 
       if (agents.length === 0) {
-        return toOCResult({ ok: true, output: "No agents found matching the query.", data: { agents: [] } });
+        return toResult({ ok: true, output: "No agents found matching the query.", data: { agents: [] } });
       }
 
       const lines = [
@@ -2102,7 +2069,7 @@ function createDiscoverTool(deps: ToolDeps): ToolDefinition {
         }),
       ];
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: lines.join("\n"),
         data: { agents },
@@ -2113,42 +2080,18 @@ function createDiscoverTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_history ---
 
-function createHistoryTool(deps: ToolDeps): ToolDefinition {
+function createHistoryTool(deps: ToolDeps): AgentTool<typeof FlockHistoryParams, Record<string, unknown>> {
   return {
     name: "flock_history",
+    label: "Flock History",
     description:
       "Query past task completions and collaboration patterns. " +
       "Shows who worked with whom, what tasks completed or failed, and patterns over time.",
-    parameters: {
-      type: "object",
-      properties: {
-        agentId: {
-          type: "string",
-          description: "Filter by agent (as sender or receiver)",
-        },
-        messageType: {
-          type: "string",
-          description: "Filter by message type",
-        },
-        state: {
-          type: "string",
-          enum: [...TASK_STATES],
-          description: "Filter by task state",
-        },
-        since: {
-          type: "number",
-          description: "Only tasks created after this epoch ms timestamp",
-        },
-        limit: {
-          type: "number",
-          description: "Max entries to return. Default: 20",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockHistoryParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockHistoryParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const taskStore = deps.taskStore;
       if (!taskStore) {
-        return toOCResult({ ok: false, error: "Task store not available." });
+        return toResult({ ok: false, error: "Task store not available." });
       }
 
       const agentId = typeof params.agentId === "string" ? params.agentId.trim() : "";
@@ -2160,7 +2103,7 @@ function createHistoryTool(deps: ToolDeps): ToolDefinition {
 
       // Validate state if provided
       if (stateParam && !isTaskState(stateParam)) {
-        return toOCResult({ ok: false, error: `Invalid state: ${stateParam}. Valid: ${TASK_STATES.join(", ")}` });
+        return toResult({ ok: false, error: `Invalid state: ${stateParam}. Valid: ${TASK_STATES.join(", ")}` });
       }
 
       // If agentId provided, query both directions and merge
@@ -2198,7 +2141,7 @@ function createHistoryTool(deps: ToolDeps): ToolDefinition {
       }
 
       if (records.length === 0) {
-        return toOCResult({ ok: true, output: "No task history found matching the query.", data: { tasks: [] } });
+        return toResult({ ok: true, output: "No task history found matching the query.", data: { tasks: [] } });
       }
 
       const lines = [
@@ -2212,7 +2155,7 @@ function createHistoryTool(deps: ToolDeps): ToolDefinition {
         }),
       ];
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: lines.join("\n"),
         data: {
@@ -2234,45 +2177,30 @@ function createHistoryTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_tasks ---
 
-function createTasksTool(deps: ToolDeps): ToolDefinition {
+function createTasksTool(deps: ToolDeps): AgentTool<typeof FlockTasksParams, Record<string, unknown>> {
   return {
     name: "flock_tasks",
+    label: "Flock Tasks",
     description:
       "List tasks for the calling agent. Shows both sent and received tasks " +
       "with their current state. Use to track pending work and check on requests you've made.",
-    parameters: {
-      type: "object",
-      properties: {
-        direction: {
-          type: "string",
-          enum: ["sent", "received", "all"],
-          description: "Filter by direction: sent (tasks you created), received (tasks assigned to you), all (both). Default: all",
-        },
-        state: {
-          type: "string",
-          enum: [...TASK_STATES],
-          description: "Filter by task state",
-        },
-        limit: {
-          type: "number",
-          description: "Max tasks to return. Default: 20",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockTasksParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockTasksParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const taskStore = deps.taskStore;
       if (!taskStore) {
-        return toOCResult({ ok: false, error: "Task store not available." });
+        return toResult({ ok: false, error: "Task store not available." });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
+      // Read injected caller from _callerAgentId (set by wrapToolWithAgentId)
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown");
       const direction = typeof params.direction === "string" ? params.direction.trim() : "all";
       const stateParam = typeof params.state === "string" ? params.state.trim() : "";
       const rawLimit = typeof params.limit === "number" ? params.limit : 20;
       const limit = Math.min(Math.max(1, rawLimit), QUERY_LIMIT_MAX);
 
       if (stateParam && !isTaskState(stateParam)) {
-        return toOCResult({ ok: false, error: `Invalid state: ${stateParam}. Valid: ${TASK_STATES.join(", ")}` });
+        return toResult({ ok: false, error: `Invalid state: ${stateParam}. Valid: ${TASK_STATES.join(", ")}` });
       }
 
       const baseFilter: TaskFilter = {
@@ -2302,7 +2230,7 @@ function createTasksTool(deps: ToolDeps): ToolDefinition {
       }
 
       if (records.length === 0) {
-        return toOCResult({ ok: true, output: "No tasks found.", data: { tasks: [] } });
+        return toResult({ ok: true, output: "No tasks found.", data: { tasks: [] } });
       }
 
       const lines = [
@@ -2320,7 +2248,7 @@ function createTasksTool(deps: ToolDeps): ToolDefinition {
         }),
       ];
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: lines.join("\n"),
         data: {
@@ -2343,52 +2271,42 @@ function createTasksTool(deps: ToolDeps): ToolDefinition {
 
 // --- flock_task_respond ---
 
-function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
+function createTaskRespondTool(deps: ToolDeps): AgentTool<typeof FlockTaskRespondParams, Record<string, unknown>> {
   return {
     name: "flock_task_respond",
+    label: "Task Respond",
     description:
       "Respond to a task that requires your input (state: input-required). " +
       "Use when another agent has asked you a clarification question during task processing.",
-    parameters: {
-      type: "object",
-      required: ["taskId", "response"],
-      properties: {
-        taskId: {
-          type: "string",
-          description: "The task ID to respond to",
-        },
-        response: {
-          type: "string",
-          description: "Your response to the clarification question",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockTaskRespondParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockTaskRespondParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const taskStore = deps.taskStore;
       if (!taskStore) {
-        return toOCResult({ ok: false, error: "Task store not available." });
+        return toResult({ ok: false, error: "Task store not available." });
       }
 
-      const callerAgentId = (typeof params.agentId === "string" && params.agentId.trim()) ? params.agentId.trim() : (typeof params._callerAgentId === "string" ? params._callerAgentId : "unknown");
+      // Read injected caller from _callerAgentId (set by wrapToolWithAgentId)
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = (typeof rp.agentId === "string" && (rp.agentId as string).trim()) ? (rp.agentId as string).trim() : (typeof rp._callerAgentId === "string" ? rp._callerAgentId as string : "unknown");
       const taskId = typeof params.taskId === "string" ? params.taskId.trim() : "";
       const response = typeof params.response === "string" ? params.response.trim() : "";
 
       if (!taskId) {
-        return toOCResult({ ok: false, error: "taskId is required." });
+        return toResult({ ok: false, error: "taskId is required." });
       }
       if (!response) {
-        return toOCResult({ ok: false, error: "response is required." });
+        return toResult({ ok: false, error: "response is required." });
       }
 
       // Look up the task
       const task = taskStore.get(taskId);
       if (!task) {
-        return toOCResult({ ok: false, error: `Task not found: ${taskId}` });
+        return toResult({ ok: false, error: `Task not found: ${taskId}` });
       }
 
       // Verify the caller is the intended recipient
       if (task.toAgentId !== callerAgentId) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Permission denied: task ${taskId} is addressed to ${task.toAgentId}, not ${callerAgentId}.`,
         });
@@ -2396,7 +2314,7 @@ function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
 
       // Verify the task is in input-required state
       if (task.state !== "input-required") {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: `Task ${taskId} is in state "${task.state}", not "input-required". Only input-required tasks can be responded to.`,
         });
@@ -2442,7 +2360,7 @@ function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
         result: "working",
       });
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `Response recorded for task ${taskId}. Task state updated to "working".`,
         data: {
@@ -2457,84 +2375,43 @@ function createTaskRespondTool(deps: ToolDeps): ToolDefinition {
 
 // --- Bridge tool ---
 
-const VALID_BRIDGE_PLATFORMS = new Set(["discord", "slack"]);
+const VALID_BRIDGE_PLATFORMS: ReadonlySet<BridgePlatform> = new Set<BridgePlatform>(["discord", "slack"]);
 const VALID_BRIDGE_ACTIONS = new Set(["create", "remove", "list", "pause", "resume"]);
 
-function createBridgeTool(deps: ToolDeps): ToolDefinition {
+function isBridgePlatform(v: string): v is BridgePlatform {
+  return VALID_BRIDGE_PLATFORMS.has(v as BridgePlatform);
+}
+
+function createBridgeTool(deps: ToolDeps): AgentTool<typeof FlockBridgeParams, Record<string, unknown>> {
   return {
     name: "flock_bridge",
+    label: "Flock Bridge",
     description: "Manage bridges between Flock channels and external platforms (Discord/Slack). " +
       "Bridges relay messages bidirectionally: external platform messages appear in the Flock channel, " +
       "and agent posts in the Flock channel are sent to the external platform.",
-    parameters: {
-      type: "object" as const,
-      properties: {
-        action: {
-          type: "string",
-          enum: ["create", "remove", "list", "pause", "resume"],
-          description: "Action to perform.",
-        },
-        channelId: {
-          type: "string",
-          description: "Flock channel ID (required for create).",
-        },
-        platform: {
-          type: "string",
-          enum: ["discord", "slack"],
-          description: "External platform (required for create).",
-        },
-        externalChannelId: {
-          type: "string",
-          description: "Discord/Slack channel ID to bridge to (required for create, unless createChannel is true).",
-        },
-        createChannel: {
-          type: "boolean",
-          description: "If true, auto-create a Discord text channel in the specified guild. Requires guildId and platform='discord'.",
-        },
-        guildId: {
-          type: "string",
-          description: "Discord guild (server) ID. Required when createChannel is true.",
-        },
-        channelName: {
-          type: "string",
-          description: "Name for the auto-created Discord channel. Defaults to the Flock channelId. Only used with createChannel=true.",
-        },
-        categoryId: {
-          type: "string",
-          description: "Discord category ID to place the auto-created channel in. Only used with createChannel=true.",
-        },
-        accountId: {
-          type: "string",
-          description: "Optional: specific bot account ID for sending messages.",
-        },
-        bridgeId: {
-          type: "string",
-          description: "Bridge ID (required for remove/pause/resume).",
-        },
-      },
-      required: ["action"],
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: FlockBridgeParams,
+    async execute(_toolCallId: string, params: Static<typeof FlockBridgeParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       if (!deps.bridgeStore) {
-        return toOCResult({ ok: false, error: "Bridge store not available." });
+        return toResult({ ok: false, error: "Bridge store not available." });
       }
 
       const action = String(params.action ?? "");
       if (!VALID_BRIDGE_ACTIONS.has(action)) {
-        return toOCResult({ ok: false, error: `Invalid action: "${action}". Must be one of: ${[...VALID_BRIDGE_ACTIONS].join(", ")}` });
+        return toResult({ ok: false, error: `Invalid action: "${action}". Must be one of: ${[...VALID_BRIDGE_ACTIONS].join(", ")}` });
       }
 
-      const callerAgentId = String(params.agentId ?? "unknown");
+      const rp = params as Record<string, unknown>;
+      const callerAgentId = String(rp.agentId ?? "unknown");
       const store = deps.bridgeStore;
 
       if (action === "list") {
-        const filter: Record<string, unknown> = {};
+        const filter: BridgeFilter = {};
         if (params.channelId) filter.channelId = String(params.channelId);
-        if (params.platform && VALID_BRIDGE_PLATFORMS.has(String(params.platform))) {
-          filter.platform = String(params.platform);
+        if (params.platform && isBridgePlatform(String(params.platform))) {
+          filter.platform = String(params.platform) as BridgePlatform;
         }
-        const bridges = store.list(filter as any);
-        return toOCResult({
+        const bridges = store.list(filter);
+        return toResult({
           ok: true,
           output: bridges.length === 0
             ? "No bridge mappings found."
@@ -2552,29 +2429,29 @@ function createBridgeTool(deps: ToolDeps): ToolDefinition {
         const channelName = String(params.channelName ?? "") || channelId;
         const categoryId = typeof params.categoryId === "string" ? params.categoryId : undefined;
 
-        if (!channelId) return toOCResult({ ok: false, error: "channelId is required for create." });
-        if (!VALID_BRIDGE_PLATFORMS.has(platform)) {
-          return toOCResult({ ok: false, error: `Invalid platform: "${platform}". Must be "discord" or "slack".` });
+        if (!channelId) return toResult({ ok: false, error: "channelId is required for create." });
+        if (!isBridgePlatform(platform)) {
+          return toResult({ ok: false, error: `Invalid platform: "${platform}". Must be "discord" or "slack".` });
         }
 
         // Verify channel exists
         const flockChannel = deps.channelStore?.get(channelId);
         if (deps.channelStore) {
-          if (!flockChannel) return toOCResult({ ok: false, error: `Flock channel "${channelId}" not found.` });
-          if (flockChannel.archived) return toOCResult({ ok: false, error: `Flock channel "${channelId}" is archived.` });
+          if (!flockChannel) return toResult({ ok: false, error: `Flock channel "${channelId}" not found.` });
+          if (flockChannel.archived) return toResult({ ok: false, error: `Flock channel "${channelId}" is archived.` });
         }
 
         // Auto-create external channel if requested
         let createdChannelName: string | undefined;
         if (shouldCreateChannel) {
           if (platform !== "discord") {
-            return toOCResult({ ok: false, error: "createChannel is only supported for platform 'discord'. Slack channel creation is not yet supported." });
+            return toResult({ ok: false, error: "createChannel is only supported for platform 'discord'. Slack channel creation is not yet supported." });
           }
           if (!guildId) {
-            return toOCResult({ ok: false, error: "guildId is required when createChannel is true." });
+            return toResult({ ok: false, error: "guildId is required when createChannel is true." });
           }
           if (!deps.discordBotToken) {
-            return toOCResult({ ok: false, error: "Discord bot token not configured. Cannot create channels." });
+            return toResult({ ok: false, error: "Discord bot token not configured. Cannot create channels." });
           }
           try {
             const result = await createDiscordChannel(deps.discordBotToken, guildId, channelName, {
@@ -2586,16 +2463,16 @@ function createBridgeTool(deps: ToolDeps): ToolDefinition {
             deps.logger?.info(`[flock:bridge] Auto-created Discord channel "${result.channelName}" (${result.channelId}) in guild ${guildId}`);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            return toOCResult({ ok: false, error: `Failed to create Discord channel: ${msg}` });
+            return toResult({ ok: false, error: `Failed to create Discord channel: ${msg}` });
           }
         } else {
-          if (!externalChannelId) return toOCResult({ ok: false, error: "externalChannelId is required for create (or use createChannel=true to auto-create)." });
+          if (!externalChannelId) return toResult({ ok: false, error: "externalChannelId is required for create (or use createChannel=true to auto-create)." });
         }
 
         // Check for duplicate
-        const existing = store.getByExternal(platform as any, externalChannelId);
+        const existing = store.getByExternal(platform, externalChannelId);
         if (existing) {
-          return toOCResult({
+          return toResult({
             ok: false,
             error: `External channel ${platform}/${externalChannelId} is already bridged to flock/${existing.channelId} (bridge: ${existing.bridgeId}).`,
           });
@@ -2620,7 +2497,7 @@ function createBridgeTool(deps: ToolDeps): ToolDefinition {
         store.insert({
           bridgeId,
           channelId,
-          platform: platform as any,
+          platform,
           externalChannelId,
           accountId: params.accountId ? String(params.accountId) : null,
           webhookUrl,
@@ -2640,7 +2517,7 @@ function createBridgeTool(deps: ToolDeps): ToolDefinition {
           result: "created",
         });
 
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `Bridge created: flock/${channelId} ↔ ${platform}/${externalChannelId}${createdNote}${webhookUrl ? " (webhook enabled — per-agent display names)" : " (prefix mode)"}`,
           data: { bridgeId, channelId, platform, externalChannelId, webhookUrl: !!webhookUrl, channelCreated: !!createdChannelName },
@@ -2649,10 +2526,10 @@ function createBridgeTool(deps: ToolDeps): ToolDefinition {
 
       // remove / pause / resume require bridgeId
       const bridgeId = String(params.bridgeId ?? "");
-      if (!bridgeId) return toOCResult({ ok: false, error: `bridgeId is required for ${action}.` });
+      if (!bridgeId) return toResult({ ok: false, error: `bridgeId is required for ${action}.` });
 
       const bridge = store.get(bridgeId);
-      if (!bridge) return toOCResult({ ok: false, error: `Bridge "${bridgeId}" not found.` });
+      if (!bridge) return toResult({ ok: false, error: `Bridge "${bridgeId}" not found.` });
 
       if (action === "remove") {
         store.delete(bridgeId);
@@ -2665,22 +2542,22 @@ function createBridgeTool(deps: ToolDeps): ToolDefinition {
           detail: `Removed bridge ${bridgeId}: flock/${bridge.channelId} ↔ ${bridge.platform}/${bridge.externalChannelId}`,
           result: "removed",
         });
-        return toOCResult({ ok: true, output: `Bridge "${bridgeId}" removed.` });
+        return toResult({ ok: true, output: `Bridge "${bridgeId}" removed.` });
       }
 
       if (action === "pause") {
-        if (!bridge.active) return toOCResult({ ok: true, output: `Bridge "${bridgeId}" is already paused.` });
+        if (!bridge.active) return toResult({ ok: true, output: `Bridge "${bridgeId}" is already paused.` });
         store.update(bridgeId, { active: false });
-        return toOCResult({ ok: true, output: `Bridge "${bridgeId}" paused.` });
+        return toResult({ ok: true, output: `Bridge "${bridgeId}" paused.` });
       }
 
       if (action === "resume") {
-        if (bridge.active) return toOCResult({ ok: true, output: `Bridge "${bridgeId}" is already active.` });
+        if (bridge.active) return toResult({ ok: true, output: `Bridge "${bridgeId}" is already active.` });
         store.update(bridgeId, { active: true });
-        return toOCResult({ ok: true, output: `Bridge "${bridgeId}" resumed.` });
+        return toResult({ ok: true, output: `Bridge "${bridgeId}" resumed.` });
       }
 
-      return toOCResult({ ok: false, error: `Unknown action: "${action}"` });
+      return toResult({ ok: false, error: `Unknown action: "${action}"` });
     },
   };
 }

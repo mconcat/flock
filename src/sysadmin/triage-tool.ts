@@ -17,8 +17,9 @@
  * No text parsing. No gateway bypass. Deterministic structured output.
  */
 
-import type { ToolDefinition, ToolResultOC } from "../types.js";
-import { toOCResult } from "../types.js";
+import { Type, type Static } from "@mariozechner/pi-ai";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { toResult } from "../tools/result.js";
 import type { TriageResult } from "../transport/types.js";
 
 // --- Types ---
@@ -49,74 +50,72 @@ export function _getCaptureStoreSize(): number {
   return triageCaptures.size;
 }
 
+// --- TypeBox Schema ---
+
+const TriageDecisionParams = Type.Object({
+  request_id: Type.String({
+    description: "The request ID from the triage prompt header.",
+  }),
+  level: Type.Union([
+    Type.Literal("GREEN"),
+    Type.Literal("YELLOW"),
+    Type.Literal("RED"),
+  ], {
+    description:
+      "GREEN: safe, auto-execute. " +
+      "YELLOW: execute with review/logging. " +
+      "RED: block, requires human approval.",
+  }),
+  reasoning: Type.String({
+    description:
+      "Why you chose this classification. " +
+      "Include risk assessment, blast radius, and reversibility analysis.",
+  }),
+  action_plan: Type.String({
+    description:
+      "GREEN/YELLOW: what would be executed. " +
+      "RED: what the human should evaluate and why it's dangerous.",
+  }),
+  risk_factors: Type.Optional(Type.Array(Type.String(), {
+    description: "Specific risk factors identified in this request.",
+  })),
+});
+
 // --- Tool ---
 
 const VALID_LEVELS = new Set(["GREEN", "YELLOW", "RED"]);
 
 /**
- * Create the triage_decision tool definition.
+ * Create the triage_decision AgentTool.
  *
- * OpenClaw execute signature: (toolCallId, params, signal?, onUpdate?)
- * Returns: { content: [{ type: "text", text }] }
+ * Execute signature: (toolCallId, params, signal?, onUpdate?)
+ * Returns: AgentToolResult
  */
-export function createTriageDecisionTool(): ToolDefinition {
+export function createTriageDecisionTool(): AgentTool<typeof TriageDecisionParams, Record<string, unknown>> {
   return {
     name: "triage_decision",
+    label: "Triage Decision",
     description:
       "Submit your triage classification for an agent request. " +
       "Call this when you classify a request as GREEN, YELLOW, or RED. " +
       "Do NOT call for WHITE (no triage needed). " +
       "Include the request-id from the request metadata.",
-    parameters: {
-      type: "object",
-      required: ["request_id", "level", "reasoning", "action_plan"],
-      properties: {
-        request_id: {
-          type: "string",
-          description: "The request ID from the triage prompt header.",
-        },
-        level: {
-          type: "string",
-          enum: ["GREEN", "YELLOW", "RED"],
-          description:
-            "GREEN: safe, auto-execute. " +
-            "YELLOW: execute with review/logging. " +
-            "RED: block, requires human approval.",
-        },
-        reasoning: {
-          type: "string",
-          description:
-            "Why you chose this classification. " +
-            "Include risk assessment, blast radius, and reversibility analysis.",
-        },
-        action_plan: {
-          type: "string",
-          description:
-            "GREEN/YELLOW: what would be executed. " +
-            "RED: what the human should evaluate and why it's dangerous.",
-        },
-        risk_factors: {
-          type: "array",
-          items: { type: "string" },
-          description: "Specific risk factors identified in this request.",
-        },
-      },
-    },
+    parameters: TriageDecisionParams,
     async execute(
       _toolCallId: string,
-      params: Record<string, unknown>,
-    ): Promise<ToolResultOC> {
+      params: Static<typeof TriageDecisionParams>,
+    ): Promise<AgentToolResult<Record<string, unknown>>> {
       const requestId = typeof params.request_id === "string"
         ? params.request_id.trim()
         : "";
 
       if (!requestId) {
-        return toOCResult({ ok: false, error: "request_id is required" });
+        return toResult({ ok: false, error: "request_id is required" });
       }
 
       const call = parseTriageParams(params);
       if (!call) {
-        return toOCResult({
+        return toResult({
           ok: false,
           error: "Invalid triage parameters. Required: level (GREEN/YELLOW/RED), reasoning, action_plan.",
         });
@@ -129,7 +128,7 @@ export function createTriageDecisionTool(): ToolDefinition {
       setTimeout(() => triageCaptures.delete(requestId), 5 * 60_000);
 
       const icon = { GREEN: "🟢", YELLOW: "🟡", RED: "🔴" }[call.level];
-      return toOCResult({
+      return toResult({
         ok: true,
         output: `${icon} Triage classification recorded: ${call.level}`,
         data: { level: call.level, requestId },

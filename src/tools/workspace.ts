@@ -13,8 +13,9 @@
 
 import { readdir, readFile, writeFile, mkdir, stat, lstat, realpath } from "node:fs/promises";
 import { resolve, join, relative, sep } from "node:path";
-import type { ToolDefinition, ToolResultOC } from "../types.js";
-import { toOCResult } from "../types.js";
+import { Type, type Static } from "@mariozechner/pi-ai";
+import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { toResult } from "./result.js";
 import type { ToolDeps } from "./index.js";
 
 type PathResult = { ok: true; resolved: string } | { ok: false; error: string };
@@ -179,6 +180,30 @@ async function buildTree(dirPath: string, prefix: string, maxDepth: number, curr
   return lines;
 }
 
+// --- TypeBox Schemas ---
+
+const WorkspaceListParams = Type.Object({
+  workspace: Type.Optional(Type.String({
+    description: "Optional workspace name to list files for. Omit to list all workspaces.",
+  })),
+});
+
+const WorkspaceReadParams = Type.Object({
+  workspace: Type.String({ description: "Workspace name" }),
+  path: Type.String({ description: "File path relative to workspace root (e.g. 'docs/readme.md')" }),
+});
+
+const WorkspaceWriteParams = Type.Object({
+  workspace: Type.String({ description: "Workspace name" }),
+  path: Type.String({ description: "File path relative to workspace root (e.g. 'projects/new-spec.md')" }),
+  content: Type.String({ description: "File content to write" }),
+});
+
+const WorkspaceTreeParams = Type.Object({
+  workspace: Type.String({ description: "Workspace name" }),
+  maxDepth: Type.Optional(Type.Number({ description: "Maximum depth to traverse. Default: 3" })),
+});
+
 // --- Tool Definitions ---
 
 export interface WorkspaceToolDeps extends ToolDeps {
@@ -188,9 +213,10 @@ export interface WorkspaceToolDeps extends ToolDeps {
 /**
  * Create all workspace tools.
  * @param deps - Standard tool dependencies plus vaultsBasePath
- * @returns Array of 4 workspace tool definitions
+ * @returns Array of 4 workspace AgentTool definitions
  */
-export function createWorkspaceTools(deps: WorkspaceToolDeps): ToolDefinition[] {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi-agent-core uses AgentTool<any>[] for heterogeneous tool arrays (see AgentState.tools)
+export function createWorkspaceTools(deps: WorkspaceToolDeps): Array<AgentTool<any>> {
   return [
     createWorkspaceListTool(deps),
     createWorkspaceReadTool(deps),
@@ -201,23 +227,16 @@ export function createWorkspaceTools(deps: WorkspaceToolDeps): ToolDefinition[] 
 
 // --- flock_workspace_list ---
 
-function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
+function createWorkspaceListTool(deps: WorkspaceToolDeps): AgentTool<typeof WorkspaceListParams, Record<string, unknown>> {
   return {
     name: "flock_workspace_list",
+    label: "Workspace List",
     description:
       "List available workspaces, or list files in a specific workspace. " +
       "Without arguments, returns all workspace names with file counts. " +
       "With a workspace name, returns the list of files in that workspace.",
-    parameters: {
-      type: "object",
-      properties: {
-        workspace: {
-          type: "string",
-          description: "Optional workspace name to list files for. Omit to list all workspaces.",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: WorkspaceListParams,
+    async execute(_toolCallId: string, params: Static<typeof WorkspaceListParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const basePath = resolve(deps.vaultsBasePath);
       const workspace = typeof params.workspace === "string" ? params.workspace.trim() : "";
 
@@ -228,7 +247,7 @@ function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
           entries = await readdir(basePath, { withFileTypes: true });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          return toOCResult({ ok: false, error: `Cannot read vaults directory: ${msg}` });
+          return toResult({ ok: false, error: `Cannot read vaults directory: ${msg}` });
         }
 
         const workspaces: Array<{ name: string; fileCount: number }> = [];
@@ -240,7 +259,7 @@ function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
         }
 
         if (workspaces.length === 0) {
-          return toOCResult({
+          return toResult({
             ok: true,
             output: "No workspaces found.",
             data: { workspaces: [] },
@@ -253,7 +272,7 @@ function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
           ...workspaces.map((w) => `- **${w.name}** — ${w.fileCount} file(s)`),
         ];
 
-        return toOCResult({
+        return toResult({
           ok: true,
           output: lines.join("\n"),
           data: { workspaces },
@@ -263,19 +282,19 @@ function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
       // List files in a specific workspace
       const pathResult = await resolveWorkspacePath(basePath, workspace);
       if (!pathResult.ok) {
-        return toOCResult({ ok: false, error: pathResult.error });
+        return toResult({ ok: false, error: pathResult.error });
       }
 
       try {
         await stat(pathResult.resolved);
       } catch {
-        return toOCResult({ ok: false, error: `Workspace "${workspace}" does not exist.` });
+        return toResult({ ok: false, error: `Workspace "${workspace}" does not exist.` });
       }
 
       const files = await listFiles(pathResult.resolved, pathResult.resolved);
 
       if (files.length === 0) {
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `Workspace "${workspace}" is empty.`,
           data: { workspace, files: [] },
@@ -288,7 +307,7 @@ function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
         ...files.map((f) => `- ${f}`),
       ];
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output: lines.join("\n"),
         data: { workspace, files },
@@ -299,46 +318,34 @@ function createWorkspaceListTool(deps: WorkspaceToolDeps): ToolDefinition {
 
 // --- flock_workspace_read ---
 
-function createWorkspaceReadTool(deps: WorkspaceToolDeps): ToolDefinition {
+function createWorkspaceReadTool(deps: WorkspaceToolDeps): AgentTool<typeof WorkspaceReadParams, Record<string, unknown>> {
   return {
     name: "flock_workspace_read",
+    label: "Workspace Read",
     description:
       "Read a file from a workspace. Returns the file content as text. " +
       "Path is relative to the workspace root (e.g. 'projects/logging-spec.md').",
-    parameters: {
-      type: "object",
-      required: ["workspace", "path"],
-      properties: {
-        workspace: {
-          type: "string",
-          description: "Workspace name",
-        },
-        path: {
-          type: "string",
-          description: "File path relative to workspace root (e.g. 'docs/readme.md')",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: WorkspaceReadParams,
+    async execute(_toolCallId: string, params: Static<typeof WorkspaceReadParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const basePath = resolve(deps.vaultsBasePath);
       const workspace = typeof params.workspace === "string" ? params.workspace.trim() : "";
       const filePath = typeof params.path === "string" ? params.path.trim() : "";
 
       if (!workspace) {
-        return toOCResult({ ok: false, error: "'workspace' is required." });
+        return toResult({ ok: false, error: "'workspace' is required." });
       }
       if (!filePath) {
-        return toOCResult({ ok: false, error: "'path' is required." });
+        return toResult({ ok: false, error: "'path' is required." });
       }
 
       const pathResult = await resolveWorkspacePath(basePath, workspace, filePath);
       if (!pathResult.ok) {
-        return toOCResult({ ok: false, error: pathResult.error });
+        return toResult({ ok: false, error: pathResult.error });
       }
 
       try {
         const content = await readFile(pathResult.resolved, "utf-8");
-        return toOCResult({
+        return toResult({
           ok: true,
           output: content,
           data: {
@@ -350,9 +357,9 @@ function createWorkspaceReadTool(deps: WorkspaceToolDeps): ToolDefinition {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("ENOENT")) {
-          return toOCResult({ ok: false, error: `File not found: ${workspace}/${filePath}` });
+          return toResult({ ok: false, error: `File not found: ${workspace}/${filePath}` });
         }
-        return toOCResult({ ok: false, error: `Cannot read file: ${msg}` });
+        return toResult({ ok: false, error: `Cannot read file: ${msg}` });
       }
     },
   };
@@ -360,60 +367,44 @@ function createWorkspaceReadTool(deps: WorkspaceToolDeps): ToolDefinition {
 
 // --- flock_workspace_write ---
 
-function createWorkspaceWriteTool(deps: WorkspaceToolDeps): ToolDefinition {
+function createWorkspaceWriteTool(deps: WorkspaceToolDeps): AgentTool<typeof WorkspaceWriteParams, Record<string, unknown>> {
   return {
     name: "flock_workspace_write",
+    label: "Workspace Write",
     description:
       "Create or overwrite a file in an existing workspace. Automatically creates parent directories within the workspace. " +
       "The workspace itself must already exist. Path is relative to the workspace root.",
-    parameters: {
-      type: "object",
-      required: ["workspace", "path", "content"],
-      properties: {
-        workspace: {
-          type: "string",
-          description: "Workspace name",
-        },
-        path: {
-          type: "string",
-          description: "File path relative to workspace root (e.g. 'projects/new-spec.md')",
-        },
-        content: {
-          type: "string",
-          description: "File content to write",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: WorkspaceWriteParams,
+    async execute(_toolCallId: string, params: Static<typeof WorkspaceWriteParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const basePath = resolve(deps.vaultsBasePath);
       const workspace = typeof params.workspace === "string" ? params.workspace.trim() : "";
       const filePath = typeof params.path === "string" ? params.path.trim() : "";
       const content = typeof params.content === "string" ? params.content : "";
 
       if (!workspace) {
-        return toOCResult({ ok: false, error: "'workspace' is required." });
+        return toResult({ ok: false, error: "'workspace' is required." });
       }
       if (!filePath) {
-        return toOCResult({ ok: false, error: "'path' is required." });
+        return toResult({ ok: false, error: "'path' is required." });
       }
 
       // Verify workspace exists — workspaces must be created explicitly
       const wsCheck = await resolveWorkspacePath(basePath, workspace);
       if (!wsCheck.ok) {
-        return toOCResult({ ok: false, error: wsCheck.error });
+        return toResult({ ok: false, error: wsCheck.error });
       }
       try {
         const wsStat = await lstat(wsCheck.resolved);
         if (!wsStat.isDirectory()) {
-          return toOCResult({ ok: false, error: `Workspace "${workspace}" is not a directory.` });
+          return toResult({ ok: false, error: `Workspace "${workspace}" is not a directory.` });
         }
       } catch {
-        return toOCResult({ ok: false, error: `Workspace "${workspace}" does not exist. Workspaces must be created explicitly.` });
+        return toResult({ ok: false, error: `Workspace "${workspace}" does not exist. Workspaces must be created explicitly.` });
       }
 
       const pathResult = await resolveWorkspacePath(basePath, workspace, filePath);
       if (!pathResult.ok) {
-        return toOCResult({ ok: false, error: pathResult.error });
+        return toResult({ ok: false, error: pathResult.error });
       }
 
       try {
@@ -424,7 +415,7 @@ function createWorkspaceWriteTool(deps: WorkspaceToolDeps): ToolDefinition {
         await writeFile(pathResult.resolved, content, "utf-8");
         const size = Buffer.byteLength(content, "utf-8");
 
-        return toOCResult({
+        return toResult({
           ok: true,
           output: `File written: ${workspace}/${filePath} (${size} bytes)`,
           data: {
@@ -435,7 +426,7 @@ function createWorkspaceWriteTool(deps: WorkspaceToolDeps): ToolDefinition {
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return toOCResult({ ok: false, error: `Cannot write file: ${msg}` });
+        return toResult({ ok: false, error: `Cannot write file: ${msg}` });
       }
     },
   };
@@ -443,44 +434,32 @@ function createWorkspaceWriteTool(deps: WorkspaceToolDeps): ToolDefinition {
 
 // --- flock_workspace_tree ---
 
-function createWorkspaceTreeTool(deps: WorkspaceToolDeps): ToolDefinition {
+function createWorkspaceTreeTool(deps: WorkspaceToolDeps): AgentTool<typeof WorkspaceTreeParams, Record<string, unknown>> {
   return {
     name: "flock_workspace_tree",
+    label: "Workspace Tree",
     description:
       "Display the directory tree structure of a workspace. " +
       "Shows files and directories in a tree format with configurable depth.",
-    parameters: {
-      type: "object",
-      required: ["workspace"],
-      properties: {
-        workspace: {
-          type: "string",
-          description: "Workspace name",
-        },
-        maxDepth: {
-          type: "number",
-          description: "Maximum depth to traverse. Default: 3",
-        },
-      },
-    },
-    async execute(_toolCallId: string, params: Record<string, unknown>): Promise<ToolResultOC> {
+    parameters: WorkspaceTreeParams,
+    async execute(_toolCallId: string, params: Static<typeof WorkspaceTreeParams>): Promise<AgentToolResult<Record<string, unknown>>> {
       const basePath = resolve(deps.vaultsBasePath);
       const workspace = typeof params.workspace === "string" ? params.workspace.trim() : "";
       const maxDepth = typeof params.maxDepth === "number" ? Math.max(1, Math.min(params.maxDepth, 10)) : 3;
 
       if (!workspace) {
-        return toOCResult({ ok: false, error: "'workspace' is required." });
+        return toResult({ ok: false, error: "'workspace' is required." });
       }
 
       const pathResult = await resolveWorkspacePath(basePath, workspace);
       if (!pathResult.ok) {
-        return toOCResult({ ok: false, error: pathResult.error });
+        return toResult({ ok: false, error: pathResult.error });
       }
 
       try {
         await stat(pathResult.resolved);
       } catch {
-        return toOCResult({ ok: false, error: `Workspace "${workspace}" does not exist.` });
+        return toResult({ ok: false, error: `Workspace "${workspace}" does not exist.` });
       }
 
       const treeLines = await buildTree(pathResult.resolved, "", maxDepth, 0);
@@ -490,7 +469,7 @@ function createWorkspaceTreeTool(deps: WorkspaceToolDeps): ToolDefinition {
         ...treeLines,
       ].join("\n");
 
-      return toOCResult({
+      return toResult({
         ok: true,
         output,
         data: { workspace, maxDepth },

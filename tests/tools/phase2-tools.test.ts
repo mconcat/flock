@@ -3,9 +3,9 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { registerFlockTools } from "../../src/tools/index.js";
+import { createFlockTools } from "../../src/tools/index.js";
 import type { ToolDeps } from "../../src/tools/index.js";
-import type { PluginApi, ToolDefinition, ToolResultOC } from "../../src/types.js";
+import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { FlockConfig } from "../../src/config.js";
 import type { HomeManager } from "../../src/homes/manager.js";
 import type { HomeProvisioner } from "../../src/homes/provisioner.js";
@@ -81,29 +81,11 @@ function makeCardRegistry(): CardRegistry {
 }
 
 // Collect registered tools from registerFlockTools
-function collectTools(deps: ToolDeps): Map<string, ToolDefinition> {
-  const tools = new Map<string, ToolDefinition>();
-  const api: PluginApi = {
-    id: "flock",
-    source: "test",
-    config: {},
-    pluginConfig: {},
-    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    registerTool(tool: ToolDefinition | ((ctx: Record<string, unknown>) => ToolDefinition | ToolDefinition[] | null | undefined)) {
-      if (typeof tool === "function") {
-        const resolved = tool({ agentId: "test-agent" });
-        if (resolved) {
-          const list = Array.isArray(resolved) ? resolved : [resolved];
-          for (const t of list) tools.set(t.name, t);
-        }
-      } else {
-        tools.set(tool.name, tool);
-      }
-    },
-    registerGatewayMethod: vi.fn(),
-    registerHttpRoute: vi.fn(),
-  };
-  registerFlockTools(api, deps);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function collectTools(deps: ToolDeps): Map<string, AgentTool<any>> {
+  const toolArray = createFlockTools(deps);
+  const tools = new Map<string, AgentTool<any>>();
+  for (const t of toolArray) tools.set(t.name, t);
   return tools;
 }
 
@@ -744,12 +726,12 @@ describe("flock_message (async)", () => {
 
 // --- Tool registration ---
 
-describe("registerFlockTools", () => {
-  it("registers all 11 tools including Phase 2 tools", () => {
+describe("createFlockTools", () => {
+  it("creates all standard tools", () => {
     const deps = makeDeps();
     const tools = collectTools(deps);
 
-    // Phase 1 tools
+    // Core tools
     expect(tools.has("flock_status")).toBe(true);
     expect(tools.has("flock_lease")).toBe(true);
     expect(tools.has("flock_audit")).toBe(true);
@@ -758,22 +740,26 @@ describe("registerFlockTools", () => {
     expect(tools.has("flock_sysadmin_request")).toBe(true);
     expect(tools.has("flock_message")).toBe(true);
 
-    // Phase 2 tools — channel-based
+    // Channel tools
     expect(tools.has("flock_channel_create")).toBe(true);
     expect(tools.has("flock_channel_post")).toBe(true);
     expect(tools.has("flock_channel_read")).toBe(true);
     expect(tools.has("flock_channel_list")).toBe(true);
     expect(tools.has("flock_assign_members")).toBe(true);
     expect(tools.has("flock_channel_archive")).toBe(true);
+    expect(tools.has("flock_archive_ready")).toBe(true);
+
+    // Discovery & task tools
     expect(tools.has("flock_discover")).toBe(true);
     expect(tools.has("flock_history")).toBe(true);
     expect(tools.has("flock_tasks")).toBe(true);
     expect(tools.has("flock_task_respond")).toBe(true);
     expect(tools.has("flock_update_card")).toBe(true);
     expect(tools.has("flock_bridge")).toBe(true);
+    expect(tools.has("flock_migrate")).toBe(true);
+    expect(tools.has("flock_sleep")).toBe(true);
 
-    expect(tools.has("flock_archive_ready")).toBe(true);
-
-    expect(tools.size).toBe(25); // 24 + flock_archive_ready (archive protocol readiness)
+    // 22 standard tools (lifecycle tools are separate)
+    expect(tools.size).toBe(22);
   });
 });
