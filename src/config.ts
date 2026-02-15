@@ -1,7 +1,15 @@
 /**
  * Flock configuration resolution.
  * Merges plugin config with sensible defaults.
+ *
+ * Two loading modes:
+ *   1. Plugin mode:  resolveFlockConfig(api.pluginConfig) — OpenClaw passes raw config
+ *   2. Standalone:   loadFlockConfig() — reads from file / env directly
  */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 
 export type DatabaseBackend = "memory" | "sqlite" | "postgres";
 
@@ -172,4 +180,40 @@ export function resolveFlockConfig(raw?: Record<string, unknown> | null): FlockC
     },
     vaultsBasePath: typeof r.vaultsBasePath === "string" ? r.vaultsBasePath : `${dataDir}/vaults`,
   };
+}
+
+/**
+ * Default config file search paths (highest priority first):
+ *   1. $FLOCK_CONFIG env
+ *   2. ./flock.json (cwd)
+ *   3. ~/.flock/flock.json
+ */
+function resolveConfigPath(): string | null {
+  if (process.env.FLOCK_CONFIG) {
+    return process.env.FLOCK_CONFIG;
+  }
+  const cwdPath = path.resolve("flock.json");
+  if (fs.existsSync(cwdPath)) return cwdPath;
+
+  const homePath = path.join(os.homedir(), ".flock", "flock.json");
+  if (fs.existsSync(homePath)) return homePath;
+
+  return null;
+}
+
+/**
+ * Load Flock config from file system (standalone mode).
+ * Falls back to defaults if no config file is found.
+ */
+export function loadFlockConfig(): FlockConfig {
+  const configPath = resolveConfigPath();
+  if (!configPath) {
+    return resolveFlockConfig({});
+  }
+
+  const raw: unknown = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`Invalid flock config at ${configPath}: expected a JSON object`);
+  }
+  return resolveFlockConfig(raw as Record<string, unknown>);
 }

@@ -47,6 +47,8 @@
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.9",
+    "@mariozechner/pi-agent-core": "^0.52.10",
+    "@mariozechner/pi-ai": "^0.52.10",
     "better-sqlite3": "^12.6.2"
   }
 }

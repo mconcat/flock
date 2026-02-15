@@ -47,6 +47,7 @@ import type { InboundEvent, InboundContext } from "./bridge/inbound.js";
 import { handleOutbound } from "./bridge/outbound.js";
 import { sendViaWebhook } from "./bridge/discord-webhook.js";
 import type { BridgePlatform } from "./db/interface.js";
+import { readJsonBody } from "./server.js";
 
 /**
  * Safely access an extended method on PluginApi that may not be
@@ -279,26 +280,6 @@ export function register(api: PluginApi) {
   // Use registerHttpHandler for prefix-based matching
   // Gateway stores entry as object, invokes entry.handler(req, res)
   logger.info(`[flock] using registerHttpHandler for HTTP routes`);
-
-  /** Read and parse JSON body from a Node.js IncomingMessage. */
-  function readJsonBody(req: any): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      // If body was already parsed (e.g. by middleware), use it directly
-      if (req.body !== undefined && req.body !== null) {
-        resolve(req.body);
-        return;
-      }
-      const chunks: Buffer[] = [];
-      req.on("data", (chunk: Buffer) => chunks.push(chunk));
-      req.on("end", () => {
-        const raw = Buffer.concat(chunks).toString("utf-8");
-        if (!raw) { resolve(undefined); return; }
-        try { resolve(JSON.parse(raw)); }
-        catch { reject(new Error("Invalid JSON body")); }
-      });
-      req.on("error", reject);
-    });
-  }
 
   const httpHandler = async (req: any, res: any): Promise<boolean> => {
       const url = req.url || req.path || "";
