@@ -235,9 +235,15 @@ async function cmdInitStandalone(): Promise<void> {
   }
 
   const standaloneConfigPath = path.join(FLOCK_HOME, "flock.json");
-  const existing = fs.existsSync(standaloneConfigPath)
-    ? JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8")) as Record<string, unknown>
-    : {} as Record<string, unknown>;
+  let existing: Record<string, unknown> = {};
+  if (fs.existsSync(standaloneConfigPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8")) as Record<string, unknown>;
+    } catch (e) {
+      console.error(`Invalid JSON in ${standaloneConfigPath}: ${e instanceof Error ? e.message : e}`);
+      process.exit(1);
+    }
+  }
 
   if (existing.gatewayAgents) {
     const proceed = await promptYN("Config already exists. Reconfigure?", false);
@@ -548,9 +554,6 @@ async function cmdStartStandalone(): Promise<void> {
 
   console.log("Starting Flock (standalone mode)...");
 
-  // Write PID file
-  fs.writeFileSync(PID_FILE, String(process.pid), "utf-8");
-
   // Dynamic import to avoid loading pi-ai at CLI parse time
   const { startFlock } = await import("../standalone.js");
   const { loadFlockConfig } = await import("../config.js");
@@ -560,7 +563,13 @@ async function cmdStartStandalone(): Promise<void> {
   const config = loadFlockConfig();
 
   // Extract Discord bot token from config (if present)
-  const rawConfig = JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8"));
+  let rawConfig: Record<string, unknown> = {};
+  try {
+    rawConfig = JSON.parse(fs.readFileSync(standaloneConfigPath, "utf-8")) as Record<string, unknown>;
+  } catch (e) {
+    console.error(`Invalid JSON in ${standaloneConfigPath}: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  }
   const discordBotToken = typeof rawConfig.discordBotToken === "string"
     ? rawConfig.discordBotToken
     : undefined;
@@ -570,6 +579,9 @@ async function cmdStartStandalone(): Promise<void> {
     discordBotToken,
     loggerOptions: { prefix: "flock", level: "info" },
   });
+
+  // Write PID file only after successful startup
+  fs.writeFileSync(PID_FILE, String(process.pid), "utf-8");
 
   console.log(`Flock running (standalone, PID ${process.pid})`);
   console.log(`  Agents: ${config.gatewayAgents.map(a => a.id).join(", ") || "none"}`);

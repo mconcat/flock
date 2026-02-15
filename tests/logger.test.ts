@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { createFlockLogger } from "../src/logger.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("createFlockLogger", () => {
   it("returns a PluginLogger-compatible object", () => {
@@ -10,72 +14,106 @@ describe("createFlockLogger", () => {
     expect(typeof logger.debug).toBe("function");
   });
 
-  it("logs info messages", () => {
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const logger = createFlockLogger({ prefix: "test" });
-    logger.info("hello");
-    expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy.mock.calls[0][0]).toContain("[test]");
-    expect(spy.mock.calls[0][0]).toContain("hello");
-    spy.mockRestore();
+  it("info/warn/error/debug do not throw", () => {
+    const logger = createFlockLogger({ prefix: "test", level: "debug" });
+    expect(() => logger.info("hello")).not.toThrow();
+    expect(() => logger.warn("caution")).not.toThrow();
+    expect(() => logger.error("failure")).not.toThrow();
+    expect(() => logger.debug("detail")).not.toThrow();
   });
 
-  it("logs warn messages", () => {
-    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const logger = createFlockLogger({ prefix: "test" });
-    logger.warn("caution");
-    expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy.mock.calls[0][0]).toContain("[test:warn]");
-    spy.mockRestore();
-  });
-
-  it("logs error messages", () => {
-    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const logger = createFlockLogger({ prefix: "test" });
-    logger.error("failure");
-    expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy.mock.calls[0][0]).toContain("[test:error]");
-    spy.mockRestore();
-  });
-
-  it("respects level filter — warn level suppresses info", () => {
-    const infoSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  it("respects level filter — warn level suppresses debug and info", () => {
+    // Spy on console methods BEFORE creating the logger, since Winston
+    // binds console.log/warn/error in the Console transport constructor.
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const logger = createFlockLogger({ level: "warn" });
-    logger.info("should be suppressed");
-    logger.warn("should appear");
-    expect(infoSpy).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    infoSpy.mockRestore();
-    warnSpy.mockRestore();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+
+    const logger = createFlockLogger({ level: "warn", prefix: "test" });
+    logger.debug("dbg-suppressed");
+    logger.info("info-suppressed");
+
+    // debug and info should be suppressed — no calls to any console method
+    const allCalls = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls, ...debugSpy.mock.calls];
+    const hasDebug = allCalls.some((args) => String(args).includes("dbg-suppressed"));
+    const hasInfo = allCalls.some((args) => String(args).includes("info-suppressed"));
+    expect(hasDebug).toBe(false);
+    expect(hasInfo).toBe(false);
+
+    logger.warn("warn-visible");
+    logger.error("error-visible");
+
+    // After the new calls, check combined output
+    const allCalls2 = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls, ...debugSpy.mock.calls];
+    const hasWarn = allCalls2.some((args) => String(args).includes("warn-visible"));
+    const hasError = allCalls2.some((args) => String(args).includes("error-visible"));
+    expect(hasWarn).toBe(true);
+    expect(hasError).toBe(true);
   });
 
   it("debug level shows everything", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
-    const infoSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const logger = createFlockLogger({ level: "debug" });
-    logger.debug("dbg");
-    logger.info("inf");
-    expect(debugSpy).toHaveBeenCalledTimes(1);
-    expect(infoSpy).toHaveBeenCalledTimes(1);
-    debugSpy.mockRestore();
-    infoSpy.mockRestore();
+
+    const logger = createFlockLogger({ level: "debug", prefix: "test" });
+    logger.debug("dbg-msg");
+    logger.info("inf-msg");
+    logger.warn("wrn-msg");
+    logger.error("err-msg");
+
+    const allCalls = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls, ...debugSpy.mock.calls];
+    const stringify = (args: unknown[]) => args.map(String).join(" ");
+    const hasDebug = allCalls.some((args) => stringify(args).includes("dbg-msg"));
+    const hasInfo = allCalls.some((args) => stringify(args).includes("inf-msg"));
+    const hasWarn = allCalls.some((args) => stringify(args).includes("wrn-msg"));
+    const hasError = allCalls.some((args) => stringify(args).includes("err-msg"));
+
+    expect(hasDebug).toBe(true);
+    expect(hasInfo).toBe(true);
+    expect(hasWarn).toBe(true);
+    expect(hasError).toBe(true);
+  });
+
+  it("uses provided prefix in output", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const logger = createFlockLogger({ prefix: "myprefix" });
+    logger.info("msg");
+
+    const allCalls = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls];
+    const hasPrefix = allCalls.some((args) => String(args).includes("[myprefix:"));
+    expect(hasPrefix).toBe(true);
   });
 
   it("uses default prefix 'flock'", () => {
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
     const logger = createFlockLogger();
     logger.info("msg");
-    expect(spy.mock.calls[0][0]).toContain("[flock]");
-    spy.mockRestore();
+
+    const allCalls = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls];
+    const hasPrefix = allCalls.some((args) => String(args).includes("[flock:"));
+    expect(hasPrefix).toBe(true);
   });
 
-  it("includes ISO timestamp", () => {
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+  it("includes timestamp in output", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
     const logger = createFlockLogger();
     logger.info("msg");
+
+    const allCalls = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls];
     // ISO 8601 pattern: YYYY-MM-DDTHH:mm:ss
-    expect(spy.mock.calls[0][0]).toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
-    spy.mockRestore();
+    const hasTimestamp = allCalls.some((args) => /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(String(args)));
+    expect(hasTimestamp).toBe(true);
   });
 });

@@ -148,6 +148,17 @@ export class SessionManager {
       // Always update tools (they may have new deps)
       existing.setTools(config.tools);
       this.configs.set(agentId, config);
+
+      // Detect config drift that requires Agent recreation
+      const prevMaxCtx = prevConfig?.maxContextMessages ?? 100;
+      const newMaxCtx = config.maxContextMessages ?? 100;
+      if (prevMaxCtx !== newMaxCtx || prevConfig?.getApiKey !== config.getApiKey) {
+        this.logger.info(`[flock:session] recreating agent "${agentId}" (config drift: maxCtx ${prevMaxCtx}→${newMaxCtx})`);
+        this.agents.delete(agentId);
+        this.configs.delete(agentId);
+        return this.getOrCreate(agentId, config);
+      }
+
       return existing;
     }
 

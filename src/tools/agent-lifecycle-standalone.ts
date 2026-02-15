@@ -15,6 +15,7 @@ import os from "node:os";
 
 import type { ToolDefinition, ToolResultOC } from "../types.js";
 import { toOCResult } from "../types.js";
+import { createFlockLogger } from "../logger.js";
 import { validateId } from "../homes/utils.js";
 import { uniqueId } from "../utils/id.js";
 import { createWorkerCard, createSysadminCard, createOrchestratorCard } from "../transport/agent-card.js";
@@ -118,12 +119,13 @@ export function createStandaloneCreateAgentTool(
           : createWorkerCard(newAgentId, nodeId, endpointUrl);
 
       // Create executor with direct LLM send
+      const logger = deps.logger ?? createFlockLogger({ prefix: "flock:lifecycle" });
       const executor = createFlockExecutor({
         flockMeta: meta,
         sessionSend,
         audit: deps.audit,
         taskStore: deps.taskStore,
-        logger: deps.logger!,
+        logger,
       });
       deps.a2aServer.registerAgent(newAgentId, card, meta, executor);
 
@@ -286,8 +288,8 @@ export function createStandaloneRestartTool(deps: ToolDeps): ToolDefinition {
         result: "success",
       });
 
-      // Schedule exit after response is sent
-      setTimeout(() => { process.exit(0); }, 500);
+      // Schedule graceful shutdown via SIGTERM (lets the CLI's handler run instance.stop())
+      setTimeout(() => { process.kill(process.pid, "SIGTERM"); }, 500);
 
       return toOCResult({
         ok: true,

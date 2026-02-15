@@ -9,20 +9,7 @@ import {
 } from "../../src/tools/agent-lifecycle-standalone.js";
 import type { ToolDeps } from "../../src/tools/index.js";
 import type { SessionSendFn } from "../../src/transport/executor.js";
-
-// Minimal mock A2A server
-function makeA2AServer(agents: Record<string, { role: string }> = {}) {
-  const registered = new Map(Object.entries(agents));
-  return {
-    hasAgent: (id: string) => registered.has(id),
-    getAgentMeta: (id: string) => registered.get(id) ?? null,
-    registerAgent: vi.fn((id: string, _card: unknown, meta: { role: string }) => {
-      registered.set(id, meta);
-    }),
-    unregisterAgent: vi.fn((id: string) => { registered.delete(id); }),
-    listAgentCards: () => [...registered.entries()].map(([agentId]) => ({ agentId })),
-  };
-}
+import { createMockA2AServer } from "../helpers/mock-a2a-server.js";
 
 function makeDeps(overrides?: Partial<ToolDeps>): ToolDeps {
   return {
@@ -57,13 +44,17 @@ function makeDeps(overrides?: Partial<ToolDeps>): ToolDeps {
       provision: () => { throw new Error("not implemented"); },
       syncToOpenClawWorkspace: () => {},
     } as ToolDeps["provisioner"],
-    a2aServer: makeA2AServer({ "orchestrator-1": { role: "orchestrator" } }) as unknown as ToolDeps["a2aServer"],
+    a2aServer: createMockA2AServer({ "orchestrator-1": { role: "orchestrator" } }),
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     ...overrides,
   };
 }
 
 const mockSessionSend: SessionSendFn = vi.fn().mockResolvedValue("ok");
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("createStandaloneCreateAgentTool", () => {
   let tmpDir: string;
@@ -98,7 +89,7 @@ describe("createStandaloneCreateAgentTool", () => {
     expect(result.content[0].type).toBe("text");
     const text = (result.content[0] as { type: "text"; text: string }).text;
     expect(text).toContain("Agent Created: new-worker");
-    expect((deps.a2aServer as ReturnType<typeof makeA2AServer>).registerAgent).toHaveBeenCalled();
+    expect(deps.a2aServer!.hasAgent("new-worker")).toBe(true);
   });
 
   it("rejects non-orchestrator callers", async () => {
@@ -150,11 +141,11 @@ describe("createStandaloneCreateAgentTool", () => {
 
 describe("createStandaloneDecommissionAgentTool", () => {
   it("decommissions an existing agent", async () => {
-    const a2a = makeA2AServer({
+    const a2a = createMockA2AServer({
       "orchestrator-1": { role: "orchestrator" },
       "victim": { role: "worker" },
     });
-    const deps = makeDeps({ a2aServer: a2a as unknown as ToolDeps["a2aServer"] });
+    const deps = makeDeps({ a2aServer: a2a });
     const tool = createStandaloneDecommissionAgentTool(deps);
 
     const result = await tool.execute("call-1", {
@@ -165,7 +156,7 @@ describe("createStandaloneDecommissionAgentTool", () => {
 
     const text = (result.content[0] as { type: "text"; text: string }).text;
     expect(text).toContain("Decommissioned: victim");
-    expect(a2a.unregisterAgent).toHaveBeenCalledWith("victim");
+    expect(a2a.hasAgent("victim")).toBe(false);
   });
 
   it("rejects self-decommission", async () => {
@@ -197,14 +188,14 @@ describe("createStandaloneRestartTool", () => {
   });
 
   it("allows sysadmin callers", async () => {
-    const a2a = makeA2AServer({
+    const a2a = createMockA2AServer({
       "sysadmin-1": { role: "sysadmin" },
     });
-    const deps = makeDeps({ a2aServer: a2a as unknown as ToolDeps["a2aServer"] });
+    const deps = makeDeps({ a2aServer: a2a });
     const tool = createStandaloneRestartTool(deps);
 
-    // Mock process.exit to prevent actual exit
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as never);
+    // Mock process.kill to prevent actual signal
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((() => true) as typeof process.kill);
 
     const result = await tool.execute("call-1", {
       _callerAgentId: "sysadmin-1",
@@ -213,6 +204,6 @@ describe("createStandaloneRestartTool", () => {
     const text = (result.content[0] as { type: "text"; text: string }).text;
     expect(text).toContain("restart initiated");
 
-    exitSpy.mockRestore();
+    killSpy.mockRestore();
   });
 });

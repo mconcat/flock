@@ -1,10 +1,11 @@
 /**
  * Flock standalone logger.
  *
- * Provides a PluginLogger-compatible factory that works without OpenClaw.
+ * Provides a PluginLogger-compatible factory backed by Winston.
  * When running as an OpenClaw plugin, the host logger is used instead.
  */
 
+import winston from "winston";
 import type { PluginLogger } from "./types.js";
 
 export interface FlockLoggerOptions {
@@ -14,13 +15,6 @@ export interface FlockLoggerOptions {
   level?: "debug" | "info" | "warn" | "error";
 }
 
-const LEVEL_PRIORITY: Record<string, number> = {
-  debug: 0,
-  info: 1,
-  warn: 2,
-  error: 3,
-};
-
 /**
  * Create a standalone logger satisfying PluginLogger.
  * Keeps the same interface OpenClaw provides, so all Flock code
@@ -28,30 +22,25 @@ const LEVEL_PRIORITY: Record<string, number> = {
  */
 export function createFlockLogger(opts?: FlockLoggerOptions): PluginLogger {
   const prefix = opts?.prefix ?? "flock";
-  const minLevel = LEVEL_PRIORITY[opts?.level ?? "info"] ?? 1;
+  const minLevel = opts?.level ?? "info";
 
-  const timestamp = (): string => new Date().toISOString();
+  const winstonLogger = winston.createLogger({
+    level: minLevel,
+    format: winston.format.combine(
+      winston.format.timestamp({ format: "YYYY-MM-DDTHH:mm:ss.SSSZ" }),
+      winston.format.printf(({ timestamp, level, message }) =>
+        `${timestamp} [${prefix}:${level}] ${message}`
+      ),
+    ),
+    transports: [
+      new winston.transports.Console({ forceConsole: true }),
+    ],
+  });
 
   return {
-    info(msg: string): void {
-      if (minLevel <= LEVEL_PRIORITY.info) {
-        console.log(`${timestamp()} [${prefix}] ${msg}`);
-      }
-    },
-    warn(msg: string): void {
-      if (minLevel <= LEVEL_PRIORITY.warn) {
-        console.warn(`${timestamp()} [${prefix}:warn] ${msg}`);
-      }
-    },
-    error(msg: string): void {
-      if (minLevel <= LEVEL_PRIORITY.error) {
-        console.error(`${timestamp()} [${prefix}:error] ${msg}`);
-      }
-    },
-    debug(msg: string): void {
-      if (minLevel <= LEVEL_PRIORITY.debug) {
-        console.debug(`${timestamp()} [${prefix}:debug] ${msg}`);
-      }
-    },
+    info: (msg: string) => winstonLogger.info(msg),
+    warn: (msg: string) => winstonLogger.warn(msg),
+    error: (msg: string) => winstonLogger.error(msg),
+    debug: (msg: string) => winstonLogger.debug(msg),
   };
 }

@@ -26,7 +26,7 @@ import { createPeerResolver, createPeerSysadminResolver } from "./transport/topo
 import { createCentralResolver, createCentralSysadminResolver } from "./transport/topologies/central.js";
 import { createAssignmentStore } from "./nodes/assignment.js";
 import { createWorkerCard, createSysadminCard, createOrchestratorCard } from "./transport/agent-card.js";
-import { createFlockExecutor } from "./transport/executor.js";
+import { createFlockExecutor, type SessionSendFn } from "./transport/executor.js";
 import { createDirectSend } from "./transport/direct-send.js";
 import type { FlockAgentRole } from "./transport/types.js";
 import { createTriageDecisionTool } from "./sysadmin/triage-tool.js";
@@ -160,6 +160,11 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
 
   // --- Register gateway agents ---
   if (config.gatewayAgents.length > 0 && config.gateway.token) {
+    // Late-binding: sessionSend is captured by closure in resolveAgentConfig.
+    // It will be assigned before the first call (resolveAgentConfig is only
+    // invoked when an agent message arrives, not during boot).
+    let sessionSend: SessionSendFn;
+
     const resolveAgentConfig = (agentId: string) => {
       const agentDef = config.gatewayAgents.find((a) => a.id === agentId);
       let role: FlockAgentRole = agentDef?.role ?? "worker";
@@ -168,9 +173,12 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       // Assemble system prompt from Flock templates
       const systemPrompt = assembleAgentsMd(role);
 
-      // Build tools for this agent (triage tool for sysadmin, extendable per role)
+      // Build tools for this agent (lifecycle + triage)
       const tools = [
         createTriageDecisionTool(),
+        createStandaloneCreateAgentTool(toolDeps, sessionSend),
+        createStandaloneDecommissionAgentTool(toolDeps),
+        createStandaloneRestartTool(toolDeps),
       ].map(toAgentTool);
 
       // Model: per-agent config → fallback to default
@@ -179,7 +187,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       return { model, systemPrompt, tools };
     };
 
-    const sessionSend = createDirectSend({
+    sessionSend = createDirectSend({
       sessionManager,
       resolveAgentConfig,
       logger,
@@ -312,6 +320,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     if (httpServer) {
       await stopFlockHttpServer(httpServer);
     }
+    try { db.close(); } catch (e) { logger.warn(`[flock:standalone] db close error: ${e}`); }
     logger.info("[flock:standalone] shutdown complete");
   };
 

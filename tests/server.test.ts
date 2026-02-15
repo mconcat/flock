@@ -113,4 +113,21 @@ describe("readJsonBody", () => {
     const result = await readJsonBody(fakeReq);
     expect(result).toEqual({ already: "parsed" });
   });
+
+  it("rejects body exceeding maxBytes", async () => {
+    const { PassThrough } = await import("node:stream");
+    const stream = new PassThrough();
+
+    // Attach minimal IncomingMessage-like properties
+    const fakeReq = stream as Parameters<typeof readJsonBody>[0];
+    fakeReq.body = undefined;
+
+    // Set maxBytes to 10 so a small payload triggers the limit
+    const promise = readJsonBody(fakeReq, 10);
+
+    // Push data exceeding the limit
+    stream.write(Buffer.alloc(20, 0x41)); // 20 bytes of 'A'
+
+    await expect(promise).rejects.toThrow("Request body too large");
+  });
 });

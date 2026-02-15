@@ -22,15 +22,27 @@ export interface FlockHttpServerOptions {
 /**
  * Read and parse JSON body from a Node.js IncomingMessage.
  * If body was already parsed (e.g. by middleware), returns it directly.
+ * Rejects with an error if the body exceeds maxBytes (default 1MB).
  */
-export function readJsonBody(req: IncomingMessage & { body?: unknown }): Promise<unknown> {
+export function readJsonBody(req: IncomingMessage & { body?: unknown }, maxBytes = 1_048_576): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (req.body !== undefined && req.body !== null) {
       resolve(req.body);
       return;
     }
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    const onData = (chunk: Buffer) => {
+      size += chunk.byteLength;
+      if (size > maxBytes) {
+        req.removeListener("data", onData);
+        reject(new Error("Request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on("data", onData);
     req.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf-8");
       if (!raw) { resolve(undefined); return; }

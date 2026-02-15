@@ -53,31 +53,36 @@ export function createDiscordSendExternal(config: DiscordBridgeConfig): SendExte
   async function getClient(): Promise<DiscordClient> {
     if (!clientPromise) {
       clientPromise = (async () => {
-        // Dynamic import to avoid requiring discord.js as a hard dependency
-        const { Client, GatewayIntentBits } = await import("discord.js");
-        const client = new Client({
-          intents: [
-            GatewayIntentBits.Guilds,
-            GatewayIntentBits.GuildMessages,
-          ],
-        });
+        try {
+          // Dynamic import to avoid requiring discord.js as a hard dependency
+          const { Client, GatewayIntentBits } = await import("discord.js");
+          const client = new Client({
+            intents: [
+              GatewayIntentBits.Guilds,
+              GatewayIntentBits.GuildMessages,
+            ],
+          });
 
-        await client.login(config.botToken);
-        logger.info("[flock:discord-bridge] bot client logged in");
+          await client.login(config.botToken);
+          logger.info("[flock:discord-bridge] bot client logged in");
 
-        return {
-          async sendMessage(channelId: string, text: string): Promise<void> {
-            const channel = await client.channels.fetch(channelId);
-            if (channel && "send" in channel && typeof channel.send === "function") {
-              await channel.send(text);
-            } else {
-              throw new Error(`Channel ${channelId} not found or not a text channel`);
-            }
-          },
-          async destroy(): Promise<void> {
-            client.destroy();
-          },
-        };
+          return {
+            async sendMessage(channelId: string, text: string): Promise<void> {
+              const channel = await client.channels.fetch(channelId);
+              if (channel && "send" in channel && typeof channel.send === "function") {
+                await channel.send(text);
+              } else {
+                throw new Error(`Channel ${channelId} not found or not a text channel`);
+              }
+            },
+            async destroy(): Promise<void> {
+              client.destroy();
+            },
+          };
+        } catch (err) {
+          clientPromise = null;
+          throw err;
+        }
       })();
     }
     return clientPromise;
