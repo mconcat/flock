@@ -933,6 +933,152 @@ function cmdStatus(): void {
   console.log(`Home:      ${FLOCK_HOME}`);
 }
 
+// ---------------------------------------------------------------------------
+// Auth Commands
+// ---------------------------------------------------------------------------
+
+async function cmdAuth(args: string[]): Promise<void> {
+  const subcommand = args[0];
+  switch (subcommand) {
+    case "login":
+      await cmdAuthLogin(args.slice(1));
+      break;
+    case "status":
+      cmdAuthStatus();
+      break;
+    case "logout":
+      cmdAuthLogout(args.slice(1));
+      break;
+    default:
+      console.error(subcommand ? `Unknown auth subcommand: ${subcommand}` : "Usage: flock auth <login|status|logout>");
+      process.exit(1);
+  }
+}
+
+async function cmdAuthLogin(args: string[]): Promise<void> {
+  const providerId = args[0];
+  if (!providerId) {
+    console.error("Usage: flock auth login <provider>");
+    console.error("Providers: anthropic, openai-codex, github-copilot, google-gemini-cli, google-antigravity");
+    process.exit(1);
+  }
+
+  // Dynamic import to avoid loading OAuth at CLI parse time
+  const { getOAuthProvider } = await import("@mariozechner/pi-ai");
+  const { setCredentials } = await import("../auth/store.js");
+
+  const provider = getOAuthProvider(providerId);
+  if (!provider) {
+    console.error(`Unknown OAuth provider: "${providerId}"`);
+    console.error("Available: anthropic, openai-codex, github-copilot, google-gemini-cli, google-antigravity");
+    process.exit(1);
+    return; // unreachable, but satisfies TS
+  }
+
+  console.log(`\nLogging in to ${provider.name}...\n`);
+
+  const credentials = await provider.login({
+    onAuth: (info) => {
+      console.log(`Open this URL in your browser:\n  ${info.url}`);
+      if (info.instructions) {
+        console.log(`\n${info.instructions}`);
+      }
+    },
+    onPrompt: async (p) => {
+      const answer = await prompt(p.placeholder ?? p.message);
+      return answer;
+    },
+    onProgress: (msg) => {
+      console.log(msg);
+    },
+    onManualCodeInput: async () => {
+      return await prompt("Paste the authorization code:");
+    },
+  });
+
+  setCredentials(providerId, credentials);
+  console.log(`\n✅ Logged in to ${provider.name}. Credentials saved to ~/.flock/auth.json`);
+}
+
+function cmdAuthStatus(): void {
+  // Dynamic import would be async, but we just need the store
+  const storePath = path.join(FLOCK_HOME, "auth.json");
+  let store: { version: number; credentials: Record<string, { expires?: number; refresh?: string; access?: string }> };
+  try {
+    const raw = fs.readFileSync(storePath, "utf-8");
+    store = JSON.parse(raw);
+  } catch {
+    console.log("No auth credentials stored. Run: flock auth login <provider>");
+    return;
+  }
+
+  const creds = store.credentials;
+  const providers = Object.keys(creds);
+
+  if (providers.length === 0) {
+    console.log("No auth credentials stored. Run: flock auth login <provider>");
+    return;
+  }
+
+  console.log("\nFlock Auth Status\n");
+  const now = Date.now();
+
+  for (const id of providers) {
+    const cred = creds[id];
+    const hasRefresh = typeof cred.refresh === "string" && cred.refresh.length > 0;
+    const expires = typeof cred.expires === "number" ? cred.expires : 0;
+    const remainingMs = expires - now;
+
+    let status: string;
+    if (expires <= 0) {
+      status = hasRefresh ? "🔑 static token (has refresh)" : "🔑 static token";
+    } else if (remainingMs <= 0) {
+      status = hasRefresh ? "🔄 expired (auto-refreshable)" : "❌ expired";
+    } else {
+      const remaining = formatDuration(remainingMs);
+      status = `✅ valid (expires in ${remaining})`;
+    }
+
+    console.log(`  ${id}: ${status}`);
+  }
+  console.log("");
+}
+
+function cmdAuthLogout(args: string[]): void {
+  const providerId = args[0];
+  if (!providerId) {
+    console.error("Usage: flock auth logout <provider>");
+    process.exit(1);
+  }
+
+  const storePath = path.join(FLOCK_HOME, "auth.json");
+  let store: { version: number; credentials: Record<string, unknown> };
+  try {
+    const raw = fs.readFileSync(storePath, "utf-8");
+    store = JSON.parse(raw);
+  } catch {
+    console.log(`No credentials found for "${providerId}".`);
+    return;
+  }
+
+  if (!(providerId in store.credentials)) {
+    console.log(`No credentials found for "${providerId}".`);
+    return;
+  }
+
+  delete store.credentials[providerId];
+  fs.writeFileSync(storePath, JSON.stringify(store, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+  console.log(`✅ Removed credentials for "${providerId}".`);
+}
+
+function formatDuration(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
 function showHelp(): void {
   console.log(`
 Flock CLI — Multi-agent swarm orchestration
@@ -954,7 +1100,17 @@ Commands:
   remove <id>             Remove an agent
   list                    List configured agents
   status                  Show Flock status
+  auth login <provider>   Log in to an OAuth provider
+  auth status             Show auth credential status
+  auth logout <provider>  Remove stored credentials for a provider
   help                    Show this help message
+
+OAuth Providers:
+  anthropic               Anthropic (Claude Pro/Max subscription)
+  openai-codex            OpenAI Codex (ChatGPT Plus/Pro subscription)
+  github-copilot          GitHub Copilot
+  google-gemini-cli       Google Gemini CLI
+  google-antigravity      Antigravity (Google Cloud)
 
 Examples:
   # Standalone mode (recommended for new setups)
@@ -964,6 +1120,10 @@ Examples:
   # OpenClaw plugin mode (legacy)
   flock init
   flock start
+
+  # Authentication
+  flock auth login anthropic
+  flock auth status
 
   # Agent management
   flock add dev-code --model anthropic/claude-sonnet-4-20250514 --role worker
@@ -1005,6 +1165,9 @@ async function main(): Promise<void> {
       break;
     case "status":
       cmdStatus();
+      break;
+    case "auth":
+      await cmdAuth(args.slice(1));
       break;
     case "help":
     case "--help":

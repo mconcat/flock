@@ -25,6 +25,8 @@ export { createFlockLogger, type FlockLoggerOptions } from "./logger.js";
 export { loadFlockConfig, resolveFlockConfig, type FlockConfig } from "./config.js";
 export { toAgentTool, toAgentTools } from "./tool-adapter.js";
 export { startFlockHttpServer, stopFlockHttpServer } from "./server.js";
+export { createApiKeyResolver, type ApiKeyResolverOptions } from "./auth/resolver.js";
+export { loadAuthStore, saveAuthStore, listProviders, defaultAuthStorePath, type AuthStore } from "./auth/store.js";
 import { createDatabase } from "./db/index.js";
 import { createHomeManager } from "./homes/manager.js";
 import { createHomeProvisioner } from "./homes/provisioner.js";

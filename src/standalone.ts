@@ -46,12 +46,15 @@ import {
   createStandaloneDecommissionAgentTool,
   createStandaloneRestartTool,
 } from "./tools/agent-lifecycle-standalone.js";
+import { createApiKeyResolver } from "./auth/resolver.js";
 
 // Re-export for external use
 export { SessionManager } from "./session/manager.js";
 export { createDirectSend } from "./transport/direct-send.js";
 export { createFlockLogger } from "./logger.js";
 export { loadFlockConfig, resolveFlockConfig } from "./config.js";
+export { createApiKeyResolver } from "./auth/resolver.js";
+export * from "./auth/index.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -102,6 +105,9 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
   const logger = createFlockLogger(opts?.loggerOptions);
 
   logger.info(`[flock:standalone] starting v0.3.0 (db: ${config.dbBackend}, topology: ${config.topology})`);
+
+  // --- Auth resolver ---
+  const getApiKey = createApiKeyResolver({ logger });
 
   // --- Database ---
   const db = createDatabase(config);
@@ -184,7 +190,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
       // Model: per-agent config → fallback to default
       const model = agentDef?.model ?? "anthropic/claude-sonnet-4-20250514";
 
-      return { model, systemPrompt, tools };
+      return { model, systemPrompt, tools, getApiKey };
     };
 
     sessionSend = createDirectSend({
