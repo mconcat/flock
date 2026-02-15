@@ -36,7 +36,16 @@ import { startFlockHttpServer, stopFlockHttpServer, readJsonBody } from "./serve
 import { assembleAgentsMd } from "./prompts/assembler.js";
 import { toAgentTool } from "./tool-adapter.js";
 import type { ToolDeps } from "./tools/index.js";
-import type { PluginLogger, ToolDefinition, ToolResultOC } from "./types.js";
+import type { PluginLogger } from "./types.js";
+import { EchoTracker, type BridgeDeps } from "./bridge/index.js";
+import { handleInbound } from "./bridge/inbound.js";
+import { handleOutbound } from "./bridge/outbound.js";
+import { createDiscordSendExternal, discordMessageToInbound } from "./bridge/discord-client.js";
+import {
+  createStandaloneCreateAgentTool,
+  createStandaloneDecommissionAgentTool,
+  createStandaloneRestartTool,
+} from "./tools/agent-lifecycle-standalone.js";
 
 // Re-export for external use
 export { SessionManager } from "./session/manager.js";
@@ -57,6 +66,8 @@ export interface FlockInstance {
   httpServer?: Server;
   /** A2A server for agent communication. */
   a2aServer: A2AServer;
+  /** Bridge dependencies (for direct outbound calls). */
+  bridgeDeps?: BridgeDeps;
   /** Logger instance. */
   logger: PluginLogger;
   /** Graceful shutdown. */
@@ -72,6 +83,8 @@ export interface StartFlockOptions {
   httpPort?: number;
   /** Skip HTTP server startup. */
   noHttp?: boolean;
+  /** Discord bot token for standalone bridge. If set, enables Discord bridge. */
+  discordBotToken?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,9 +276,38 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     });
   }
 
+  // --- Bridge (Discord) ---
+  let bridgeDeps: BridgeDeps | undefined;
+  let echoTracker: EchoTracker | undefined;
+
+  if (opts?.discordBotToken) {
+    const sendExternal = createDiscordSendExternal({
+      botToken: opts.discordBotToken,
+      logger,
+    });
+
+    echoTracker = new EchoTracker();
+
+    bridgeDeps = {
+      bridgeStore: db.bridges,
+      channelStore: db.channels,
+      channelMessages: db.channelMessages,
+      audit,
+      logger,
+      sendExternal,
+      agentLoop: db.agentLoop,
+    };
+
+    // Make sendExternal available to tools
+    toolDeps.sendExternal = sendExternal;
+
+    logger.info("[flock:standalone] Discord bridge configured");
+  }
+
   // --- Shutdown ---
   const stop = async () => {
     logger.info("[flock:standalone] shutting down...");
+    echoTracker?.dispose();
     sessionManager.destroyAll();
     if (httpServer) {
       await stopFlockHttpServer(httpServer);
@@ -278,6 +320,7 @@ export async function startFlock(opts?: StartFlockOptions): Promise<FlockInstanc
     sessionManager,
     httpServer,
     a2aServer,
+    bridgeDeps,
     logger,
     stop,
   };
