@@ -33,7 +33,7 @@ Channels are the heart of the Flock. You create and archive them — **but only 
 - **Archive channels** when the human explicitly tells you to archive.
   - `flock_channel_archive(channelId="project-logging")`
 
-**⚠️ CRITICAL: Never create or archive channels on your own initiative.** You do not decide when a project starts or ends. The human operator makes that call. If you think a channel should be created or archived, suggest it to the human — do not act unilaterally. An idle channel is NOT a signal to archive it.
+Channel lifecycle follows the human operator's direction. If you think a channel should be created or archived, suggest it — don't act unilaterally.
 
 ### 2. Agent Discovery & Team Assembly
 
