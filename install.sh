@@ -43,11 +43,11 @@ echo ""
 echo "🚀 Next steps:"
 if [ "$LINK_OK" = true ]; then
   echo "   1. Run: flock init"
-  echo "   2. Start gateway: openclaw gateway start"
+  echo "   2. Start gateway: flock start"
 else
   echo "   ⚠️ Global CLI link failed. You can still run Flock directly."
   echo "   1. Run: $FLOCK_DIR/dist/cli/index.js init"
-  echo "   2. Start gateway: openclaw gateway start"
+  echo "   2. Start gateway: $FLOCK_DIR/dist/cli/index.js start"
 fi
 echo ""
 echo "   Or run directly: $FLOCK_DIR/dist/cli/index.js init"

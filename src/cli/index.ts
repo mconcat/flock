@@ -96,6 +96,17 @@ function run(cmd: string, opts?: { cwd?: string; silent?: boolean }): void {
   execSync(cmd, { cwd: opts?.cwd, stdio, env: process.env });
 }
 
+/** Enable corepack and prepare pnpm so OpenClaw can be built with its declared packageManager. */
+function ensurePnpm(): void {
+  try {
+    execSync("pnpm --version", { stdio: "pipe" });
+  } catch {
+    console.log("Enabling corepack and preparing pnpm...");
+    execSync("corepack enable", { stdio: "inherit" });
+    execSync("corepack prepare pnpm@latest --activate", { stdio: "inherit" });
+  }
+}
+
 function getFlockPluginDir(): string {
   // The Flock plugin's dist/ directory (where this CLI lives)
   return path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -265,11 +276,12 @@ async function cmdInit(): Promise<void> {
     run(`git clone --branch ${FLOCK_BRANCH} --depth 1 ${FLOCK_REPO} "${OPENCLAW_DIR}"`);
   }
 
-  // 3. Install dependencies and build
+  // 3. Install dependencies and build (OpenClaw requires pnpm)
+  ensurePnpm();
   console.log("Installing dependencies...");
-  run("npm install --no-fund --no-audit", { cwd: OPENCLAW_DIR });
+  run("pnpm install", { cwd: OPENCLAW_DIR });
   console.log("Building OpenClaw...");
-  run("npm run build", { cwd: OPENCLAW_DIR });
+  run("pnpm run build", { cwd: OPENCLAW_DIR });
 
   // 4. Symlink Flock plugin into extensions/
   const flockPluginDir = getFlockPluginDir();
@@ -543,11 +555,12 @@ async function cmdUpdate(): Promise<void> {
   console.log("Updating bundled OpenClaw...");
   run("git pull", { cwd: OPENCLAW_DIR });
 
+  ensurePnpm();
   console.log("Installing dependencies...");
-  run("npm install --no-fund --no-audit", { cwd: OPENCLAW_DIR });
+  run("pnpm install", { cwd: OPENCLAW_DIR });
 
   console.log("Building...");
-  run("npm run build", { cwd: OPENCLAW_DIR });
+  run("pnpm run build", { cwd: OPENCLAW_DIR });
 
   // Update Nix daemon image
   if (fs.existsSync(NIX_COMPOSE) && hasDocker()) {
