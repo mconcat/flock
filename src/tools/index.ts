@@ -76,6 +76,10 @@ export interface ToolDeps {
   discordBotToken?: string;
   /** Send function for bridged external platforms (wired at runtime). */
   sendExternal?: SendExternalFn;
+  /** Steer an active streaming session (injected from OpenClaw plugin API). */
+  steerSession?: (sessionKey: string, text: string) => boolean;
+  /** Check whether a session is currently streaming. */
+  isSessionStreaming?: (sessionKey: string) => boolean;
 }
 
 /**
@@ -92,7 +96,15 @@ function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined):
       // to avoid collisions with user-facing params like agentId (used as filter in flock_history).
       // Tools should read _callerAgentId first, then fall back to params.agentId.
       params._callerAgentId = resolvedId;
-      return tool.execute(toolCallId, params);
+      console.log(`[flock:tool-call] ${resolvedId} → ${tool.name}(${JSON.stringify(params)})`);
+      const result = await tool.execute(toolCallId, params);
+      const ok = result.details?.ok !== false;
+      if (ok) {
+        console.log(`[flock:tool-call] ${resolvedId} ← ${tool.name}: ${JSON.stringify(result.details)}`);
+      } else {
+        console.error(`[flock:tool-call:ERROR] ${resolvedId} ← ${tool.name} FAILED: ${JSON.stringify(result.details)}`);
+      }
+      return result;
     },
   };
 }
@@ -141,7 +153,6 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
 
   for (const tool of toolFactories) {
     api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-      console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
       return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
     });
   }
@@ -159,7 +170,6 @@ export function registerFlockTools(api: PluginApi, deps: ToolDeps): void {
     });
     for (const tool of workspaceTools) {
       api.registerTool((ctx: { agentId?: string; sessionKey?: string }) => {
-        console.log(`[FLOCK-FACTORY] tool="${tool.name}" ctx.agentId="${ctx.agentId}" ctx.sessionKey="${ctx.sessionKey}"`);
         return wrapToolWithAgentId(tool, resolveCtxAgentId(ctx));
       });
     }
@@ -1298,7 +1308,9 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
       }
 
       const now = Date.now();
-      const allMembers = [...new Set([callerAgentId, ...members])].filter(m => m !== "main" && m !== "unknown");
+      // Include the creator only if they're in the explicit members list.
+      // Orchestrators typically create channels without joining them.
+      const allMembers = [...new Set(members)].filter(m => m !== "main" && m !== "unknown");
 
       // Create the channel record
       deps.channelStore.insert({
@@ -1329,11 +1341,17 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
         });
         messageCount = 1;
 
-        // Track channel participation for work loop
-        if (deps.workLoopScheduler) {
-          for (const member of allMembers) {
-            deps.workLoopScheduler.trackChannel(member, channelId, seq);
-          }
+      }
+
+      // Trigger immediate per-channel tick for channel members so they see the
+      // new channel right away instead of waiting for the next scheduled tick cycle.
+      if (deps.workLoopScheduler) {
+        for (const member of allMembers) {
+          if (member === callerAgentId) continue;
+          deps.workLoopScheduler.requestImmediateTick(member, channelId).catch((err) => {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            deps.logger?.warn(`[flock:channel-create] Immediate tick for "${member}" in "${channelId}" failed: ${errorMsg}`);
+          });
         }
       }
 
@@ -1419,11 +1437,6 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
         }
       }
 
-      // Track channel participation for work loop
-      if (deps.workLoopScheduler) {
-        deps.workLoopScheduler.trackChannel(callerAgentId, channelId, newSeq);
-      }
-
       // Audit
       deps.audit.append({
         id: uniqueId(`channel-post-${channelId}-${callerAgentId}`),
@@ -1462,13 +1475,31 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
             });
           }
 
-          // Trigger immediate tick for mentioned agents (SLEEP→AWAKE or REACTIVE)
-          // so they see the message now rather than waiting for the next periodic tick.
+          // Trigger immediate per-channel tick for mentioned agents so they see
+          // the message in the correct channel session right away.
           if (deps.workLoopScheduler) {
-            deps.workLoopScheduler.requestImmediateTick(mentioned).catch((err) => {
+            deps.workLoopScheduler.requestImmediateTick(mentioned, channelId).catch((err) => {
               const errorMsg = err instanceof Error ? err.message : String(err);
-              deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" failed: ${errorMsg}`);
+              deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" in "${channelId}" failed: ${errorMsg}`);
             });
+          }
+        }
+      }
+
+      // Steer: inject notification into channel members that are currently streaming.
+      // This solves the stale-context problem — if agent B is mid-response while
+      // agent A posts, B sees the new message between tool calls instead of
+      // finishing with stale context. Non-streaming members are unaffected (they
+      // pick up new messages on their next tick via the scheduler).
+      if (deps.steerSession) {
+        const steerText = `[channel:#${channelId}] New message from @${callerAgentId}: ${message}`;
+        for (const member of channel.members) {
+          if (member === callerAgentId) continue;
+          // Steer into the member's per-channel session
+          const sessionKey = `agent:${member}:flock:channel:${channelId}`;
+          const steered = deps.steerSession(sessionKey, steerText);
+          if (steered) {
+            deps.logger?.info(`[flock:channel-post] Steered "${member}" with new message in #${channelId}`);
           }
         }
       }
@@ -1660,12 +1691,15 @@ function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
       // SLEEP members are NOT auto-woken — they will discover new channel
       // membership via slow-tick polling and self-wake if relevant.
 
-      // Track newly added members in work loop scheduler
-      if (deps.workLoopScheduler && deps.channelMessages) {
-        const latestCount = deps.channelMessages.count(channelId);
+      // Trigger immediate per-channel tick for newly added members so they
+      // discover the channel in its own session right away.
+      if (deps.workLoopScheduler) {
         for (const member of toAdd) {
           if (!channel.members.includes(member)) {
-            deps.workLoopScheduler.trackChannel(member, channelId, latestCount);
+            deps.workLoopScheduler.requestImmediateTick(member, channelId).catch((err) => {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              deps.logger?.warn(`[flock:assign-members] Immediate tick for "${member}" in "${channelId}" failed: ${errorMsg}`);
+            });
           }
         }
       }

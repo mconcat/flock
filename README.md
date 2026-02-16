@@ -1,6 +1,6 @@
 # Flock
 
-**Multi-agent swarm orchestration for [OpenClaw](https://github.com/mconcat/openclaw).**
+**Multi-agent swarm orchestration for [OpenClaw](https://github.com/openclaw/openclaw).**
 
 Flock turns a set of OpenClaw agents into a self-organizing team. Give a project to the orchestrator, and the workers plan, build, review, and test it autonomously — communicating through named channels with persistent history.
 
@@ -21,7 +21,7 @@ flock init
 ```
 
 This will:
-1. Clone the OpenClaw fork into `~/.flock/openclaw/` and build it
+1. Clone OpenClaw into `~/.flock/openclaw/` and build it
 2. Create a config at `~/.flock/config.json`
 3. Set up an orchestrator agent
 4. Prompt for model choice and gateway token

@@ -24,6 +24,19 @@ export interface PluginApi {
   registerTool(tool: ToolDefinition | ((ctx: Record<string, unknown>) => ToolDefinition | ToolDefinition[] | null | undefined), opts?: { optional?: boolean }): void;
   registerGatewayMethod(method: string, handler: GatewayHandler): void;
   registerHttpRoute(params: { path: string; handler: HttpHandler }): void;
+
+  /**
+   * Steer an active streaming session by injecting a message between tool calls.
+   * Returns true if the message was queued, false if the session is not streaming.
+   * Available when running on an OpenClaw fork with the plugin-steer-api patch.
+   */
+  steerSession?: (sessionKey: string, text: string) => boolean;
+
+  /**
+   * Check whether a session is currently streaming (actively generating a response).
+   * Available when running on an OpenClaw fork with the plugin-steer-api patch.
+   */
+  isSessionStreaming?: (sessionKey: string) => boolean;
 }
 
 /**
@@ -66,7 +79,7 @@ export interface ToolResult {
 export function toOCResult(result: ToolResult): ToolResultOC {
   const text = result.ok
     ? result.output ?? JSON.stringify(result.data ?? { ok: true }, null, 2)
-    : result.error ?? "Unknown error";
+    : `ERROR: ${result.error ?? "Unknown error"}\n\nThis tool call FAILED. Do not proceed as if it succeeded.`;
   return {
     content: [{ type: "text", text }],
     details: { ok: result.ok, ...(result.data ?? {}) },

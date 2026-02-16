@@ -39,11 +39,9 @@ import {
  *   agent:{agentId}:flock:channel:{channelId}
  *   agent:{agentId}:flock:dm:{peerId}
  */
-export type SessionSendFn = (
-  agentId: string,
-  message: string,
-  sessionKey?: string,
-) => Promise<string | null>;
+import type { SessionSendFn } from "./gateway-send.js";
+// Re-export for backward compatibility — canonical definition in gateway-send.ts
+export type { SessionSendFn } from "./gateway-send.js";
 
 export interface FlockExecutorParams {
   /** Flock metadata for the agent this executor handles. */

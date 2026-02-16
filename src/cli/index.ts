@@ -3,7 +3,7 @@
  * Flock CLI — Standalone multi-agent swarm orchestration.
  *
  * Commands:
- *   flock init              Clone OpenClaw fork, build, and configure Flock
+ *   flock init              Install OpenClaw, build, and configure Flock
  *   flock start             Start the Flock gateway
  *   flock stop              Stop the running gateway
  *   flock add <id>          Add a new agent
@@ -32,8 +32,8 @@ const EXTENSIONS_DIR = path.join(FLOCK_HOME, "extensions");
 const WORKSPACES_DIR = path.join(FLOCK_HOME, "workspaces");
 const PID_FILE = path.join(FLOCK_HOME, "gateway.pid");
 
-const FLOCK_REPO = "https://github.com/mconcat/openclaw.git";
-const FLOCK_BRANCH = "fix/wire-after-tool-call-hook";
+const FLOCK_REPO = "https://github.com/openclaw/openclaw.git";
+const FLOCK_BRANCH = "main";
 
 /** Tools allowed inside sandbox containers. Shared by all sandboxed agents. */
 const SANDBOX_TOOL_ALLOW = [
@@ -158,15 +158,43 @@ function isNixDaemonRunning(): boolean {
   }
 }
 
-/** Write the docker-compose.nix.yml file. */
-function generateNixCompose(): void {
+/**
+ * Extract shared bind mounts from config that the Nix daemon should also have.
+ * Sandbox containers get binds like "/tmp/flock-e2e/shared:/tmp/shared".
+ * The Nix daemon needs these too so sysadmin can compile/place files there
+ * via `docker exec flock-nix-daemon`.
+ */
+function getSharedBindsFromConfig(): string[] {
+  if (!fs.existsSync(CONFIG_PATH)) return [];
+  try {
+    const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf-8"));
+    const agents = config.agents as Record<string, unknown> | undefined;
+    const defaults = agents?.defaults as Record<string, unknown> | undefined;
+    const sandbox = defaults?.sandbox as Record<string, unknown> | undefined;
+    const docker = sandbox?.docker as Record<string, unknown> | undefined;
+    const binds = docker?.binds as string[] | undefined;
+    if (!binds) return [];
+    // Include bind mounts but skip the nix volume (already in compose)
+    return binds.filter(b => !b.startsWith(`${NIX_VOLUME}:`));
+  } catch {
+    return [];
+  }
+}
+
+/** Write the docker-compose.nix.yml file. Returns the content string. */
+function generateNixCompose(): string {
+  const extraBinds = getSharedBindsFromConfig();
+  const volumeLines = [`      - ${NIX_VOLUME}:/nix`];
+  for (const bind of extraBinds) {
+    volumeLines.push(`      - ${bind}`);
+  }
   const content = `services:
   nix-daemon:
     image: nixos/nix:latest
     container_name: ${NIX_CONTAINER}
     command: ["nix-daemon"]
     volumes:
-      - ${NIX_VOLUME}:/nix
+${volumeLines.join("\n")}
     restart: unless-stopped
 
 volumes:
@@ -174,12 +202,18 @@ volumes:
     name: ${NIX_VOLUME}
 `;
   fs.writeFileSync(NIX_COMPOSE, content, "utf-8");
+  return content;
 }
 
-/** Start the nix-daemon container if not already running. */
+/** Start the nix-daemon container, restarting if compose config changed. */
 function ensureNixDaemon(): void {
-  if (isNixDaemonRunning()) return;
-  if (!fs.existsSync(NIX_COMPOSE)) generateNixCompose();
+  const existing = fs.existsSync(NIX_COMPOSE)
+    ? fs.readFileSync(NIX_COMPOSE, "utf-8")
+    : "";
+  const updated = generateNixCompose();
+
+  if (isNixDaemonRunning() && updated === existing) return;
+
   console.log("Starting Nix daemon...");
   run(`docker compose -f "${NIX_COMPOSE}" up -d`);
 }
@@ -746,7 +780,7 @@ Usage:
   flock <command> [options]
 
 Commands:
-  init                    Set up Flock (clones OpenClaw, builds, configures)
+  init                    Set up Flock (installs OpenClaw, builds, configures)
   start                   Start the gateway
   stop                    Stop the gateway
   update                  Update bundled OpenClaw to latest

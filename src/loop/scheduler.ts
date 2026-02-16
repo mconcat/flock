@@ -14,10 +14,9 @@
  */
 
 import type { AgentLoopStore, AgentLoopRecord, ChannelMessageStore, ChannelStore } from "../db/interface.js";
-import type { A2AClient } from "../transport/client.js";
+import type { SessionSendFn } from "../transport/gateway-send.js";
 import type { AuditLog } from "../audit/log.js";
 import type { PluginLogger } from "../types.js";
-import { userMessage, dataPart } from "../transport/a2a-helpers.js";
 import { uniqueId } from "../utils/id.js";
 
 /** Base tick interval for AWAKE agents (ms). */
@@ -46,7 +45,8 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 
 export interface WorkLoopSchedulerDeps {
   agentLoop: AgentLoopStore;
-  a2aClient: A2AClient;
+  /** Send a message to an agent's OpenClaw session. */
+  sessionSend: SessionSendFn;
   channelMessages: ChannelMessageStore;
   channelStore: ChannelStore;
   audit: AuditLog;
@@ -67,6 +67,9 @@ export class WorkLoopScheduler {
   /** Track last slow-tick time per SLEEP agent (in-memory, not persisted). */
   private lastSlowTickAt = new Map<string, number>();
 
+  /** Timestamp when start() was called — used for startup grace period. */
+  private startedAt = 0;
+
   constructor(deps: WorkLoopSchedulerDeps) {
     this.deps = deps;
   }
@@ -74,9 +77,14 @@ export class WorkLoopScheduler {
   /**
    * Start the tick loop. Idempotent.
    */
+  /** Grace period after start() before first tick — lets gateway finish booting.
+   *  Needs to be generous: OpenClaw may build UI assets (~80s) before listening. */
+  static readonly STARTUP_GRACE_MS = 90_000;
+
   start(): void {
     if (this.timer) return;
     this.running = true;
+    this.startedAt = Date.now();
 
     // Check interval: half the base interval for responsive jitter handling
     const checkInterval = TICK_INTERVAL_MS / 2;
@@ -106,6 +114,11 @@ export class WorkLoopScheduler {
     if (!this.running) return;
 
     const now = Date.now();
+
+    // Skip ticks during startup grace period — gateway may not be ready yet.
+    if (now - this.startedAt < WorkLoopScheduler.STARTUP_GRACE_MS) {
+      return;
+    }
 
     // --- Fast ticks for AWAKE agents ---
     const awakeAgents = this.deps.agentLoop.listByState("AWAKE");
@@ -169,39 +182,66 @@ export class WorkLoopScheduler {
   }
 
   /**
-   * Send a tick to a single agent with retry.
+   * Send per-channel ticks to an AWAKE agent.
    *
-   * The agent continues work by making tool calls within a single turn —
-   * OpenClaw handles the multi-turn tool loop internally. Three outcomes:
-   *   1. Agent keeps calling tools → continuous work within this tick
-   *   2. Agent returns final text → waits for next tick (~60s)
-   *   3. Agent calls flock_sleep() then returns → enters SLEEP state
+   * Each channel the agent belongs to that has new messages gets its own
+   * tick message sent to a per-channel session:
+   *   `agent:{agentId}:flock:channel:{channelId}`
+   *
+   * This gives each channel an isolated conversation thread — tool calls,
+   * thinking, and context stay within the channel's scope, like a normal
+   * assistant session.
+   *
+   * If no channels have updates, sends a brief "no activity" message to
+   * the control session so the agent can decide to sleep.
    *
    * On failure: retries up to TICK_MAX_RETRIES times with exponential backoff.
-   * After MAX_CONSECUTIVE_FAILURES consecutive failures, auto-sleeps the agent
-   * to prevent wasting resources on unreachable agents.
+   * After MAX_CONSECUTIVE_FAILURES consecutive failures, auto-sleeps the agent.
    */
   private async sendTick(agent: AgentLoopRecord, now: number): Promise<void> {
-    const { agentLoop, a2aClient, audit, logger } = this.deps;
+    const { agentLoop, sessionSend, audit, logger } = this.deps;
 
     // Update lastTickAt before sending (prevents double-ticks on slow responses)
     agentLoop.updateLastTick(agent.agentId, now);
 
-    const tickMessage = this.buildTickMessage(agent);
+    const channelUpdates = this.getChannelUpdates(agent.agentId);
+
+    if (channelUpdates.length === 0) {
+      // No channel activity — send a brief control message so the agent can sleep
+      const controlMessage = this.buildNoActivityMessage(agent);
+      await this.deliverMessage(agent, controlMessage, `agent:${agent.agentId}:flock:tick:control`, now);
+      return;
+    }
+
+    // Send a separate tick to each channel with updates
+    for (const update of channelUpdates) {
+      const tickMessage = this.buildChannelTickMessage(agent, update);
+      const sessionKey = `agent:${agent.agentId}:flock:channel:${update.channelId}`;
+      // Fire each channel tick independently; don't let one channel failure block others
+      await this.deliverMessage(agent, tickMessage, sessionKey, now);
+    }
+  }
+
+  /**
+   * Deliver a message to an agent session with retry and failure tracking.
+   */
+  private async deliverMessage(
+    agent: AgentLoopRecord,
+    message: string,
+    sessionKey: string,
+    now: number,
+  ): Promise<boolean> {
+    const { agentLoop, sessionSend, audit, logger } = this.deps;
     let delivered = false;
 
     for (let attempt = 0; attempt <= TICK_MAX_RETRIES; attempt++) {
       try {
-        await a2aClient.sendA2A(agent.agentId, {
-          message: userMessage(tickMessage, [
-            dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
-          ]),
-        });
+        await sessionSend(agent.agentId, message, sessionKey);
         delivered = true;
         break;
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        logger.warn(`[flock:loop] Tick attempt ${attempt + 1}/${TICK_MAX_RETRIES + 1} failed for "${agent.agentId}": ${errorMsg}`);
+        logger.warn(`[flock:loop] Tick attempt ${attempt + 1}/${TICK_MAX_RETRIES + 1} failed for "${agent.agentId}" [${sessionKey}]: ${errorMsg}`);
 
         if (attempt < TICK_MAX_RETRIES) {
           await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
@@ -210,11 +250,9 @@ export class WorkLoopScheduler {
     }
 
     if (delivered) {
-      // Reset consecutive failure counter on success
       this.consecutiveFailures.delete(agent.agentId);
-      logger.debug?.(`[flock:loop] Tick sent to "${agent.agentId}"`);
+      logger.debug?.(`[flock:loop] Tick sent to "${agent.agentId}" [${sessionKey}]`);
     } else {
-      // Track consecutive failures
       const failures = (this.consecutiveFailures.get(agent.agentId) ?? 0) + 1;
       this.consecutiveFailures.set(agent.agentId, failures);
 
@@ -224,11 +262,10 @@ export class WorkLoopScheduler {
         agentId: agent.agentId,
         action: "tick-failed",
         level: "YELLOW",
-        detail: `Work loop tick failed after ${TICK_MAX_RETRIES + 1} attempts (consecutive failures: ${failures})`,
+        detail: `Tick failed [${sessionKey}] after ${TICK_MAX_RETRIES + 1} attempts (consecutive: ${failures})`,
         result: "error",
       });
 
-      // Auto-sleep agent after too many consecutive failures
       if (failures >= MAX_CONSECUTIVE_FAILURES) {
         logger.warn(
           `[flock:loop] Agent "${agent.agentId}" unreachable for ${failures} consecutive ticks — auto-sleeping`,
@@ -247,158 +284,154 @@ export class WorkLoopScheduler {
         });
       }
     }
+
+    return delivered;
   }
 
   /**
-   * Send a slow-tick to a SLEEP agent.
+   * Send per-channel slow-ticks to a SLEEP agent.
    *
-   * Slow-ticks provide a channel activity summary so SLEEP agents can decide
-   * whether to self-wake. The agent reviews recent channel activity and either:
-   *   1. Calls flock_sleep() again → stays SLEEP (or simply returns)
-   *   2. Responds / makes tool calls → indicates interest, but stays SLEEP
-   *      until they explicitly call self-wake or the scheduler sees engagement
-   *
-   * The slow-tick message instructs the agent to call flock_channel_post if
-   * they want to participate, which will naturally transition them to AWAKE
-   * as they start engaging in work loop ticks.
+   * Each channel with recent activity gets its own slow-tick sent to the
+   * channel's dedicated session. This maintains the per-channel isolation:
+   * the SLEEP agent reviews each channel independently and can respond
+   * within the appropriate session context.
    */
   private async sendSlowTick(agent: AgentLoopRecord, now: number): Promise<void> {
-    const { a2aClient, audit, logger } = this.deps;
+    const { channelStore, channelMessages, logger } = this.deps;
 
     this.lastSlowTickAt.set(agent.agentId, now);
 
-    const message = this.buildSlowTickMessage(agent);
-    if (!message) {
-      // No channel activity to report — skip this slow-tick entirely
-      logger.debug?.(`[flock:loop] No channel activity for SLEEP agent "${agent.agentId}" — skipping slow-tick`);
+    const channels = channelStore.list({ member: agent.agentId, archived: false });
+    if (channels.length === 0) {
+      logger.debug?.(`[flock:loop] No channels for SLEEP agent "${agent.agentId}" — skipping slow-tick`);
       return;
     }
 
-    try {
-      await a2aClient.sendA2A(agent.agentId, {
-        message: userMessage(message, [
-          dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
-        ]),
-      });
-      logger.debug?.(`[flock:loop] Slow-tick sent to SLEEP agent "${agent.agentId}"`);
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.warn(`[flock:loop] Slow-tick failed for SLEEP agent "${agent.agentId}": ${errorMsg}`);
-
-      audit.append({
-        id: uniqueId("slow-tick-err"),
-        timestamp: now,
-        agentId: agent.agentId,
-        action: "slow-tick-failed",
-        level: "YELLOW",
-        detail: `Slow-tick to SLEEP agent failed: ${errorMsg.slice(0, 200)}`,
-        result: "error",
-      });
-    }
-  }
-
-  /**
-   * Build the slow-tick message for a SLEEP agent.
-   * Returns null if there's no channel activity to report.
-   *
-   * The message includes a summary of all channels the agent is a member of
-   * with recent activity, and instructs the agent to self-wake if interested.
-   */
-  private buildSlowTickMessage(agent: AgentLoopRecord): string | null {
-    const { channelStore, channelMessages } = this.deps;
-
-    // Find all channels this agent is a member of
-    const channels = channelStore.list({ member: agent.agentId, archived: false });
-    if (channels.length === 0) return null;
-
-    const channelSummaries: string[] = [];
-
+    let sentCount = 0;
     for (const ch of channels) {
       const totalCount = channelMessages.count(ch.channelId);
       if (totalCount === 0) continue;
 
-      // Get recent messages (last 5) as a preview
-      const allMessages = channelMessages.list({ channelId: ch.channelId });
-      const recentMessages = allMessages.slice(-5);
-      const preview = recentMessages.map(m =>
-        `  [seq ${m.seq}] ${m.agentId}: ${m.content.slice(0, 120)}`,
-      ).join("\n");
-
-      channelSummaries.push(
-        `#${ch.channelId} — ${ch.topic}\n` +
-        `  Members: ${ch.members.join(", ")} | ${totalCount} total messages\n` +
-        preview,
-      );
+      const message = this.buildSlowTickChannelMessage(agent, ch, channelMessages);
+      const sessionKey = `agent:${agent.agentId}:flock:channel:${ch.channelId}`;
+      const delivered = await this.deliverMessage(agent, message, sessionKey, now);
+      if (delivered) sentCount++;
     }
 
-    if (channelSummaries.length === 0) return null;
+    if (sentCount === 0) {
+      logger.debug?.(`[flock:loop] No channel activity for SLEEP agent "${agent.agentId}" — skipping slow-tick`);
+    }
+  }
 
+  /**
+   * Build a slow-tick message for a single channel.
+   * Includes recent message preview so the SLEEP agent can decide whether to engage.
+   */
+  private buildSlowTickChannelMessage(
+    agent: AgentLoopRecord,
+    channel: { channelId: string; topic?: string; members: string[] },
+    channelMessages: ChannelMessageStore,
+  ): string {
     const sleepDuration = agent.sleptAt ? Date.now() - agent.sleptAt : 0;
     const sleepMins = Math.floor(sleepDuration / 60_000);
 
+    const totalCount = channelMessages.count(channel.channelId);
+    const allMessages = channelMessages.list({ channelId: channel.channelId });
+    const recentMessages = allMessages.slice(-5);
+    const preview = recentMessages.map(m =>
+      `  [seq ${m.seq}] ${m.agentId}: ${m.content}`,
+    ).join("\n");
+
+    const header = channel.topic
+      ? `#${channel.channelId} — ${channel.topic}`
+      : `#${channel.channelId}`;
+
     const lines = [
-      `[Sleep Tick — Periodic Channel Review]`,
+      `[Sleep Tick — Channel Review]`,
       `State: SLEEP (${sleepMins}m)`,
+      `Channel: ${header}`,
+      `Members: ${channel.members.join(", ")} | ${totalCount} total messages`,
       ``,
-      `You are currently sleeping. Here is a summary of recent channel activity:`,
+      `You are currently sleeping. Recent activity in this channel:`,
       ``,
-      `--- Channel Activity Summary ---`,
-      ...channelSummaries,
-      `--- End Summary ---`,
+      preview,
       ``,
-      `Review the activity above. If any discussion is relevant to your role and you can contribute:`,
-      `  1. Post to the channel: flock_channel_post(channelId="...", message="...")`,
-      `  2. This will automatically transition you to AWAKE state.`,
+      `If this discussion is relevant to your role and you can contribute:`,
+      `  Post to the channel: flock_channel_post(channelId="${channel.channelId}", message="...")`,
+      `  This will automatically transition you to AWAKE state.`,
       ``,
-      `If nothing requires your attention, do nothing — you will stay asleep and check again in ~5 minutes.`,
-      `Do NOT wake up just to say "nothing to do". Silence is the correct response when sleeping.`,
+      `If nothing requires your attention, do nothing — silence means stay asleep.`,
     ];
 
     return lines.join("\n");
   }
 
   /**
-   * Build the tick message content for an agent.
-   * Includes: active channel updates with name/topic, general status, sleep hint.
+   * Build a tick message for a single channel.
+   * Each channel gets its own session, so the message only contains
+   * that channel's updates — no cross-channel pollution.
    */
-  private buildTickMessage(agent: AgentLoopRecord): string {
-    const channelUpdates = this.getChannelUpdates(agent.agentId);
-
+  private buildChannelTickMessage(
+    agent: AgentLoopRecord,
+    update: { channelId: string; topic: string; newMessages: Array<{ agentId: string; content: string; seq: number }> },
+  ): string {
     const awakeDuration = Date.now() - agent.awakenedAt;
     const awakeMins = Math.floor(awakeDuration / 60_000);
 
+    const header = update.topic
+      ? `#${update.channelId} — ${update.topic}`
+      : `#${update.channelId}`;
+
     const lines: string[] = [
-      `[Work Loop Tick]`,
+      `[Work Loop Tick — Channel Update]`,
       `State: AWAKE (${awakeMins}m)`,
+      `Channel: ${header}`,
+      ``,
+      `--- New Messages (${update.newMessages.length}) ---`,
     ];
 
-    if (channelUpdates.length > 0) {
-      lines.push(``);
-      lines.push(`--- New Channel Activity ---`);
-      for (const update of channelUpdates) {
-        const header = update.topic
-          ? `#${update.channelId} — ${update.topic}`
-          : `#${update.channelId}`;
-        lines.push(`${header} (${update.newMessages.length} new):`);
-        for (const msg of update.newMessages) {
-          lines.push(`  [${msg.agentId}]: ${msg.content.slice(0, 200)}`);
-        }
-      }
-      lines.push(`--- End Channel Activity ---`);
-    } else {
-      lines.push(`No new channel activity since last tick.`);
+    for (const msg of update.newMessages) {
+      lines.push(`  [${msg.agentId}]: ${msg.content}`);
     }
 
+    lines.push(`--- End Messages ---`);
     lines.push(``);
-    lines.push(`Continue your work. Review any new channel messages and respond if needed.`);
-    lines.push(`If you have nothing to do and no pending work, call flock_sleep() to conserve resources.`);
+    lines.push(`Continue your work in this channel. Review the new messages and respond if needed.`);
+    lines.push(`Post your responses with: flock_channel_post(channelId="${update.channelId}", message="...")`);
+    lines.push(`If you have nothing to do, call flock_sleep() to conserve resources.`);
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Build a brief no-activity message for the control session.
+   * Sent when an AWAKE agent has no channel updates — lets them decide to sleep.
+   */
+  private buildNoActivityMessage(agent: AgentLoopRecord): string {
+    const awakeDuration = Date.now() - agent.awakenedAt;
+    const awakeMins = Math.floor(awakeDuration / 60_000);
+
+    const lines = [
+      `[Work Loop Tick]`,
+      `State: AWAKE (${awakeMins}m)`,
+      `No new channel activity since last tick.`,
+      ``,
+      `If you have nothing to do and no pending work, call flock_sleep() to conserve resources.`,
+    ];
 
     return lines.join("\n");
   }
 
   /**
    * Get channel updates for an agent since their last tick.
-   * Tracks which channels the agent has seen via agentChannelSeqs.
+   *
+   * Discovers channels from DB (via membership query) rather than relying
+   * on an in-memory registration map. This ensures agents see new channels
+   * they've been added to, even if the channel was created by a different
+   * plugin instance or before this scheduler started.
+   *
+   * For newly discovered channels (not yet in agentChannelSeqs), lastSeenSeq
+   * starts at 0 so all existing messages are included as "new".
    */
   private getChannelUpdates(agentId: string): Array<{
     channelId: string;
@@ -417,20 +450,22 @@ export class WorkLoopScheduler {
     }
     const seqs = this.agentChannelSeqs.get(agentId)!;
 
-    // Check all channels the agent has been tracked in
-    for (const [channelId, lastSeenSeq] of seqs) {
+    // Query DB for all non-archived channels this agent is a member of.
+    const channels = channelStore.list({ member: agentId, archived: false });
+
+    for (const ch of channels) {
+      // For channels not yet tracked, start at 0 so all messages appear new.
+      const lastSeenSeq = seqs.get(ch.channelId) ?? 0;
+
       const newMessages = channelMessages.list({
-        channelId,
+        channelId: ch.channelId,
         since: lastSeenSeq + 1,
       });
 
       if (newMessages.length > 0) {
-        // Look up channel metadata for rich context
-        const channel = channelStore.get(channelId);
-
         updates.push({
-          channelId,
-          topic: channel?.topic ?? "",
+          channelId: ch.channelId,
+          topic: ch.topic ?? "",
           newMessages: newMessages.map(m => ({
             agentId: m.agentId,
             content: m.content,
@@ -439,7 +474,7 @@ export class WorkLoopScheduler {
         });
 
         const maxSeq = Math.max(...newMessages.map(m => m.seq));
-        seqs.set(channelId, maxSeq);
+        seqs.set(ch.channelId, maxSeq);
       }
     }
 
@@ -447,40 +482,77 @@ export class WorkLoopScheduler {
   }
 
   /**
-   * Register that an agent is participating in a channel.
-   * Called when an agent posts to or is notified about a channel.
-   */
-  trackChannel(agentId: string, channelId: string, currentSeq: number): void {
-    if (!this.agentChannelSeqs.has(agentId)) {
-      this.agentChannelSeqs.set(agentId, new Map());
-    }
-    const seqs = this.agentChannelSeqs.get(agentId)!;
-    const existing = seqs.get(channelId) ?? 0;
-    if (currentSeq > existing) {
-      seqs.set(channelId, currentSeq);
-    }
-  }
-
-  /**
-   * Request an immediate one-shot tick for an agent.
+   * Request an immediate tick for an agent, optionally scoped to a channel.
    *
-   * Used when an agent is @mentioned in a channel — triggers a tick
-   * so they see the new messages immediately rather than waiting for
-   * the next periodic cycle.
+   * If channelId is provided, sends a per-channel tick to that channel's
+   * session only. If omitted, sends ticks to all channels with pending updates
+   * (same as a regular periodic tick, but bypasses startup grace + schedule).
    *
-   * Key property: does NOT change agent state. A REACTIVE agent stays
-   * REACTIVE, a SLEEP agent stays SLEEP. The tick is purely a one-shot
-   * push through the same `tick:control` session route.
+   * Key property: does NOT change agent state. A SLEEP agent stays SLEEP,
+   * an AWAKE agent stays AWAKE. The tick is purely a one-shot push.
    */
-  async requestImmediateTick(agentId: string): Promise<void> {
+  async requestImmediateTick(agentId: string, channelId?: string): Promise<void> {
     const { agentLoop, logger } = this.deps;
     const record = agentLoop.get(agentId);
     if (!record) {
       logger.warn(`[flock:loop] requestImmediateTick: agent "${agentId}" not found in loop state`);
       return;
     }
-    logger.info(`[flock:loop] Immediate tick requested for "${agentId}" (state: ${record.state})`);
-    await this.sendTick(record, Date.now());
+
+    if (channelId) {
+      logger.info(`[flock:loop] Immediate tick requested for "${agentId}" in channel "${channelId}"`);
+      // Build update for the specific channel
+      const update = this.getChannelUpdate(agentId, channelId);
+      if (update) {
+        const tickMessage = this.buildChannelTickMessage(record, update);
+        const sessionKey = `agent:${agentId}:flock:channel:${channelId}`;
+        await this.deliverMessage(record, tickMessage, sessionKey, Date.now());
+      }
+    } else {
+      logger.info(`[flock:loop] Immediate tick requested for "${agentId}" (all channels)`);
+      await this.sendTick(record, Date.now());
+    }
+  }
+
+  /**
+   * Get updates for a single channel for a specific agent.
+   * Returns null if the channel has no new messages.
+   */
+  private getChannelUpdate(agentId: string, channelId: string): {
+    channelId: string;
+    topic: string;
+    newMessages: Array<{ agentId: string; content: string; seq: number }>;
+  } | null {
+    const { channelMessages, channelStore } = this.deps;
+
+    const channel = channelStore.get(channelId);
+    if (!channel || !channel.members.includes(agentId)) return null;
+
+    if (!this.agentChannelSeqs.has(agentId)) {
+      this.agentChannelSeqs.set(agentId, new Map());
+    }
+    const seqs = this.agentChannelSeqs.get(agentId)!;
+    const lastSeenSeq = seqs.get(channelId) ?? 0;
+
+    const newMessages = channelMessages.list({
+      channelId,
+      since: lastSeenSeq + 1,
+    });
+
+    if (newMessages.length === 0) return null;
+
+    const maxSeq = Math.max(...newMessages.map(m => m.seq));
+    seqs.set(channelId, maxSeq);
+
+    return {
+      channelId,
+      topic: channel.topic ?? "",
+      newMessages: newMessages.map(m => ({
+        agentId: m.agentId,
+        content: m.content,
+        seq: m.seq,
+      })),
+    };
   }
 
   /**
