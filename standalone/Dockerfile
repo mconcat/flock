@@ -41,7 +41,7 @@ RUN npm link
 RUN mkdir -p /root/.flock && \
     git clone --branch fix/wire-after-tool-call-hook --depth 1 \
       https://github.com/mconcat/openclaw.git /root/.flock/openclaw && \
-    cd /root/.flock/openclaw && npm install --no-fund --no-audit && npm run build
+    cd /root/.flock/openclaw && corepack enable && pnpm install && pnpm run build
 
 # Docker CLI + compose plugin — talks to host daemon via mounted /var/run/docker.sock
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
