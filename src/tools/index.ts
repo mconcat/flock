@@ -98,7 +98,12 @@ function wrapToolWithAgentId(tool: ToolDefinition, agentId: string | undefined):
       params._callerAgentId = resolvedId;
       console.log(`[flock:tool-call] ${resolvedId} → ${tool.name}(${JSON.stringify(params)})`);
       const result = await tool.execute(toolCallId, params);
-      console.log(`[flock:tool-call] ${resolvedId} ← ${tool.name}: ${JSON.stringify(result.details)}`);
+      const ok = result.details?.ok !== false;
+      if (ok) {
+        console.log(`[flock:tool-call] ${resolvedId} ← ${tool.name}: ${JSON.stringify(result.details)}`);
+      } else {
+        console.error(`[flock:tool-call:ERROR] ${resolvedId} ← ${tool.name} FAILED: ${JSON.stringify(result.details)}`);
+      }
       return result;
     },
   };

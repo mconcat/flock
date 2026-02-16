@@ -17,7 +17,7 @@
 # Verbose:
 #   E2E_VERBOSE=1 docker compose -f docker-compose.standalone.yml up --build --abort-on-container-exit
 #
-# Clean up:
+# Clean up (the test auto-cleans sandbox containers, but to remove everything):
 #   docker compose -f docker-compose.standalone.yml down -v
 
 services:

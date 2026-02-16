@@ -56,8 +56,10 @@ const CHANNEL_NAME = "fizzbuzz-project";
 // Shared bind mount — identical path on host and inside E2E container so that
 // sandbox containers (sibling containers on host daemon) see the same files.
 const SHARED_DIR = "/tmp/flock-e2e/shared";
-// Inside sandbox containers, /tmp/shared is bind-mounted from SHARED_DIR.
-const SANDBOX_SHARED = "/tmp/shared";
+// Inside sandbox containers, /shared is bind-mounted from SHARED_DIR.
+// IMPORTANT: Must NOT be under /tmp — sandbox containers use tmpfs at /tmp
+// which shadows any bind mounts to subdirectories of /tmp.
+const SANDBOX_SHARED = "/shared";
 // Rust source file and compiled output — agents write source, compile, run, save output
 const SOURCE_PATH = `${SHARED_DIR}/fizzbuzz.rs`;
 const SANDBOX_SOURCE_PATH = `${SANDBOX_SHARED}/fizzbuzz.rs`;
@@ -95,6 +97,27 @@ function assert(condition, name, details = "") {
     if (details) log(`     ${details}`);
   }
   return condition;
+}
+
+/**
+ * Clean up sandbox containers and Nix daemon from previous (or current) runs.
+ * Sandbox containers are sibling containers on the HOST Docker daemon — they
+ * survive `docker compose down` and must be explicitly removed.
+ */
+function cleanupSandboxContainers() {
+  // Remove all OpenClaw sandbox containers
+  const ps = execCapture(
+    'docker ps -a --filter label=openclaw.sandbox=1 --format "{{.Names}}"'
+  );
+  if (ps.ok && ps.output.trim()) {
+    const containers = ps.output.trim().split("\n").filter(Boolean);
+    if (containers.length > 0) {
+      log(`  Removing ${containers.length} sandbox container(s)...`);
+      execCapture(`docker rm -f ${containers.join(" ")}`);
+    }
+  }
+  // Remove Nix daemon if running
+  execCapture("docker rm -f flock-nix-daemon");
 }
 
 function execCapture(cmd, opts = {}) {
@@ -921,6 +944,10 @@ async function main() {
   }
 
   try {
+    // Pre-cleanup: remove stale sandbox containers from previous runs
+    log("Cleaning up stale containers from previous runs...");
+    cleanupSandboxContainers();
+
     // Phase 1: Init
     const config = await testFlockInit();
 
@@ -975,6 +1002,9 @@ async function main() {
         // already dead
       }
     }
+    // Post-cleanup: remove sandbox containers from this run
+    log("Cleaning up sandbox containers...");
+    cleanupSandboxContainers();
   }
 }
 

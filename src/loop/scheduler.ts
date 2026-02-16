@@ -339,7 +339,7 @@ export class WorkLoopScheduler {
     const allMessages = channelMessages.list({ channelId: channel.channelId });
     const recentMessages = allMessages.slice(-5);
     const preview = recentMessages.map(m =>
-      `  [seq ${m.seq}] ${m.agentId}: ${m.content.slice(0, 120)}`,
+      `  [seq ${m.seq}] ${m.agentId}: ${m.content}`,
     ).join("\n");
 
     const header = channel.topic
@@ -391,7 +391,7 @@ export class WorkLoopScheduler {
     ];
 
     for (const msg of update.newMessages) {
-      lines.push(`  [${msg.agentId}]: ${msg.content.slice(0, 200)}`);
+      lines.push(`  [${msg.agentId}]: ${msg.content}`);
     }
 
     lines.push(`--- End Messages ---`);

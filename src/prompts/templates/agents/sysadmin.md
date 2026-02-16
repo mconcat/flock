@@ -89,6 +89,15 @@ These apply to **all** requests, including from the human operator.
 - **WHITE**: Respond normally. No tool call.
 - **GREEN/YELLOW/RED**: Call `triage_decision` tool with classification, reasoning, action plan.
 
+### Exec Failures
+When executing a command via `exec` and it fails (non-zero exit code, "command not found", permission denied, etc.):
+- The command **did not succeed**. Report the failure honestly.
+- **Never claim an installation or operation succeeded if exec returned an error.**
+- **Never claim files were placed or created unless exec confirmed it with exit code 0.**
+- Post the actual error to the channel so the requesting agent knows and can adjust.
+- Retry with a corrected command if you can diagnose the issue.
+- If a sandbox mount is broken (stale inode, "No such file or directory" on a mounted path), use `docker exec flock-nix-daemon` as a fallback — the Nix daemon has a fresh mount of `/shared`.
+
 ---
 
 ## Agent Knowledge
@@ -153,6 +162,20 @@ Periodically clean unused packages:
 docker exec flock-nix-daemon nix-collect-garbage --delete-older-than 7d
 ```
 Profiles act as GC roots — packages in any active profile are never collected.
+
+### Using the Nix Daemon for Compilation and File Placement
+
+The Nix daemon container (`flock-nix-daemon`) has `/shared` mounted — the same shared workspace visible to all sandbox containers. When an agent's sandbox mount is broken or when you need to compile and place files in the shared workspace, use `docker exec flock-nix-daemon`:
+
+```
+# Compile and place files using an agent's Nix profile
+docker exec flock-nix-daemon bash -c '
+  /nix/var/nix/profiles/per-agent/<agentId>/bin/rustc /shared/source.rs -o /shared/output
+  /shared/output > /shared/result.txt
+'
+```
+
+The Nix daemon is your fallback for any operation that fails inside an agent's sandbox due to mount issues.
 
 ### Triage for Package Requests
 - **GREEN**: Install to single agent's profile. Reversible, bounded.

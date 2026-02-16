@@ -79,7 +79,7 @@ export interface ToolResult {
 export function toOCResult(result: ToolResult): ToolResultOC {
   const text = result.ok
     ? result.output ?? JSON.stringify(result.data ?? { ok: true }, null, 2)
-    : result.error ?? "Unknown error";
+    : `ERROR: ${result.error ?? "Unknown error"}\n\nThis tool call FAILED. Do not proceed as if it succeeded.`;
   return {
     content: [{ type: "text", text }],
     details: { ok: result.ok, ...(result.data ?? {}) },
