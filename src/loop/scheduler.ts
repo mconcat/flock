@@ -67,6 +67,9 @@ export class WorkLoopScheduler {
   /** Track last slow-tick time per SLEEP agent (in-memory, not persisted). */
   private lastSlowTickAt = new Map<string, number>();
 
+  /** Timestamp when start() was called — used for startup grace period. */
+  private startedAt = 0;
+
   constructor(deps: WorkLoopSchedulerDeps) {
     this.deps = deps;
   }
@@ -74,9 +77,14 @@ export class WorkLoopScheduler {
   /**
    * Start the tick loop. Idempotent.
    */
+  /** Grace period after start() before first tick — lets gateway finish booting.
+   *  Needs to be generous: OpenClaw may build UI assets (~80s) before listening. */
+  static readonly STARTUP_GRACE_MS = 90_000;
+
   start(): void {
     if (this.timer) return;
     this.running = true;
+    this.startedAt = Date.now();
 
     // Check interval: half the base interval for responsive jitter handling
     const checkInterval = TICK_INTERVAL_MS / 2;
@@ -106,6 +114,11 @@ export class WorkLoopScheduler {
     if (!this.running) return;
 
     const now = Date.now();
+
+    // Skip ticks during startup grace period — gateway may not be ready yet.
+    if (now - this.startedAt < WorkLoopScheduler.STARTUP_GRACE_MS) {
+      return;
+    }
 
     // --- Fast ticks for AWAKE agents ---
     const awakeAgents = this.deps.agentLoop.listByState("AWAKE");
@@ -393,7 +406,14 @@ export class WorkLoopScheduler {
 
   /**
    * Get channel updates for an agent since their last tick.
-   * Tracks which channels the agent has seen via agentChannelSeqs.
+   *
+   * Discovers channels from DB (via membership query) rather than relying
+   * on an in-memory registration map. This ensures agents see new channels
+   * they've been added to, even if the channel was created by a different
+   * plugin instance or before this scheduler started.
+   *
+   * For newly discovered channels (not yet in agentChannelSeqs), lastSeenSeq
+   * starts at 0 so all existing messages are included as "new".
    */
   private getChannelUpdates(agentId: string): Array<{
     channelId: string;
@@ -412,20 +432,22 @@ export class WorkLoopScheduler {
     }
     const seqs = this.agentChannelSeqs.get(agentId)!;
 
-    // Check all channels the agent has been tracked in
-    for (const [channelId, lastSeenSeq] of seqs) {
+    // Query DB for all non-archived channels this agent is a member of.
+    const channels = channelStore.list({ member: agentId, archived: false });
+
+    for (const ch of channels) {
+      // For channels not yet tracked, start at 0 so all messages appear new.
+      const lastSeenSeq = seqs.get(ch.channelId) ?? 0;
+
       const newMessages = channelMessages.list({
-        channelId,
+        channelId: ch.channelId,
         since: lastSeenSeq + 1,
       });
 
       if (newMessages.length > 0) {
-        // Look up channel metadata for rich context
-        const channel = channelStore.get(channelId);
-
         updates.push({
-          channelId,
-          topic: channel?.topic ?? "",
+          channelId: ch.channelId,
+          topic: ch.topic ?? "",
           newMessages: newMessages.map(m => ({
             agentId: m.agentId,
             content: m.content,
@@ -434,26 +456,11 @@ export class WorkLoopScheduler {
         });
 
         const maxSeq = Math.max(...newMessages.map(m => m.seq));
-        seqs.set(channelId, maxSeq);
+        seqs.set(ch.channelId, maxSeq);
       }
     }
 
     return updates;
-  }
-
-  /**
-   * Register that an agent is participating in a channel.
-   * Called when an agent posts to or is notified about a channel.
-   */
-  trackChannel(agentId: string, channelId: string, currentSeq: number): void {
-    if (!this.agentChannelSeqs.has(agentId)) {
-      this.agentChannelSeqs.set(agentId, new Map());
-    }
-    const seqs = this.agentChannelSeqs.get(agentId)!;
-    const existing = seqs.get(channelId) ?? 0;
-    if (currentSeq > existing) {
-      seqs.set(channelId, currentSeq);
-    }
   }
 
   /**

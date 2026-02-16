@@ -1336,11 +1336,17 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
         });
         messageCount = 1;
 
-        // Track channel participation for work loop
-        if (deps.workLoopScheduler) {
-          for (const member of allMembers) {
-            deps.workLoopScheduler.trackChannel(member, channelId, seq);
-          }
+      }
+
+      // Trigger immediate tick for channel members so they see the new channel
+      // right away instead of waiting for the next scheduled tick cycle.
+      if (deps.workLoopScheduler) {
+        for (const member of allMembers) {
+          if (member === callerAgentId) continue;
+          deps.workLoopScheduler.requestImmediateTick(member).catch((err) => {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            deps.logger?.warn(`[flock:channel-create] Immediate tick for "${member}" failed: ${errorMsg}`);
+          });
         }
       }
 
@@ -1424,11 +1430,6 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
           deps.agentLoop.setState(callerAgentId, "AWAKE");
           deps.logger?.info(`[flock:channel-post] Auto-woke "${callerAgentId}" — posted to #${channelId}`);
         }
-      }
-
-      // Track channel participation for work loop
-      if (deps.workLoopScheduler) {
-        deps.workLoopScheduler.trackChannel(callerAgentId, channelId, newSeq);
       }
 
       // Audit
@@ -1684,12 +1685,15 @@ function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
       // SLEEP members are NOT auto-woken — they will discover new channel
       // membership via slow-tick polling and self-wake if relevant.
 
-      // Track newly added members in work loop scheduler
-      if (deps.workLoopScheduler && deps.channelMessages) {
-        const latestCount = deps.channelMessages.count(channelId);
+      // Trigger immediate tick for newly added members so they discover
+      // the channel right away.
+      if (deps.workLoopScheduler) {
         for (const member of toAdd) {
           if (!channel.members.includes(member)) {
-            deps.workLoopScheduler.trackChannel(member, channelId, latestCount);
+            deps.workLoopScheduler.requestImmediateTick(member).catch((err) => {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              deps.logger?.warn(`[flock:assign-members] Immediate tick for "${member}" failed: ${errorMsg}`);
+            });
           }
         }
       }

@@ -63,8 +63,25 @@ function getPluginMethod<T>(api: PluginApi, name: string): T | null {
 }
 import { createNodesTool } from "./nodes/tools.js";
 
+// --- Singleton state ---
+// OpenClaw calls register() for every agent session. Heavy state (DB,
+// scheduler, A2A server) must only be created once. Tool registration
+// must happen every time so each agent session gets the tools.
+interface FlockSingleton {
+  toolDeps: ToolDeps;
+}
+let _singleton: FlockSingleton | null = null;
+
 export function register(api: PluginApi) {
   const logger = api.logger;
+
+  // On subsequent calls (per-agent sessions), only register tools — skip
+  // heavy init (DB, scheduler, A2A, hooks).
+  if (_singleton) {
+    registerFlockTools(api, _singleton.toolDeps);
+    logger.info(`[flock] tools re-registered for agent session (singleton reuse)`);
+    return;
+  }
   const rawPluginConfig = api.pluginConfig as Record<string, unknown> | undefined;
   logger.info(`[flock:debug] raw pluginConfig keys: ${rawPluginConfig ? Object.keys(rawPluginConfig).join(", ") : "undefined"}`);
   if (rawPluginConfig?.gatewayAgents) {
@@ -618,6 +635,10 @@ export function register(api: PluginApi) {
     workLoopScheduler.stop();
     db.close();
   });
+
+  // Store singleton so subsequent register() calls reuse heavy state
+  // but still register tools per agent session.
+  _singleton = { toolDeps };
 
   logger.info(`[flock] ready — data: ${config.dataDir}, backend: ${db.backend}, a2a: active, workloop: active`);
 }

@@ -554,7 +554,10 @@ async function testWorkflow() {
     return;
   }
 
-  // --- 6a: Ensure shared output directory ---
+  // --- 6a: Ensure shared output directory (clean previous run artifacts) ---
+  if (fs.existsSync(SHARED_DIR)) {
+    fs.rmSync(SHARED_DIR, { recursive: true });
+  }
   fs.mkdirSync(SHARED_DIR, { recursive: true });
   log("  Shared directory: " + SHARED_DIR);
 
