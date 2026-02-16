@@ -264,6 +264,8 @@ export function register(api: PluginApi) {
     vaultsBasePath: config.vaultsBasePath,
     bridgeStore: db.bridges,
     discordBotToken,
+    steerSession: api.steerSession?.bind(api),
+    isSessionStreaming: api.isSessionStreaming?.bind(api),
   };
   registerFlockTools(api, toolDeps);
 

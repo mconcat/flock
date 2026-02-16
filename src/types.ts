@@ -24,6 +24,19 @@ export interface PluginApi {
   registerTool(tool: ToolDefinition | ((ctx: Record<string, unknown>) => ToolDefinition | ToolDefinition[] | null | undefined), opts?: { optional?: boolean }): void;
   registerGatewayMethod(method: string, handler: GatewayHandler): void;
   registerHttpRoute(params: { path: string; handler: HttpHandler }): void;
+
+  /**
+   * Steer an active streaming session by injecting a message between tool calls.
+   * Returns true if the message was queued, false if the session is not streaming.
+   * Available when running on an OpenClaw fork with the plugin-steer-api patch.
+   */
+  steerSession?: (sessionKey: string, text: string) => boolean;
+
+  /**
+   * Check whether a session is currently streaming (actively generating a response).
+   * Available when running on an OpenClaw fork with the plugin-steer-api patch.
+   */
+  isSessionStreaming?: (sessionKey: string) => boolean;
 }
 
 /**

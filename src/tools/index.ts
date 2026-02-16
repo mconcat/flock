@@ -76,6 +76,10 @@ export interface ToolDeps {
   discordBotToken?: string;
   /** Send function for bridged external platforms (wired at runtime). */
   sendExternal?: SendExternalFn;
+  /** Steer an active streaming session (injected from OpenClaw plugin API). */
+  steerSession?: (sessionKey: string, text: string) => boolean;
+  /** Check whether a session is currently streaming. */
+  isSessionStreaming?: (sessionKey: string) => boolean;
 }
 
 /**
@@ -1472,6 +1476,23 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
               const errorMsg = err instanceof Error ? err.message : String(err);
               deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" failed: ${errorMsg}`);
             });
+          }
+        }
+      }
+
+      // Steer: inject notification into channel members that are currently streaming.
+      // This solves the stale-context problem — if agent B is mid-response while
+      // agent A posts, B sees the new message between tool calls instead of
+      // finishing with stale context. Non-streaming members are unaffected (they
+      // pick up new messages on their next tick via the scheduler).
+      if (deps.steerSession) {
+        const steerText = `[channel:#${channelId}] New message from @${callerAgentId}: ${message}`;
+        for (const member of channel.members) {
+          if (member === callerAgentId) continue;
+          const sessionKey = `agent:${member}:flock:tick:control`;
+          const steered = deps.steerSession(sessionKey, steerText);
+          if (steered) {
+            deps.logger?.info(`[flock:channel-post] Steered "${member}" with new message in #${channelId}`);
           }
         }
       }
