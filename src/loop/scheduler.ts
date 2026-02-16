@@ -14,10 +14,9 @@
  */
 
 import type { AgentLoopStore, AgentLoopRecord, ChannelMessageStore, ChannelStore } from "../db/interface.js";
-import type { A2AClient } from "../transport/client.js";
+import type { SessionSendFn } from "../transport/gateway-send.js";
 import type { AuditLog } from "../audit/log.js";
 import type { PluginLogger } from "../types.js";
-import { userMessage, dataPart } from "../transport/a2a-helpers.js";
 import { uniqueId } from "../utils/id.js";
 
 /** Base tick interval for AWAKE agents (ms). */
@@ -46,7 +45,8 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 
 export interface WorkLoopSchedulerDeps {
   agentLoop: AgentLoopStore;
-  a2aClient: A2AClient;
+  /** Send a message to an agent's OpenClaw session. */
+  sessionSend: SessionSendFn;
   channelMessages: ChannelMessageStore;
   channelStore: ChannelStore;
   audit: AuditLog;
@@ -182,21 +182,18 @@ export class WorkLoopScheduler {
    * to prevent wasting resources on unreachable agents.
    */
   private async sendTick(agent: AgentLoopRecord, now: number): Promise<void> {
-    const { agentLoop, a2aClient, audit, logger } = this.deps;
+    const { agentLoop, sessionSend, audit, logger } = this.deps;
 
     // Update lastTickAt before sending (prevents double-ticks on slow responses)
     agentLoop.updateLastTick(agent.agentId, now);
 
     const tickMessage = this.buildTickMessage(agent);
+    const sessionKey = `agent:${agent.agentId}:flock:tick:control`;
     let delivered = false;
 
     for (let attempt = 0; attempt <= TICK_MAX_RETRIES; attempt++) {
       try {
-        await a2aClient.sendA2A(agent.agentId, {
-          message: userMessage(tickMessage, [
-            dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
-          ]),
-        });
+        await sessionSend(agent.agentId, tickMessage, sessionKey);
         delivered = true;
         break;
       } catch (err) {
@@ -263,7 +260,7 @@ export class WorkLoopScheduler {
    * as they start engaging in work loop ticks.
    */
   private async sendSlowTick(agent: AgentLoopRecord, now: number): Promise<void> {
-    const { a2aClient, audit, logger } = this.deps;
+    const { sessionSend, audit, logger } = this.deps;
 
     this.lastSlowTickAt.set(agent.agentId, now);
 
@@ -274,12 +271,10 @@ export class WorkLoopScheduler {
       return;
     }
 
+    const sessionKey = `agent:${agent.agentId}:flock:tick:control`;
+
     try {
-      await a2aClient.sendA2A(agent.agentId, {
-        message: userMessage(message, [
-          dataPart({ sessionRouting: { chatType: "tick", peerId: "control" } }),
-        ]),
-      });
+      await sessionSend(agent.agentId, message, sessionKey);
       logger.debug?.(`[flock:loop] Slow-tick sent to SLEEP agent "${agent.agentId}"`);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);

@@ -3,7 +3,7 @@
  * Flock CLI — Standalone multi-agent swarm orchestration.
  *
  * Commands:
- *   flock init              Clone OpenClaw fork, build, and configure Flock
+ *   flock init              Install OpenClaw, build, and configure Flock
  *   flock start             Start the Flock gateway
  *   flock stop              Stop the running gateway
  *   flock add <id>          Add a new agent
@@ -32,8 +32,8 @@ const EXTENSIONS_DIR = path.join(FLOCK_HOME, "extensions");
 const WORKSPACES_DIR = path.join(FLOCK_HOME, "workspaces");
 const PID_FILE = path.join(FLOCK_HOME, "gateway.pid");
 
-const FLOCK_REPO = "https://github.com/mconcat/openclaw.git";
-const FLOCK_BRANCH = "fix/wire-after-tool-call-hook";
+const FLOCK_REPO = "https://github.com/openclaw/openclaw.git";
+const FLOCK_BRANCH = "main";
 
 /** Tools allowed inside sandbox containers. Shared by all sandboxed agents. */
 const SANDBOX_TOOL_ALLOW = [
@@ -746,7 +746,7 @@ Usage:
   flock <command> [options]
 
 Commands:
-  init                    Set up Flock (clones OpenClaw, builds, configures)
+  init                    Set up Flock (installs OpenClaw, builds, configures)
   start                   Start the gateway
   stop                    Stop the gateway
   update                  Update bundled OpenClaw to latest

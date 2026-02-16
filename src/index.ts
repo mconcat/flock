@@ -491,9 +491,19 @@ export function register(api: PluginApi) {
   // Wire agent loop store and scheduler into tool deps
   toolDeps.agentLoop = db.agentLoop;
 
+  // Scheduler uses fire-and-forget sends — ticks kick agents without
+  // blocking on their response. This frees the scheduler loop and lets
+  // agents run independently via OpenClaw's multi-turn tool loop.
+  const schedulerSend = createGatewaySessionSend({
+    port: config.gateway.port,
+    token: config.gateway.token,
+    logger,
+    fireAndForget: true,
+  });
+
   const workLoopScheduler = new WorkLoopScheduler({
     agentLoop: db.agentLoop,
-    a2aClient,
+    sessionSend: schedulerSend,
     channelMessages: db.channelMessages,
     channelStore: db.channels,
     audit,
