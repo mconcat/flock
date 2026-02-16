@@ -22,9 +22,6 @@ RUN apt-get update && \
 
 RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
-# OpenClaw build scripts use pnpm
-RUN npm install -g pnpm
-
 # --- Build Flock from source ---
 COPY package.json package-lock.json ./
 RUN npm install
