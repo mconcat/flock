@@ -30,6 +30,8 @@ COPY package.json package-lock.json ./
 RUN npm install
 
 COPY tsconfig.json openclaw.plugin.json ./
+# Cache-bust: changes to src/ should invalidate everything below
+ARG CACHE_BUST=0
 COPY src/ src/
 RUN npx tsc && cp -r src/prompts/templates dist/prompts/ && cp openclaw.plugin.json dist/ && chmod +x dist/cli/index.js
 

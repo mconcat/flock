@@ -1338,14 +1338,14 @@ function createChannelCreateTool(deps: ToolDeps): ToolDefinition {
 
       }
 
-      // Trigger immediate tick for channel members so they see the new channel
-      // right away instead of waiting for the next scheduled tick cycle.
+      // Trigger immediate per-channel tick for channel members so they see the
+      // new channel right away instead of waiting for the next scheduled tick cycle.
       if (deps.workLoopScheduler) {
         for (const member of allMembers) {
           if (member === callerAgentId) continue;
-          deps.workLoopScheduler.requestImmediateTick(member).catch((err) => {
+          deps.workLoopScheduler.requestImmediateTick(member, channelId).catch((err) => {
             const errorMsg = err instanceof Error ? err.message : String(err);
-            deps.logger?.warn(`[flock:channel-create] Immediate tick for "${member}" failed: ${errorMsg}`);
+            deps.logger?.warn(`[flock:channel-create] Immediate tick for "${member}" in "${channelId}" failed: ${errorMsg}`);
           });
         }
       }
@@ -1470,12 +1470,12 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
             });
           }
 
-          // Trigger immediate tick for mentioned agents (SLEEP→AWAKE or REACTIVE)
-          // so they see the message now rather than waiting for the next periodic tick.
+          // Trigger immediate per-channel tick for mentioned agents so they see
+          // the message in the correct channel session right away.
           if (deps.workLoopScheduler) {
-            deps.workLoopScheduler.requestImmediateTick(mentioned).catch((err) => {
+            deps.workLoopScheduler.requestImmediateTick(mentioned, channelId).catch((err) => {
               const errorMsg = err instanceof Error ? err.message : String(err);
-              deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" failed: ${errorMsg}`);
+              deps.logger?.warn(`[flock:channel-post] Immediate tick for "${mentioned}" in "${channelId}" failed: ${errorMsg}`);
             });
           }
         }
@@ -1490,7 +1490,8 @@ function createChannelPostTool(deps: ToolDeps): ToolDefinition {
         const steerText = `[channel:#${channelId}] New message from @${callerAgentId}: ${message}`;
         for (const member of channel.members) {
           if (member === callerAgentId) continue;
-          const sessionKey = `agent:${member}:flock:tick:control`;
+          // Steer into the member's per-channel session
+          const sessionKey = `agent:${member}:flock:channel:${channelId}`;
           const steered = deps.steerSession(sessionKey, steerText);
           if (steered) {
             deps.logger?.info(`[flock:channel-post] Steered "${member}" with new message in #${channelId}`);
@@ -1685,14 +1686,14 @@ function createAssignMembersTool(deps: ToolDeps): ToolDefinition {
       // SLEEP members are NOT auto-woken — they will discover new channel
       // membership via slow-tick polling and self-wake if relevant.
 
-      // Trigger immediate tick for newly added members so they discover
-      // the channel right away.
+      // Trigger immediate per-channel tick for newly added members so they
+      // discover the channel in its own session right away.
       if (deps.workLoopScheduler) {
         for (const member of toAdd) {
           if (!channel.members.includes(member)) {
-            deps.workLoopScheduler.requestImmediateTick(member).catch((err) => {
+            deps.workLoopScheduler.requestImmediateTick(member, channelId).catch((err) => {
               const errorMsg = err instanceof Error ? err.message : String(err);
-              deps.logger?.warn(`[flock:assign-members] Immediate tick for "${member}" failed: ${errorMsg}`);
+              deps.logger?.warn(`[flock:assign-members] Immediate tick for "${member}" in "${channelId}" failed: ${errorMsg}`);
             });
           }
         }
